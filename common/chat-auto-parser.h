@@ -388,6 +388,9 @@ struct autoparser {
     // Preserved tokens for tokenizer (union of all non-empty markers)
     std::vector<std::string> preserved_tokens;
 
+    // Extra stop sequences added to sampling antiprompt (strip from streaming output)
+    std::vector<std::string> additional_stops;
+
     autoparser() = default;
 
     // Find the starting marker for the user message and assistant message

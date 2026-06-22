@@ -135,6 +135,13 @@ struct llama_hparams {
     float    yarn_beta_fast   = 32.0f;
     float    yarn_beta_slow   =  1.0f;
 
+    // Per-layer-type YaRN params for architectures with mixed RoPE (e.g. Laguna: YaRN global, plain SWA).
+    // Initialized to match the non-SWA fields so other architectures are unaffected.
+    float    yarn_ext_factor_swa  = -1.0f;
+    float    yarn_attn_factor_swa =  1.0f;
+    float    yarn_beta_fast_swa   = 32.0f;
+    float    yarn_beta_slow_swa   =  1.0f;
+
     std::array<int, 4> rope_sections;
 
     // Sliding Window Attention (SWA)
@@ -182,6 +189,11 @@ struct llama_hparams {
     bool use_alibi     = false;
     bool attn_soft_cap = false;
     bool use_kq_norm   = false;
+
+    // Laguna attention output gate: true = per-head (broadcast across head_dim),
+    // false = per-element (one gate per (head, head_dim) channel). Default true
+    // preserves Laguna-XS GGUFs that predate the gate_per_head key.
+    bool attn_gate_per_head = true;
 
     // for Classifiers
     uint32_t n_cls_out = 1;

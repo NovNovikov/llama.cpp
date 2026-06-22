@@ -222,6 +222,7 @@ TEXT_MODEL_MAP: dict[str, str] = {
     "StableLmForCausalLM": "stablelm",
     "Starcoder2ForCausalLM": "starcoder",
     "Step3p5ForCausalLM": "step3",
+    "LagunaForCausalLM": "laguna",
     "StepVLForConditionalGeneration": "step3",
     "Step3p7ForConditionalGeneration": "step3",
     "T5EncoderModel": "t5",

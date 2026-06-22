@@ -122,6 +122,11 @@ struct cli_context {
                     common_tokenize(vocab, defaults.sampling.reasoning_budget_message + chat_params.thinking_end_tag, false, true);
             }
 
+            // Apply template-derived stop sequences (e.g. </assistant> for Laguna)
+            for (const auto & stop : chat_params.additional_stops) {
+                task.params.antiprompt.push_back(stop);
+            }
+
             rd.post_task({std::move(task)});
         }
 

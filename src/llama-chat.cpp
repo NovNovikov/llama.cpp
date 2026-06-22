@@ -80,6 +80,7 @@ static const std::map<std::string, llm_chat_template> LLM_CHAT_TEMPLATES = {
     { "grok-2",            LLM_CHAT_TEMPLATE_GROK_2            },
     { "pangu-embedded",    LLM_CHAT_TEMPLATE_PANGU_EMBED       },
     { "solar-open",        LLM_CHAT_TEMPLATE_SOLAR_OPEN        },
+    { "laguna",            LLM_CHAT_TEMPLATE_LAGUNA            },
 };
 
 llm_chat_template llm_chat_template_from_str(const std::string & name) {
@@ -235,6 +236,8 @@ llm_chat_template llm_chat_detect_template(const std::string & tmpl) {
         return LLM_CHAT_TEMPLATE_PANGU_EMBED;
     } else if (tmpl_contains("<|begin|>") && tmpl_contains("<|end|>") && tmpl_contains("<|content|>")) {
         return LLM_CHAT_TEMPLATE_SOLAR_OPEN;
+    } else if (tmpl_contains("laguna_glm_thinking_v5")) {
+        return LLM_CHAT_TEMPLATE_LAGUNA;
     }
     return LLM_CHAT_TEMPLATE_UNKNOWN;
 }
@@ -936,6 +939,27 @@ int32_t llm_chat_apply_template(
         }
         if (add_ass) {
             ss << "<|begin|>assistant";
+        }
+    } else if (tmpl == LLM_CHAT_TEMPLATE_LAGUNA) {
+        // poolside Laguna: <system>...</system> / <user>...</user> / <assistant>...</assistant>
+        // Default: enable_thinking=false, so assistant turns open with </think> (skip reasoning).
+        bool system_done = false;
+        for (auto message : chat) {
+            std::string role(message->role);
+            std::string content(message->content);
+            if (role == "system" && !system_done) {
+                ss << "<system>\n\n" << content << "\n</system>\n";
+                system_done = true;
+            } else if (role == "user") {
+                ss << "<user>\n" << content << "\n</user>\n";
+            } else if (role == "assistant") {
+                ss << "<assistant>\n</think>\n" << content << "\n</assistant>\n";
+            } else if (role == "tool") {
+                ss << "<tool_response>\n" << content << "\n</tool_response>\n";
+            }
+        }
+        if (add_ass) {
+            ss << "<assistant>\n</think>\n";
         }
     } else {
         // template not supported

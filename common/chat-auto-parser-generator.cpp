@@ -47,6 +47,8 @@ common_chat_params peg_generator::generate_parser(const common_chat_template &  
     data.generation_prompt = common_chat_template_generation_prompt(tmpl, inputs);
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.preserved_tokens  = autoparser.preserved_tokens;
+    data.additional_stops.insert(data.additional_stops.end(),
+        autoparser.additional_stops.begin(), autoparser.additional_stops.end());
 
     std::string parser_generation_prompt = data.generation_prompt;
 
@@ -164,7 +166,12 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
                 // Standard tag-based: optional(<think>reasoning</think>)
                 return p.optional(p.optspace(start) + p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
             }
-            // Delimiter-style (empty start)
+            // Delimiter-style (empty start): reasoning begins immediately at generation start.
+            // Only applies when thinking is enabled; with thinking disabled the generated stream
+            // contains no reasoning at all, so return eps to avoid misclassifying plain content.
+            if (!ctx.inputs.enable_thinking) {
+                return p.eps();
+            }
             return p.optional(p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
         }
     }

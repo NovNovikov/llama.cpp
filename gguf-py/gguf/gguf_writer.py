@@ -769,6 +769,11 @@ class GGUFWriter:
     def add_value_length(self, length: int) -> None:
         self.add_uint32(Keys.Attention.VALUE_LENGTH.format(arch=self.arch), length)
 
+    def add_attention_gate_per_head(self, per_head: bool) -> None:
+        # Laguna attention output gate mode: True = per-head (gate broadcasts across
+        # head_dim), False = per-element (one gate per (head, head_dim) channel).
+        self.add_bool(Keys.Attention.GATE_PER_HEAD.format(arch=self.arch), per_head)
+
     def add_key_length_mla(self, length: int) -> None:
         self.add_uint32(Keys.Attention.KEY_LENGTH_MLA.format(arch=self.arch), length)
 

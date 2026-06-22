@@ -192,6 +192,14 @@ static gguf_context_ptr get_gguf_ctx(const llm_arch arch, const bool moe) {
             pattern.push_back(il % 2);
         }
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
+    } else if (arch == LLM_ARCH_LAGUNA) {
+        // Laguna: 10 global + 30 SWA, 3:1 pattern (SWA,SWA,SWA,global repeating)
+        std::vector<uint32_t> pattern;
+        pattern.reserve(n_layer);
+        for (uint32_t il = 0; il < n_layer; il++) {
+            pattern.push_back((il % 4) == 3 ? 0 : 1);
+        }
+        ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, pattern);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_SLIDING_WINDOW_PATTERN, uint32_t(2));
     }
@@ -357,6 +365,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_MIMO2:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_STEP35:
+        case LLM_ARCH_LAGUNA:
         case LLM_ARCH_MISTRAL4:
         case LLM_ARCH_MELLUM:
             return true;

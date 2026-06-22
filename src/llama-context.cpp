@@ -64,6 +64,10 @@ llama_context::llama_context(
     cparams.yarn_attn_factor        = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor;
     cparams.yarn_beta_fast          = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast;
     cparams.yarn_beta_slow          = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow;
+    cparams.yarn_ext_factor_swa     = params.yarn_ext_factor  >= 0.0f ? params.yarn_ext_factor  : hparams.yarn_ext_factor_swa;
+    cparams.yarn_attn_factor_swa    = params.yarn_attn_factor >= 0.0f ? params.yarn_attn_factor : hparams.yarn_attn_factor_swa;
+    cparams.yarn_beta_fast_swa      = params.yarn_beta_fast   >= 0.0f ? params.yarn_beta_fast   : hparams.yarn_beta_fast_swa;
+    cparams.yarn_beta_slow_swa      = params.yarn_beta_slow   >= 0.0f ? params.yarn_beta_slow   : hparams.yarn_beta_slow_swa;
     cparams.embeddings              = params.embeddings;
     cparams.embeddings_pre_norm     = false;
     cparams.embeddings_nextn        = false;
@@ -142,11 +146,11 @@ llama_context::llama_context(
         cparams.yarn_ext_factor = rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN ? 1.0f : 0.0f;
     }
 
-    if (cparams.yarn_ext_factor != 0) {
-        static auto get_mscale = [](float scale, float mscale) {
-            return scale <= 1.0f ? 1.0f : (0.1f * mscale * logf(scale) + 1.0f);
-        };
+    static auto get_mscale = [](float scale, float mscale) {
+        return scale <= 1.0f ? 1.0f : (0.1f * mscale * logf(scale) + 1.0f);
+    };
 
+    if (cparams.yarn_ext_factor != 0) {
         const float factor = 1.0f / cparams.rope_freq_scale;
 
         // ref: https://github.com/huggingface/transformers/blob/6d00f6b0a5679c36510f203e4226e36f517c3032/src/transformers/modeling_rope_utils.py#L336-L348
@@ -180,6 +184,20 @@ llama_context::llama_context(
     }
 
     cparams.yarn_attn_factor *= hparams.rope_attn_factor;
+
+    // SWA-layer YaRN params (used by mixed-RoPE archs like Laguna)
+    if (cparams.yarn_ext_factor_swa < 0.0f) {
+        cparams.yarn_ext_factor_swa = rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_YARN ? 1.0f : 0.0f;
+    }
+
+    if (cparams.yarn_ext_factor_swa != 0.0f) {
+        const float factor_swa = 1.0f / cparams.rope_freq_scale;
+
+        cparams.yarn_attn_factor_swa = get_mscale(factor_swa, 1.0f);
+        cparams.yarn_attn_factor_swa *= 1.0f / (1.0f + 0.1f * logf(factor_swa));
+    }
+
+    cparams.yarn_attn_factor_swa *= hparams.rope_attn_factor;
 
     if (cparams.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
         if (hparams.pooling_type == LLAMA_POOLING_TYPE_UNSPECIFIED) {
