@@ -24,6 +24,9 @@
 static std::function<void(int)> shutdown_handler;
 static std::atomic_flag is_terminating = ATOMIC_FLAG_INIT;
 
+// Structured stdout prefix for child-process startup failures in router mode.
+#define CMD_CHILD_TO_ROUTER_ERROR "cmd_child_to_router:error:"
+
 static inline void signal_handler(int signal) {
     if (is_terminating.test_and_set()) {
         // in case it hangs, we can force terminate the server by hitting Ctrl+C twice

@@ -44,6 +44,13 @@ struct common_device_memory_data {
 
 using common_device_memory_data_vec = std::vector<common_device_memory_data>;
 
+struct common_projected_memory_usage {
+    size_t gpu_used   = 0;
+    size_t gpu_free   = 0;
+    size_t host_used  = 0;
+    size_t host_total = 0;
+};
+
 // Load a model + context with no_alloc and return the per-device memory breakdown.
 common_device_memory_data_vec common_get_device_memory_data(
                          const char * path_model,
@@ -53,4 +60,11 @@ common_device_memory_data_vec common_get_device_memory_data(
                            uint32_t & hp_ngl,
                            uint32_t & hp_n_ctx_train,
                            uint32_t & hp_n_expert,
+                     ggml_log_level   log_level);
+
+// Return the same projected target-model memory totals used by the --fit path.
+common_projected_memory_usage common_get_projected_memory_usage(
+                         const char * path_model,
+           const llama_model_params * mparams,
+         const llama_context_params * cparams,
                      ggml_log_level   log_level);

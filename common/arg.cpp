@@ -509,6 +509,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     auto parse_cli_args = [&]() {
         std::set<std::string> seen_args;
+        static constexpr const char * k_default_generated_output_log_path = "output.log";
 
         for (int i = 1; i < argc; i++) {
             const std::string arg_prefix = "--";
@@ -541,6 +542,15 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
                 if (opt.handler_bool) {
                     opt.handler_bool(params, is_positive);
                     continue;
+                }
+
+                // --log-generated-output accepts an optional path and defaults to ./output.log.
+                if (opt.handler_string && arg == "--log-generated-output") {
+                    const bool has_explicit_value = (i + 1) < argc && argv[i + 1][0] != '-';
+                    if (!has_explicit_value) {
+                        opt.handler_string(params, k_default_generated_output_log_path);
+                        continue;
+                    }
                 }
 
                 // arg with single value
@@ -2866,6 +2876,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.api_prefix = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_API_PREFIX"));
+    add_opt(common_arg(
+        {"--log-generated-output"}, "PATH",
+        "debug: append final generated output as JSONL for each chat/completion request (if PATH omitted, defaults to ./output.log)",
+        [](common_params & params, const std::string & value) {
+            params.log_generated_output = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_LOG_GENERATED_OUTPUT"));
     add_opt(common_arg(
         {"--ui-config", "--webui-config"}, "JSON",
         "JSON that provides default UI settings (overrides UI defaults)",

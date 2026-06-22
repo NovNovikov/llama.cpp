@@ -34,7 +34,8 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
         uint32_t & hp_ngl,
         uint32_t & hp_n_ctx_train,
         uint32_t & hp_n_expert,
-        ggml_log_level log_level) {
+        ggml_log_level log_level,
+        bool print_memory_breakdown = true) {
     struct user_data_t {
         struct {
             ggml_log_callback callback;
@@ -141,7 +142,9 @@ static std::vector<llama_device_memory_data> common_get_device_memory_data_impl(
     hp_n_ctx_train = llama_model_n_ctx_train(model);
     hp_n_expert    = llama_model_n_expert(model);
 
-    common_memory_breakdown_print(ctx);
+    if (print_memory_breakdown) {
+        common_memory_breakdown_print(ctx);
+    }
 
     llama_free(ctx);
     llama_model_free(model);
@@ -170,6 +173,33 @@ common_device_memory_data_vec common_get_device_memory_data(
         ret[i].context = impl[i].mb.context;
         ret[i].compute = impl[i].mb.compute;
     }
+    return ret;
+}
+
+common_projected_memory_usage common_get_projected_memory_usage(
+        const char * path_model,
+        const llama_model_params * mparams,
+        const llama_context_params * cparams,
+        ggml_log_level log_level) {
+    std::vector<ggml_backend_dev_t> devs;
+    uint32_t hp_ngl = 0;
+    uint32_t hp_nct = 0;
+    uint32_t hp_nex = 0;
+
+    const auto dmd = common_get_device_memory_data_impl(
+            path_model, mparams, cparams, devs, hp_ngl, hp_nct, hp_nex, log_level);
+
+    GGML_ASSERT(dmd.size() == devs.size() + 1);
+
+    common_projected_memory_usage ret;
+    for (size_t i = 0; i < devs.size(); ++i) {
+        ret.gpu_used += dmd[i].mb.total();
+        ret.gpu_free += dmd[i].free;
+    }
+
+    ret.host_used  = dmd.back().mb.total();
+    ret.host_total = dmd.back().total;
+
     return ret;
 }
 

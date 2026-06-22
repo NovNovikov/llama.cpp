@@ -9,6 +9,8 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "llama-cpp.h"
+#include "../../src/llama-ext.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -1025,6 +1027,27 @@ private:
     // note: accessing these fields outside of this class is not thread-safe
     // use server_context methods instead
 
+    struct scoped_llama_log_filter {
+        ggml_log_callback original_callback = nullptr;
+        void * original_user_data = nullptr;
+
+        static void filtered_callback(ggml_log_level level, const char * text, void * user_data) {
+            auto * self = static_cast<scoped_llama_log_filter *>(user_data);
+            if (level >= GGML_LOG_LEVEL_ERROR && self->original_callback != nullptr) {
+                self->original_callback(level, text, self->original_user_data);
+            }
+        }
+
+        scoped_llama_log_filter() {
+            llama_log_get(&original_callback, &original_user_data);
+            llama_log_set(filtered_callback, this);
+        }
+
+        ~scoped_llama_log_filter() {
+            llama_log_set(original_callback, original_user_data);
+        }
+    };
+
     common_params params_base;
 
     // note: keep these alive - they determine the lifetime of the model, context, etc.
@@ -1146,6 +1169,8 @@ private:
 
         params_base = params;
         params_base.n_outputs_max = server_n_outputs_max(params_base);
+        size_t projected_extra_gpu_required  = 0;
+        size_t projected_extra_host_required = 0;
 
         const bool has_mmproj = !params.mmproj.path.empty();
         const bool has_draft = params.speculative.has_dft();
@@ -1191,7 +1216,7 @@ private:
         }
 
         // optionally get the memory usage of mmproj
-        if (has_mmproj && params_base.fit_params) {
+        if (has_mmproj) {
             int64_t t_start = ggml_time_us();
             auto mmproj_mem = mtmd_get_memory_usage(mmproj_path.c_str(), mparams);
             int64_t t_elapsed = ggml_time_us() - t_start;
@@ -1199,17 +1224,31 @@ private:
                 size_t total = 0;
                 for (auto & [dev, size] : mmproj_mem) {
                     total += size;
+
+                    if (dev == nullptr) {
+                        continue;
+                    }
+
+                    const auto dev_type = ggml_backend_dev_type(dev);
+                    const bool is_gpu_dev = dev_type == GGML_BACKEND_DEVICE_TYPE_GPU || dev_type == GGML_BACKEND_DEVICE_TYPE_IGPU;
+                    if (is_gpu_dev) {
+                        projected_extra_gpu_required += size;
+                    } else {
+                        projected_extra_host_required += size;
+                    }
                 }
                 SRV_INF("[mtmd] estimated worst-case memory usage of mmproj is %.2f MiB (took %.2f ms)\n", total / (1024.0 * 1024.0), t_elapsed / 1000.0);
-                GGML_ASSERT(!params_base.fit_params_target.empty());
-                for (auto & [dev, size] : mmproj_mem) {
-                    for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
-                        if (ggml_backend_dev_get(i) == dev) {
-                            if (i < params_base.fit_params_target.size()) {
-                                SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
-                                params_base.fit_params_target[i] += size;
+                if (params_base.fit_params) {
+                    GGML_ASSERT(!params_base.fit_params_target.empty());
+                    for (auto & [dev, size] : mmproj_mem) {
+                        for (size_t i = 0; i < ggml_backend_dev_count(); i++) {
+                            if (ggml_backend_dev_get(i) == dev) {
+                                if (i < params_base.fit_params_target.size()) {
+                                    SRV_DBG("[mtmd] adding %.2f MiB to fit_params_target for device %s\n", size / (1024.0 * 1024.0), ggml_backend_dev_name(dev));
+                                    params_base.fit_params_target[i] += size;
+                                }
+                                break;
                             }
-                            break;
                         }
                     }
                 }
@@ -1218,9 +1257,11 @@ private:
             }
         }
 
-        // optionally reserve VRAM for the draft / MTP context before fitting the target model
-        if (params_base.fit_params) {
-            if (has_spec) {
+        // optionally reserve / estimate memory for the draft or MTP context.
+        // Keep the estimate active even with --fit off so the server still reports
+        // the projected full memory footprint, while only the fit target update
+        // remains conditional on fit_params.
+        if (has_spec) {
                 common_params params_dft = params_base;
                 bool measure_model_bytes = true;
 
@@ -1253,47 +1294,225 @@ private:
                 uint32_t hp_nct = 0;
                 uint32_t hp_nex = 0;
                 try {
-                    auto dmd = common_get_device_memory_data(
-                        params_dft.model.path.c_str(), &mparams_dft, &cparams_dft,
-                        devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                    std::map<ggml_backend_dev_t, size_t> probe_gpu_baseline_bytes;
 
-                    GGML_ASSERT(!params_base.fit_params_target.empty());
-                    size_t total = 0;
+                    auto measure_draft_memory = [&](const llama_context_params & cparams_probe) {
+                        return common_get_device_memory_data(
+                            params_dft.model.path.c_str(), &mparams_dft, &cparams_probe,
+                            devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                    };
+
+                    common_device_memory_data_vec dmd;
+                    try {
+                        dmd = measure_draft_memory(cparams_dft);
+                    } catch (const std::exception &) {
+                        const bool needs_ctx_other_retry =
+                            has_draft &&
+                            spec_mtp &&
+                            cparams_dft.ctx_other == nullptr;
+
+                        if (!needs_ctx_other_retry) {
+                            throw;
+                        }
+
+                        // Gemma4 assistant draft models need a valid target context even
+                        // during the temporary VRAM probe used for sizing. Build a
+                        // transient target context so the MTP draft requirement is still
+                        // accounted for instead of being dropped from the estimate.
+                        SRV_INF("%s\n", "[spec] retrying draft model memory measurement with temporary ctx_other");
+
+                        auto mparams_tgt_probe = common_model_params_to_llama(params_base);
+                        mparams_tgt_probe.no_alloc  = true;
+                        mparams_tgt_probe.use_mmap  = false;
+                        mparams_tgt_probe.use_mlock = false;
+
+                        auto cparams_tgt_probe = common_context_params_to_llama(params_base);
+                        cparams_tgt_probe.n_rs_seq = 0;
+
+                        auto capture_gpu_free = []() {
+                            std::map<ggml_backend_dev_t, size_t> ret;
+                            for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                                ggml_backend_dev_t dev = ggml_backend_dev_get(i);
+                                const auto dev_type = ggml_backend_dev_type(dev);
+                                if (dev_type != GGML_BACKEND_DEVICE_TYPE_GPU && dev_type != GGML_BACKEND_DEVICE_TYPE_IGPU) {
+                                    continue;
+                                }
+
+                                size_t free = 0;
+                                size_t total = 0;
+                                ggml_backend_dev_memory(dev, &free, &total);
+                                ret[dev] = free;
+                            }
+                            return ret;
+                        };
+
+                        const auto gpu_free_before_tgt_probe = capture_gpu_free();
+                        llama_model_ptr model_tgt_probe;
+                        llama_context_ptr ctx_tgt_probe;
+                        {
+                            // This temporary target exists only to satisfy ctx_other while
+                            // sizing Gemma assistant drafts. Keep probe-only loader chatter
+                            // out of the server log, but still allow real errors through.
+                            scoped_llama_log_filter quiet_probe_logs;
+
+                            model_tgt_probe.reset(llama_model_load_from_file(
+                                params_base.model.path.c_str(), mparams_tgt_probe));
+                            if (model_tgt_probe == nullptr) {
+                                throw std::runtime_error("failed to load temporary target model for draft fit probe");
+                            }
+
+                            ctx_tgt_probe.reset(llama_init_from_model(
+                                model_tgt_probe.get(), cparams_tgt_probe));
+                            if (ctx_tgt_probe == nullptr) {
+                                throw std::runtime_error("failed to create temporary target context for draft fit probe");
+                            }
+
+                            const auto gpu_free_after_tgt_probe = capture_gpu_free();
+                            for (const auto & [dev, free_before] : gpu_free_before_tgt_probe) {
+                                auto it_after = gpu_free_after_tgt_probe.find(dev);
+                                if (it_after == gpu_free_after_tgt_probe.end()) {
+                                    continue;
+                                }
+
+                                if (free_before > it_after->second) {
+                                    probe_gpu_baseline_bytes[dev] = free_before - it_after->second;
+                                }
+                            }
+                        }
+
+                        auto cparams_dft_retry = cparams_dft;
+                        cparams_dft_retry.ctx_other = ctx_tgt_probe.get();
+                        dmd = measure_draft_memory(cparams_dft_retry);
+                    }
+
+                    size_t total_accounted = 0;
+                    size_t total_gpu_used  = 0;
+                    size_t total_host_used = (measure_model_bytes ? dmd.back().model : 0) + dmd.back().context + dmd.back().compute;
 
                     std::vector<ggml_backend_dev_t> tgt_devices = params.devices;
 
                     if (tgt_devices.empty()) {
-                        for(size_t i = 0; i < ggml_backend_dev_count(); ++i) {
-                           tgt_devices.push_back(ggml_backend_dev_get(i));
+                        for (size_t i = 0; i < ggml_backend_dev_count(); ++i) {
+                            tgt_devices.push_back(ggml_backend_dev_get(i));
                         }
                     }
 
                     for (size_t j = 0; j < devs.size(); ++j) {
-                        const size_t bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
-                        total += bytes;
-                        for (size_t i = 0; i < tgt_devices.size(); i++) {
-                            if (tgt_devices[i] == devs[j]) {
-                                SRV_DBG("[spec] adding %.2f MiB to fit_params_target for device %s\n",
-                                        bytes / (1024.0 * 1024.0), ggml_backend_dev_name(devs[j]));
-                                params_base.fit_params_target[i] += bytes;
-                                break;
+                        const size_t accounted_bytes = (measure_model_bytes ? dmd[j].model : 0) + dmd[j].context + dmd[j].compute;
+                        size_t gpu_used_bytes = dmd[j].total >= dmd[j].free ? dmd[j].total - dmd[j].free : accounted_bytes;
+
+                        auto it_probe = probe_gpu_baseline_bytes.find(devs[j]);
+                        if (it_probe != probe_gpu_baseline_bytes.end()) {
+                            gpu_used_bytes = gpu_used_bytes > it_probe->second ? gpu_used_bytes - it_probe->second : 0;
+                        }
+
+                        total_accounted += accounted_bytes;
+                        total_gpu_used  += gpu_used_bytes;
+
+                        if (params_base.fit_params) {
+                            GGML_ASSERT(!params_base.fit_params_target.empty());
+                            for (size_t i = 0; i < tgt_devices.size(); i++) {
+                                if (tgt_devices[i] == devs[j]) {
+                                    // Reserve the full device footprint seen by the backend,
+                                    // not just the accounted model/context/compute buckets.
+                                    // This keeps --fit aligned with real VRAM pressure when
+                                    // CUDA/WDDM overhead lands outside the tracked buckets.
+                                    SRV_DBG("[spec] adding %.2f MiB of total GPU usage to fit_params_target for device %s (accounted %.2f MiB)\n",
+                                            gpu_used_bytes / (1024.0 * 1024.0),
+                                            ggml_backend_dev_name(devs[j]),
+                                            accounted_bytes / (1024.0 * 1024.0));
+                                    params_base.fit_params_target[i] += gpu_used_bytes;
+                                    break;
+                                }
                             }
                         }
                     }
-                    SRV_INF("[spec] estimated memory usage of %s is %.2f MiB\n",
+
+                    projected_extra_gpu_required  += total_gpu_used;
+                    projected_extra_host_required += total_host_used;
+
+                    SRV_INF("[spec] estimated accounted memory usage of %s is %.2f MiB\n",
                             has_draft ? "draft model" : "MTP context",
-                            total / (1024.0 * 1024.0));
+                            total_accounted / (1024.0 * 1024.0));
+                    SRV_INF("[spec] estimated total GPU memory usage of %s is %.2f MiB (host excluded)\n",
+                            has_draft ? "draft model" : "MTP context",
+                            total_gpu_used / (1024.0 * 1024.0));
                 } catch (const std::exception & e) {
                     SRV_WRN("[spec] failed to measure %s memory: %s\n",
                             has_draft ? "draft model" : "MTP context", e.what());
                 }
-            }
         }
 
         // attach a progress callback
         {
             params_base.load_progress_callback = load_progress_callback;
             params_base.load_progress_callback_user_data = &load_progress_text;
+        }
+
+        {
+            try {
+                auto mparams_probe = common_model_params_to_llama(params_base);
+                auto cparams_probe = common_context_params_to_llama(params_base);
+
+                std::vector<ggml_backend_dev_t> devs_probe;
+                uint32_t hp_ngl_probe = 0;
+                uint32_t hp_nct_probe = 0;
+                uint32_t hp_nex_probe = 0;
+
+                const auto dmd_probe = common_get_device_memory_data(
+                    params_base.model.path.c_str(),
+                    &mparams_probe,
+                    &cparams_probe,
+                    devs_probe,
+                    hp_ngl_probe,
+                    hp_nct_probe,
+                    hp_nex_probe,
+                    GGML_LOG_LEVEL_ERROR);
+
+                SRV_INF("%s", "memory breakdown [MiB] | total    free    self   model   context   compute    unaccounted |\n");
+
+                size_t total_gpu_required  = 0;
+                size_t total_host_required = 0;
+                for (size_t i = 0; i < devs_probe.size(); ++i) {
+                    const auto & dmd = dmd_probe[i];
+                    const size_t self = dmd.model + dmd.context + dmd.compute;
+                    const int64_t unaccounted = dmd.total - dmd.free - static_cast<int64_t>(self);
+
+                    total_gpu_required += self;
+
+                    SRV_INF("  - %s | %6" PRId64 " = %6" PRId64 " + (%6zu = %6zu + %7zu + %7zu) + %11" PRId64 "\n",
+                            ggml_backend_dev_name(devs_probe[i]),
+                            dmd.total / (1024 * 1024),
+                            dmd.free / (1024 * 1024),
+                            self / (1024 * 1024),
+                            dmd.model / (1024 * 1024),
+                            dmd.context / (1024 * 1024),
+                            dmd.compute / (1024 * 1024),
+                            unaccounted / (1024 * 1024));
+                }
+
+                {
+                    const auto & dmd_host = dmd_probe.back();
+                    const size_t self = dmd_host.model + dmd_host.context + dmd_host.compute;
+                    total_host_required += self;
+
+                    SRV_INF("  - Host  |                  %6zu = %6zu + %7zu + %7zu\n",
+                            self / (1024 * 1024),
+                            dmd_host.model / (1024 * 1024),
+                            dmd_host.context / (1024 * 1024),
+                            dmd_host.compute / (1024 * 1024));
+                }
+
+                total_gpu_required  += projected_extra_gpu_required;
+                total_host_required += projected_extra_host_required;
+
+                SRV_INF("loaded server state requires %.2f MiB of device memory (host excluded)\n",
+                        total_gpu_required / (1024.0 * 1024.0));
+                SRV_INF("loaded server state requires %.2f MiB of host memory\n",
+                        total_host_required / (1024.0 * 1024.0));
+            } catch (const std::exception & e) {
+                SRV_WRN("failed to estimate loaded server state memory requirement: %s\n", e.what());
+            }
         }
 
         llama_init = common_init_from_params(params_base);
@@ -2591,8 +2810,8 @@ private:
                     const int id_task = task.id;
 
                     server_slot * slot = nullptr;
-                    if (id_slot != -1) {
-                        slot = get_slot_by_id(id_slot);
+                    if (task.id_slot != -1) {
+                        slot = get_slot_by_id(task.id_slot);
                     } else if (!task.cache_key.empty()) {
                         server_slot * slot_cache_key = get_slot_by_cache_key(task.cache_key);
                         if (slot_cache_key != nullptr && cache_key_slot_has_enough_similarity(*slot_cache_key, task)) {
@@ -4455,7 +4674,7 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
             task.tokens = std::move(inputs[i]);
             task.debug_request_id = request_id_for_debug;
             task.debug_endpoint   = req.path;
-            task.params = server_task::params_from_json_cmpl(
+            task.params = server_schema::eval_llama_cmpl_schema(
                     ctx_server.vocab,
                     params,
                     meta->slot_n_ctx,
