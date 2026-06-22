@@ -139,6 +139,7 @@ struct server_task {
     // used by SERVER_TASK_TYPE_CANCEL
     int id_target = -1;
     int id_slot   = -1;
+    std::string cache_key;
 
     // used by parallel sampling (multiple completions from same prompt)
     int id_parent  = -1;
@@ -149,6 +150,9 @@ struct server_task {
     // used by SERVER_TASK_TYPE_INFERENCE
     task_params   params;
     server_tokens tokens;
+    // Debug-only request metadata for server-side JSONL output logging.
+    std::string debug_request_id;
+    std::string debug_endpoint;
 
     // only used by CLI, this allow tokenizing CLI inputs on server side
     // we need this because mtmd_context and vocab are not accessible outside of server_context
@@ -230,7 +234,10 @@ struct server_task {
         copy.params    = params;
         copy.type      = type;
         copy.tokens    = tokens.clone();
+        copy.debug_request_id = debug_request_id;
+        copy.debug_endpoint   = debug_endpoint;
         copy.id_slot   = -1; // child tasks cannot specify slot
+        copy.cache_key.clear();
 
         // use different sampling seed for each child
         // note: https://github.com/ggml-org/llama.cpp/pull/18700#discussion_r2675115723

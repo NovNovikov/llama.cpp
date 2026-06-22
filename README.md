@@ -1,4 +1,4 @@
-# llama.cpp
+# llama.cpp Fork
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
 
@@ -9,6 +9,28 @@
 [![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
 
 [Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
+
+Upstream-first fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) with a small set of local runtime and server patches kept on top of fresh upstream syncs.
+
+## Fork status
+
+- Default branch: `feature/prefill-checkpoints`
+- Archived TurboQuant branch: `archive/turboquant-prefill`
+- Base: regularly synced with upstream `ggml-org/llama.cpp`
+
+## What this fork keeps
+
+- assistant prefill preserved for chat completions and `enable_thinking` flows
+- restored broad prompt checkpoint scheduling for long SWA / hybrid contexts
+- safer checkpoint invalidation after restore, bounded by actual prompt divergence
+- local MTP stability fixes for current Qwen / Gemma server and CLI paths
+- server-side generated-output logging option kept alongside upstream prompt logging
+
+## What moved out of the default branch
+
+TurboQuant-specific KV and weight quantization support is no longer part of the main line of this fork. That code stays available in the archived `archive/turboquant-prefill` branch for reference or recovery, but the default branch is now intentionally close to upstream llama.cpp plus the runtime fixes above.
+
+Everything below this section remains the upstream llama.cpp README.
 
 LLM inference in C/C++
 

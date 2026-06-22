@@ -202,6 +202,28 @@ def test_chat_template_continue_final_message_vllm_compat():
     assert res.body["__verbose"]["prompt"].endswith("<|start_header_id|>user<|end_header_id|>\n\nWhat is the best book<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nWhill")
 
 
+def test_chat_template_assistant_prefill_with_enable_thinking():
+    global server
+    server.jinja = True
+    server.chat_template_file = "../../../models/templates/meta-llama-Llama-3.1-8B-Instruct.jinja"
+    server.debug = True
+    server.start()
+    res = server.make_request("POST", "/chat/completions", data={
+        "max_tokens": 8,
+        "chat_template_kwargs": {
+            "enable_thinking": True,
+        },
+        "messages": [
+            {"role": "system", "content": "Book"},
+            {"role": "user", "content": "What is the best book"},
+            {"role": "assistant", "content": "Whill"},
+        ]
+    })
+    assert res.status_code == 200
+    assert "__verbose" in res.body
+    assert res.body["__verbose"]["prompt"].endswith("<|start_header_id|>user<|end_header_id|>\n\nWhat is the best book<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\nWhill")
+
+
 def test_chat_template_continue_final_message_mutual_exclusion():
     """add_generation_prompt and continue_final_message both set to true must be rejected"""
     global server
