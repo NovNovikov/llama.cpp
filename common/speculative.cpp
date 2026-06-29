@@ -938,6 +938,23 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    void reset_seq_state(llama_seq_id seq_id) {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        std::fill(pending_h[seq_id].begin(), pending_h[seq_id].end(), 0.0f);
+        verify_h[seq_id].clear();
+        verify_h_rows[seq_id] = 0;
+        i_last[seq_id]        = -1;
+        i_batch_beg[seq_id]   = -1;
+        i_batch_end[seq_id]   = -1;
+
+        if (chain_heads) {
+            chain_h[seq_id].clear();
+        }
+    }
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1361,6 +1378,64 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+    }
+
+    bool get_state(llama_seq_id seq_id, std::vector<uint8_t> & data) const override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return false;
+        }
+
+        // Server checkpoints must persist the draft-MTP carryover row.
+        // Without it, restoring an older checkpoint reloads draft KV but leaves
+        // the speculative hidden-state boundary stale, which can corrupt later
+        // MTP generations on reused slots.
+        constexpr uint32_t version = 1;
+        data.resize(sizeof(version) + sizeof(uint32_t) + (size_t) n_embd * sizeof(float));
+
+        uint8_t * ptr = data.data();
+        std::memcpy(ptr, &version, sizeof(version));
+        ptr += sizeof(version);
+
+        const uint32_t n_embd_u32 = (uint32_t) n_embd;
+        std::memcpy(ptr, &n_embd_u32, sizeof(n_embd_u32));
+        ptr += sizeof(n_embd_u32);
+
+        std::memcpy(ptr, pending_h[seq_id].data(), (size_t) n_embd * sizeof(float));
+        return true;
+    }
+
+    void set_state(llama_seq_id seq_id, const std::vector<uint8_t> & data) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        reset_seq_state(seq_id);
+
+        if (data.empty()) {
+            return;
+        }
+
+        constexpr uint32_t version = 1;
+        const size_t expected = sizeof(version) + sizeof(uint32_t) + (size_t) n_embd * sizeof(float);
+        if (data.size() != expected) {
+            return;
+        }
+
+        const uint8_t * ptr = data.data();
+
+        uint32_t data_version = 0;
+        std::memcpy(&data_version, ptr, sizeof(data_version));
+        ptr += sizeof(data_version);
+
+        uint32_t data_n_embd = 0;
+        std::memcpy(&data_n_embd, ptr, sizeof(data_n_embd));
+        ptr += sizeof(data_n_embd);
+
+        if (data_version != version || data_n_embd != (uint32_t) n_embd) {
+            return;
+        }
+
+        std::memcpy(pending_h[seq_id].data(), ptr, (size_t) n_embd * sizeof(float));
     }
 
     bool need_embd() const override {
