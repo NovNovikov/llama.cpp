@@ -648,14 +648,6 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
     llama_kv_cache_dsv4_context::comp_plan plan;
     plan.n_visible.resize(ubatch.n_tokens);
     plan.n_stream = dsv4_comp_graph_n_stream(ubatch, n_stream);
-    // Reserve-time ubatches are synthetic batches that start at position 0 and
-    // only need enough compressed rows to cover their prompt width. Using the
-    // full compressed cache capacity here massively over-reserves DSV4 compute
-    // buffers during sched_reserve(), even though the graph shape for the
-    // reserve batch only exposes the rows visible from those synthetic
-    // positions.
-    const uint64_t n_visible_u64 = ubatch.n_seq_tokens > 0 ? (uint64_t) ubatch.n_seq_tokens/ratio : 0;
-    plan.n_kv = (uint32_t) std::min<uint64_t>(kv_size, n_visible_u64);
 
     if (ubatch.n_tokens == 0) {
         return plan;
@@ -663,6 +655,19 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
 
     const uint32_t n_seqs       = std::max<uint32_t>(1, ubatch.n_seqs);
     const uint32_t n_seq_tokens = std::max<uint32_t>(1, ubatch.n_seq_tokens);
+
+    // Reserve-time ubatches are synthetic batches with positions laid out as
+    // `i / n_seqs`. Mirror that layout here so the reserve graph only exposes
+    // the compressed rows that are actually visible for the prompt width of the
+    // reserve batch instead of the full cache capacity.
+    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+        const uint32_t pos = i / n_seqs;
+        const int64_t n_visible = (int64_t) (pos + 1) / ratio;
+        plan.n_visible[i] = (int32_t) n_visible;
+        plan.n_kv = std::max(plan.n_kv, n_visible);
+    }
+    plan.n_kv = std::min<int64_t>(plan.n_kv, kv_size);
+
     const uint64_t n_blocks_u64 = (uint64_t) n_seqs*((n_seq_tokens + ratio - 1)/ratio);
     const size_t n_blocks = (size_t) std::max<uint64_t>(1, n_blocks_u64);
     GGML_ASSERT((uint64_t) n_blocks == std::max<uint64_t>(1, n_blocks_u64));
