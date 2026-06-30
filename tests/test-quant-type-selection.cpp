@@ -424,10 +424,58 @@ static bool run_test_section(quantize_state_impl * qs, mock_tensors & mt, const 
     return all_pass;
 }
 
+static bool run_integer_tensor_regression() {
+    llama_quant_model_desc desc = {};
+    desc.architecture           = "deepseek4";
+    desc.n_embd                 = 4096;
+    desc.n_ff                   = 16384;
+    desc.n_layer                = 1;
+    desc.n_head                 = 32;
+    desc.n_head_kv              = 4;
+    desc.n_expert               = 256;
+
+    llama_model * model = llama_quant_model_from_metadata(&desc);
+    llama_model_quantize_params qparams = llama_model_quantize_default_params();
+    quantize_state_impl * qs = llama_quant_init(model, &qparams);
+
+    struct ggml_init_params params = {
+        /*.mem_size   = */ ggml_tensor_overhead(),
+        /*.mem_buffer = */ nullptr,
+        /*.no_alloc   = */ true,
+    };
+    ggml_context_ptr ctx(ggml_init(params));
+    ggml_tensor * tensor = ggml_new_tensor_2d(ctx.get(), GGML_TYPE_I32, 129280, 6);
+    ggml_set_name(tensor, "blk.0.ffn_gate_tid2eid.weight");
+
+    bool pass = true;
+
+    if (llama_quant_tensor_allows_quantization(qs, tensor)) {
+        printf("  FAIL  integer routing tensor was marked quantizable\n");
+        pass = false;
+    }
+
+    ggml_tensor * tensors[] = { tensor };
+    ggml_type result_types[1] = { GGML_TYPE_COUNT };
+    llama_quant_compute_types(qs, LLAMA_FTYPE_MOSTLY_Q3_K_S, tensors, result_types, 1);
+    if (result_types[0] != GGML_TYPE_I32) {
+        printf("  FAIL  integer routing tensor changed type: expected %s, got %s\n",
+               ggml_type_name(GGML_TYPE_I32), ggml_type_name(result_types[0]));
+        pass = false;
+    }
+
+    llama_quant_free(qs);
+    llama_model_free(model);
+    return pass;
+}
+
 static int run_remote_tests(const std::string & snapshot_dir, const char * argv0) {
     int total_pass = 0;
     int total_fail = 0;
     int total_skip = 0;
+
+    if (!run_integer_tensor_regression()) {
+        return 1;
+    }
 
     for (int m = 0; m < n_model_specs; m++) {
         const auto & spec = model_specs[m];

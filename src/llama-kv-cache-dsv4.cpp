@@ -648,7 +648,14 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
     llama_kv_cache_dsv4_context::comp_plan plan;
     plan.n_visible.resize(ubatch.n_tokens);
     plan.n_stream = dsv4_comp_graph_n_stream(ubatch, n_stream);
-    plan.n_kv = kv_size;
+    // Reserve-time ubatches are synthetic batches that start at position 0 and
+    // only need enough compressed rows to cover their prompt width. Using the
+    // full compressed cache capacity here massively over-reserves DSV4 compute
+    // buffers during sched_reserve(), even though the graph shape for the
+    // reserve batch only exposes the rows visible from those synthetic
+    // positions.
+    const uint64_t n_visible_u64 = ubatch.n_seq_tokens > 0 ? (uint64_t) ubatch.n_seq_tokens/ratio : 0;
+    plan.n_kv = (uint32_t) std::min<uint64_t>(kv_size, n_visible_u64);
 
     if (ubatch.n_tokens == 0) {
         return plan;
@@ -669,6 +676,10 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
     plan.state_read_idxs .resize((overlap ? 2u : 1u)*ratio*n_blocks);
     plan.state_write_idxs.resize(n_blocks);
     plan.state_write_pos .resize(n_blocks);
+
+    if (plan.n_kv > 0) {
+        plan.n_kv = GGML_PAD(plan.n_kv, 256u);
+    }
 
     return plan;
 }

@@ -289,6 +289,18 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     // trivial checks first -- no string ops needed
     if (params->only_copy)       return false;
 
+    // Preserve integer tensors such as DeepSeek V4 expert-routing tables.
+    // They are model metadata, not floating-point weights.
+    switch (tensor->type) {
+        case GGML_TYPE_I8:
+        case GGML_TYPE_I16:
+        case GGML_TYPE_I32:
+        case GGML_TYPE_I64:
+            return false;
+        default:
+            break;
+    }
+
     // quantize only 2D and 3D tensors (experts)
     if (ggml_n_dims(tensor) < 2) return false;
 
