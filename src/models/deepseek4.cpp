@@ -581,7 +581,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     cb(indexer_q, "lid_q_rot", il);
 
     ggml_tensor * indexer_weights = build_lora_mm(layer.indexer_proj, cur);
-    indexer_weights = ggml_scale(ctx0, indexer_weights, 1.0f/sqrtf(float(n_embd_indexer_head*n_indexer_head)));
     cb(indexer_weights, "lid_weights", il);
 
     ggml_tensor * indexer_k = inp_dsv4->mctx->get_lid()->get_k(ctx0, il);
@@ -602,32 +601,16 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
             indexer_weights->ne[0], indexer_weights->ne[1]/n_stream, indexer_weights->ne[2], n_stream,
             indexer_weights->nb[1], indexer_weights->nb[2]/n_stream, indexer_weights->nb[3]/n_stream, 0);
 
-    indexer_q = ggml_permute(ctx0, indexer_q, 0, 2, 1, 3);
-    cb(indexer_q, "lid_q", il);
-    indexer_k = ggml_permute(ctx0, indexer_k, 0, 2, 1, 3);
-    cb(indexer_k, "lid_k", il);
-
-    ggml_tensor * indexer_score = nullptr;
-    const int64_t n_indexer_head_view = indexer_q->ne[2];
-    GGML_ASSERT(indexer_weights->ne[0] == n_indexer_head_view);
-
-    // Accumulate the LID score one head at a time so we avoid materializing the
-    // full [n_lid, n_batch, n_head, n_stream] intermediate during reserve.
-    for (int64_t ih = 0; ih < n_indexer_head_view; ++ih) {
-        ggml_tensor * indexer_q_h = ggml_view_4d(ctx0, indexer_q,
-                indexer_q->ne[0], indexer_q->ne[1], 1, indexer_q->ne[3],
-                indexer_q->nb[1], indexer_q->nb[2], indexer_q->nb[3], ih*indexer_q->nb[2]);
-        ggml_tensor * indexer_w_h = ggml_view_4d(ctx0, indexer_weights,
-                1, indexer_weights->ne[1], indexer_weights->ne[2], indexer_weights->ne[3],
-                indexer_weights->nb[1], indexer_weights->nb[2], indexer_weights->nb[3], ih*indexer_weights->nb[0]);
-
-        ggml_tensor * indexer_score_h = ggml_mul_mat(ctx0, indexer_k, indexer_q_h);
-        indexer_score_h = ggml_relu(ctx0, indexer_score_h);
-        indexer_score_h = ggml_mul(ctx0, indexer_score_h, indexer_w_h);
-
-        indexer_score = indexer_score ? ggml_add(ctx0, indexer_score, indexer_score_h) : indexer_score_h;
-    }
-    cb(indexer_score, "lid_score", il);
+    // Always use the fused lightning indexer path so CUDA can score all heads
+    // without materializing the large intermediate that the unfused graph creates.
+    ggml_tensor * indexer_score = ggml_lightning_indexer(
+            ctx0,
+            indexer_q,
+            indexer_k,
+            indexer_weights,
+            1.0f / sqrtf(float(n_embd_indexer_head)),
+            1.0f / sqrtf(float(n_indexer_head)));
+    cb(indexer_score, "indexer_score", il);
 
     indexer_score = ggml_add(ctx0, indexer_score, inp_lid.kq_mask);
     cb(indexer_score, "lid_score_masked", il);
