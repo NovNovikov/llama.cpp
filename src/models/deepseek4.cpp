@@ -215,21 +215,6 @@ static ggml_tensor * dsv4_top_k_rows_view(ggml_context * ctx, ggml_tensor * top_
             top_k->nb[1], top_k->nb[2], top_k->ne[3]*top_k->nb[3], 0);
 }
 
-static ggml_tensor * dsv4_gather_top_k_mask_rows(
-        ggml_context * ctx,
-        ggml_tensor * kq_mask,
-        ggml_tensor * top_k) {
-    ggml_tensor * top_k_3d = dsv4_top_k_rows_view(ctx, top_k);
-
-    ggml_tensor * kq_mask_rows = ggml_view_4d(ctx, kq_mask, 1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3],
-            kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[2], 0);
-    ggml_tensor * kq_mask_top_k = ggml_get_rows(ctx, kq_mask_rows, top_k_3d);
-
-    return ggml_view_4d(ctx, kq_mask_top_k,
-            kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3],
-            kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
-}
-
 static constexpr int64_t DSV4_CSA_RATIO  = 4;
 static constexpr int64_t DSV4_HCA_RATIO  = 128;
 
@@ -630,21 +615,23 @@ ggml_tensor * llama_model_deepseek4::graph::build_top_k_mask(
     GGML_ASSERT(kq_mask);
     GGML_ASSERT(top_k);
 
-    // Reuse the original visibility rows for the selected indices so we do not
-    // need an extra add/zero source on top of the dense reserve-time mask.
-    ggml_tensor * selected_rows = dsv4_gather_top_k_mask_rows(ctx0, kq_mask, top_k);
-    selected_rows = ggml_view_4d(ctx0, selected_rows, 1, selected_rows->ne[0], selected_rows->ne[1], selected_rows->ne[3],
-            selected_rows->nb[0], selected_rows->nb[1], selected_rows->nb[2], 0);
-
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
     kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3],
             kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
 
     ggml_tensor * top_k_3d = dsv4_top_k_rows_view(ctx0, top_k);
-    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, selected_rows, top_k_3d);
+
+    // Keep the same top-k unmasking pattern as the generic llama.cpp graph path
+    // so backend schedulers see the canonical set_rows + add form.
+    ggml_tensor * zeros = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, 1, top_k_3d->ne[0], top_k_3d->ne[1], top_k_3d->ne[2]);
+    zeros = ggml_fill(ctx0, zeros, 0.0f);
+
+    ggml_tensor * kq_mask_top_k = ggml_set_rows(ctx0, kq_mask_all, zeros, top_k_3d);
     kq_mask_top_k = ggml_view_4d(ctx0, kq_mask_top_k,
             kq_mask_top_k->ne[1], kq_mask_top_k->ne[2], 1, kq_mask_top_k->ne[3],
             kq_mask_top_k->nb[2], kq_mask_top_k->nb[3], kq_mask_top_k->nb[3], 0);
+
+    kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
     cb(kq_mask_top_k, name, il);
 
     return kq_mask_top_k;
