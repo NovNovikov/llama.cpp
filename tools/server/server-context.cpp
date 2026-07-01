@@ -24,6 +24,7 @@
 #include <ctime>
 #include <cstddef>
 #include <cinttypes>
+#include <cstdlib>
 #include <exception>
 #include <fstream>
 #include <iomanip>
@@ -46,6 +47,11 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static bool server_prefill_profile_enabled() {
+    static const bool enabled = getenv("LLAMA_PREFILL_PROFILE") != nullptr;
+    return enabled;
+}
 
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
@@ -372,26 +378,6 @@ struct server_slot {
                 next_periodic_checkpoint_nt = next;
             }
         }
-    }
-
-    int64_t next_prompt_checkpoint_target_nt() const {
-        int64_t target = -1;
-
-        if (!checkpoint_quarter_done && checkpoint_quarter_nt > 0) {
-            target = checkpoint_quarter_nt;
-        }
-
-        if (!checkpoint_midpoint_done && checkpoint_midpoint_nt > 0 &&
-                (target < 0 || checkpoint_midpoint_nt < target)) {
-            target = checkpoint_midpoint_nt;
-        }
-
-        if (next_periodic_checkpoint_nt > 0 &&
-                (target < 0 || next_periodic_checkpoint_nt < target)) {
-            target = next_periodic_checkpoint_nt;
-        }
-
-        return target;
     }
 
     void init_sampler() const {
@@ -3516,6 +3502,8 @@ private:
         // process in chunks of params.n_batch
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
+        int32_t prompt_slots_batched = 0;
+        int32_t prompt_tokens_batched = 0;
 
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
@@ -3952,12 +3940,15 @@ private:
                     const bool periodic_checkpointing_enabled = params_base.checkpoint_every_n_tokens > 0;
                     const auto & spans = slot.task->params.message_spans;
                     const auto last_user_pos = spans.last_user_message_pos();
+                    const char * chunk_stop_reason = "prompt_exhausted";
+                    int64_t chunk_stop_target = -1;
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
+                            chunk_stop_reason = "mtmd_boundary";
                             break; // end of text chunk
                         }
 
@@ -3966,6 +3957,8 @@ private:
                         // this batch at those pre-invocation tokens.
                         if (alora_scale > 0 && slot.prompt.n_tokens() == slot.alora_invocation_start - 1) {
                             SLT_DBG(slot, "stop prompt batch filling at (n_tokens = %d, alora_invocation_start = %d)\n", slot.prompt.n_tokens(), slot.alora_invocation_start);
+                            chunk_stop_reason = "alora_boundary";
+                            chunk_stop_target = slot.alora_invocation_start - 1;
                             break;
                         }
 
@@ -3980,26 +3973,23 @@ private:
 
                         slot.n_prompt_tokens_processed++;
 
-                        // stop the prompt batch exactly before a user message
-                        if (spans.is_user_start(slot.prompt.n_tokens())) {
-                            break;
-                        }
+                        // Checkpoints are created only at natural batch boundaries. We do
+                        // not split a large prefill batch just to hit a user-message or
+                        // checkpoint target exactly, because that fragments long-context
+                        // prompt processing into many small decode calls.
+                    }
 
-                        // Debugging long-context cache reuse is much easier when checkpoints
-                        // are anchored to broad prompt coverage rather than only the tail.
-                        // Stop the batch exactly at the scheduled 25% / 50% / periodic target
-                        // so the next batch starts there and the checkpoint lands near that point.
-                        if (do_checkpoint) {
-                            const int64_t next_checkpoint_target_nt = slot.next_prompt_checkpoint_target_nt();
-                            if (next_checkpoint_target_nt > 0 &&
-                                    slot.prompt.n_tokens() == next_checkpoint_target_nt) {
-                                break;
-                            }
-                        }
+                    if (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() >= n_batch) {
+                        chunk_stop_reason = "batch_full";
+                        chunk_stop_target = batch.size();
                     }
 
                     // the number of tokens added to the batch for the current slot
                     const auto n_tokens_cur = batch.size() - n_tokens_prev;
+                    if (n_tokens_cur > 0) {
+                        prompt_slots_batched++;
+                        prompt_tokens_batched += n_tokens_cur;
+                    }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
@@ -4021,8 +4011,9 @@ private:
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
-                    // checkpoints are created before the current batch is decoded, so
-                    // their token position is the batch start rather than the prompt end
+                    // Checkpoints are created only at natural batch boundaries. Since they
+                    // are created before the current batch is decoded, their token position
+                    // is the batch start rather than the prompt end.
                     bool is_quarter_checkpoint = false;
                     bool is_midpoint_checkpoint = false;
                     bool is_periodic_checkpoint = false;
@@ -4039,7 +4030,11 @@ private:
                             slot.checkpoint_midpoint_nt > 0 &&
                             n_tokens_start >= slot.checkpoint_midpoint_nt;
 
-                        is_user_boundary_checkpoint = is_last_user_message;
+                        // Keep latest-user checkpoints only as optional extras when the
+                        // boundary already matches a natural batch start.
+                        is_user_boundary_checkpoint =
+                            is_last_user_message &&
+                            n_tokens_start == last_user_pos;
 
                         is_periodic_checkpoint =
                             periodic_checkpointing_enabled &&
@@ -4110,12 +4105,34 @@ private:
                             slot.next_periodic_checkpoint_nt += params_base.checkpoint_every_n_tokens;
                         }
                     }
+
+                    if (server_prefill_profile_enabled() && n_tokens_cur > 0) {
+                        SLT_INF(slot,
+                                "prefill_profile: chunk added=%d, cached=%d, processed=%d, batch_total=%d, n_batch=%d, n_ubatch=%d, stop=%s, target=%" PRId64 "\n",
+                                (int) n_tokens_cur,
+                                slot.n_prompt_tokens_cache,
+                                slot.n_prompt_tokens_processed,
+                                batch.size(),
+                                n_batch,
+                                n_ubatch,
+                                chunk_stop_reason,
+                                chunk_stop_target);
+                    }
                 }
 
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
             });
+
+            if (server_prefill_profile_enabled() && prompt_tokens_batched > 0) {
+                SRV_INF("prefill_profile: assembled prompt batch tokens=%d across %d slot(s), batch_total=%d, n_batch=%d, n_ubatch=%d\n",
+                        prompt_tokens_batched,
+                        prompt_slots_batched,
+                        batch.size(),
+                        n_batch,
+                        n_ubatch);
+            }
         }
     }
 
@@ -4123,6 +4140,19 @@ private:
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
+
+        int prompt_slots = 0;
+        if (server_prefill_profile_enabled()) {
+            for (auto & slot : slots) {
+                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
+                    prompt_slots++;
+                }
+            }
+        }
+        const bool profile_prefill = server_prefill_profile_enabled() && prompt_slots > 0;
+        const int32_t n_batch_before = n_batch;
+        const int32_t batch_tokens = batch_view.n_tokens;
+        const int64_t t_decode_start = profile_prefill ? ggml_time_us() : 0;
 
         auto & slot_batched      = batch.slot_batched;
         auto & alora_scale       = batch.alora_scale;
@@ -4156,6 +4186,7 @@ private:
         }
 
         const int ret = llama_decode(ctx_tgt, batch_view);
+        const double t_decode_ms = profile_prefill ? (ggml_time_us() - t_decode_start) / 1000.0 : 0.0;
 
         metrics.on_decoded(slots);
 
@@ -4205,6 +4236,10 @@ private:
             }
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
+            if (profile_prefill) {
+                SRV_INF("prefill_profile: decode retry off=%d, batch_tokens=%d, n_batch=%d -> %d, prompt_slots=%d, time=%.2f ms, ret=%d\n",
+                        off, batch_tokens, n_batch_before, n_batch, prompt_slots, t_decode_ms, ret);
+            }
 
             return false; // retry with the updated n_batch
         }
@@ -4217,6 +4252,11 @@ private:
 
             // TODO: handle error
             throw std::runtime_error("failed to process speculative batch");
+        }
+
+        if (profile_prefill) {
+            SRV_INF("prefill_profile: decode ok off=%d, batch_tokens=%d, n_batch=%d, prompt_slots=%d, time=%.2f ms\n",
+                    off, batch_tokens, n_batch_before, prompt_slots, t_decode_ms);
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too

@@ -14,6 +14,7 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -28,6 +29,11 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
         case LLAMA_CONTEXT_TYPE_MTP    : return LLM_GRAPH_TYPE_DECODER_MTP;
     }
     throw std::runtime_error("Unsupported ctx type");
+}
+
+static bool llama_prefill_profile_enabled() {
+    static const bool enabled = getenv("LLAMA_PREFILL_PROFILE") != nullptr;
+    return enabled;
 }
 
 llama_context::llama_context(
@@ -625,6 +631,17 @@ void llama_context::sched_reserve() {
     int n_nodes_tg  = -1;
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
+
+    if (llama_prefill_profile_enabled()) {
+        LLAMA_LOG_INFO("%s: prefill_profile reserve n_tokens=%u, n_seqs=%u, n_outputs_pp=%u, n_ubatch=%u, flash_attn=%s, kv_unified=%s\n",
+                __func__,
+                n_tokens,
+                n_seqs,
+                n_outputs_pp,
+                cparams.n_ubatch,
+                cparams.flash_attn ? "enabled" : "disabled",
+                cparams.kv_unified ? "true" : "false");
+    }
 
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
