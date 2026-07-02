@@ -190,6 +190,42 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
 
 #define CUDA_CHECK(err) CUDA_CHECK_GEN(err, cudaSuccess, cudaGetErrorString)
 
+static bool ggml_cuda_prefill_profile_enabled() {
+    static const bool enabled = getenv("LLAMA_PREFILL_PROFILE") != nullptr;
+    return enabled;
+}
+
+// Debug-only: per-op CUDA timing forces stream synchronization and can distort
+// prompt-processing throughput, so keep it behind a dedicated opt-in flag.
+static bool ggml_cuda_prefill_profile_timing_enabled() {
+    static const bool enabled = getenv("LLAMA_PREFILL_PROFILE_CUDA_TIMING") != nullptr;
+    return enabled;
+}
+
+static void ggml_cuda_prefill_profile_append(const char * text) {
+    if (!ggml_cuda_prefill_profile_enabled()) {
+        return;
+    }
+
+    static const std::string path = []() {
+        const char * env = getenv("LLAMA_PREFILL_PROFILE_FILE");
+        return std::string(env && env[0] ? env : "prefill_profile.txt");
+    }();
+    static std::mutex mtx;
+
+    std::lock_guard<std::mutex> lock(mtx);
+    FILE * file = ggml_fopen(path.c_str(), "ab");
+    if (!file) {
+        return;
+    }
+
+    fputs(text, file);
+    if (text[0] == '\0' || text[strlen(text) - 1] != '\n') {
+        fputc('\n', file);
+    }
+    fclose(file);
+}
+
 
 #if CUDART_VERSION >= 12000 || defined(GGML_USE_MUSA)
     static const char * cublas_get_error_str(const cublasStatus_t err) {

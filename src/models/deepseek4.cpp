@@ -16,11 +16,6 @@ static float dsv4_rope_attn_factor(float freq_scale, float ext_factor) {
     return 1.0f / (1.0f + 0.1f*logf(1.0f/freq_scale));
 }
 
-static bool dsv4_prefill_profile_enabled() {
-    static const bool enabled = getenv("LLAMA_PREFILL_PROFILE") != nullptr;
-    return enabled;
-}
-
 void llama_model_deepseek4::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
@@ -544,9 +539,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     const int64_t n_embd_indexer_head_nope = n_embd_indexer_head - n_embd_indexer_head_rope;
     const int64_t n_indexer_head           = hparams.indexer_n_head;
     const int64_t nt                       = cur->ne[1];
-    const bool profile_prefill = dsv4_prefill_profile_enabled();
-    const int64_t t_start_us = profile_prefill ? ggml_time_us() : 0;
-
     GGML_ASSERT(inp_lid.kq_mask);
     GGML_ASSERT(inp_lid.k_rot);
     GGML_ASSERT(n_embd_indexer_head >= n_embd_indexer_head_rope);
@@ -612,16 +604,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
     cb(top_k, "lid_top_k", il);
 
-    if (profile_prefill) {
-        LLAMA_LOG_INFO("%s: prefill_profile layer=%d, nt=%lld, n_lid=%lld, n_stream=%lld, n_top_k=%u, time=%.3f ms\n",
-                __func__,
-                il,
-                (long long) nt,
-                (long long) n_lid,
-                (long long) n_stream,
-                n_top_k,
-                (ggml_time_us() - t_start_us) / 1000.0);
-    }
+    llama_prefill_profile_graph_note_lid(nt, n_lid, n_stream, n_top_k);
 
     return top_k;
 }
@@ -633,9 +616,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_top_k_mask(
         int il) const {
     GGML_ASSERT(kq_mask);
     GGML_ASSERT(top_k);
-    const bool profile_prefill = dsv4_prefill_profile_enabled();
-    const int64_t t_start_us = profile_prefill ? ggml_time_us() : 0;
-
     ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
     kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3],
             kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
@@ -655,17 +635,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_top_k_mask(
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
     cb(kq_mask_top_k, name, il);
 
-    if (profile_prefill) {
-        LLAMA_LOG_INFO("%s: prefill_profile layer=%d, name=%s, n_kv=%lld, n_top_k=%lld, n_batch=%lld, n_stream=%lld, time=%.3f ms\n",
-                __func__,
-                il,
-                name,
-                (long long) kq_mask->ne[0],
-                (long long) top_k->ne[0],
-                (long long) kq_mask->ne[1],
-                (long long) kq_mask->ne[3],
-                (ggml_time_us() - t_start_us) / 1000.0);
-    }
+    llama_prefill_profile_graph_note_top_k_mask(kq_mask, top_k, kq_mask_all, zeros);
 
     return kq_mask_top_k;
 }
@@ -685,9 +655,6 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     const auto & inp_csa = inp_dsv4->get_csa();
     GGML_ASSERT(inp_csa.kq_mask);
     GGML_ASSERT(inp_attn->self_k_rot == nullptr);
-    const bool profile_prefill = dsv4_prefill_profile_enabled();
-    const int64_t t_start_us = profile_prefill ? ggml_time_us() : 0;
-
     ggml_tensor * top_k = build_lid_top_k(model, inp_dsv4, qr, cur, inp_pos, il);
 
     ggml_build_forward_expand(gf, q);
@@ -732,16 +699,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, kq_b, kq_mask, sinks, nullptr, kq_scale, il);
     cb(out, "attn_csa_lid", il);
 
-    if (profile_prefill) {
-        LLAMA_LOG_INFO("%s: prefill_profile layer=%d, nt=%lld, raw_kv=%lld, csa_kv=%lld, n_stream=%lld, time=%.3f ms\n",
-                __func__,
-                il,
-                (long long) cur->ne[1],
-                (long long) raw_mask->ne[0],
-                (long long) inp_csa.kq_mask->ne[0],
-                (long long) k_all->ne[3],
-                (ggml_time_us() - t_start_us) / 1000.0);
-    }
+    llama_prefill_profile_graph_note_csa_lid_attention(cur->ne[1], raw_mask->ne[0], inp_csa.kq_mask->ne[0], k_all->ne[3]);
 
     return out;
 }

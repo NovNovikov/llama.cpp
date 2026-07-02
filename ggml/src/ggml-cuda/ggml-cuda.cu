@@ -2790,6 +2790,19 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    const bool profile_cuda_op = ggml_cuda_prefill_profile_timing_enabled() && (
+            dst->op == GGML_OP_SET_ROWS ||
+            dst->op == GGML_OP_FLASH_ATTN_EXT ||
+            dst->op == GGML_OP_LIGHTNING_INDEXER);
+    cudaEvent_t profile_start = nullptr;
+    cudaEvent_t profile_end = nullptr;
+
+    if (profile_cuda_op) {
+        CUDA_CHECK(cudaEventCreate(&profile_start));
+        CUDA_CHECK(cudaEventCreate(&profile_end));
+        CUDA_CHECK(cudaEventRecord(profile_start, ctx.stream()));
+    }
+
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -3124,6 +3137,27 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         default:
             return false;
+    }
+
+    if (profile_cuda_op) {
+        CUDA_CHECK(cudaEventRecord(profile_end, ctx.stream()));
+        CUDA_CHECK(cudaEventSynchronize(profile_end));
+
+        float elapsed_ms = 0.0f;
+        CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, profile_start, profile_end));
+
+        char profile_msg[512];
+        snprintf(profile_msg, sizeof(profile_msg), "%s: prefill_profile_cuda op=%s tensor=%s ne=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] ms=%.3f\n",
+                __func__,
+                ggml_op_name(dst->op),
+                dst->name ? dst->name : "(unnamed)",
+                dst->ne[0], dst->ne[1], dst->ne[2], dst->ne[3],
+                elapsed_ms);
+        GGML_LOG_INFO("%s", profile_msg);
+        ggml_cuda_prefill_profile_append(profile_msg);
+
+        CUDA_CHECK(cudaEventDestroy(profile_start));
+        CUDA_CHECK(cudaEventDestroy(profile_end));
     }
 
     cudaError_t err = cudaGetLastError();
