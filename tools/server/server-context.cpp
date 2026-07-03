@@ -50,6 +50,23 @@ using json = nlohmann::ordered_json;
 constexpr int HTTP_POLLING_SECONDS = 1;
 constexpr int CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT = 8192;
 
+static int32_t server_prompt_tail_batch_limit(int32_t remaining_tokens, int32_t n_batch) {
+    if (n_batch <= 0 || remaining_tokens <= n_batch) {
+        return n_batch;
+    }
+
+    const int32_t tail_tokens = remaining_tokens - n_batch;
+
+    // If the natural final tail would be much smaller than a full prompt batch,
+    // split the final two batches more evenly to avoid a disproportionately slow
+    // tiny last decode call.
+    if (tail_tokens > 0 && tail_tokens < n_batch/2) {
+        return (remaining_tokens + 1)/2;
+    }
+
+    return n_batch;
+}
+
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
 
@@ -4070,9 +4087,15 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
                     const char * chunk_stop_reason = "prompt_exhausted";
                     int64_t chunk_stop_target = -1;
+                    int32_t batch_fill_limit = n_batch;
+
+                    if (batch.size() == n_tokens_prev) {
+                        const int32_t remaining_tokens = slot.task->n_tokens() - slot.prompt.n_tokens();
+                        batch_fill_limit = server_prompt_tail_batch_limit(remaining_tokens, n_batch);
+                    }
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < batch_fill_limit) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -4107,9 +4130,9 @@ private:
                         // prompt processing into many small decode calls.
                     }
 
-                    if (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() >= n_batch) {
+                    if (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() >= batch_fill_limit) {
                         chunk_stop_reason = "batch_full";
-                        chunk_stop_target = batch.size();
+                        chunk_stop_target = batch_fill_limit;
                     }
 
                     // the number of tokens added to the batch for the current slot

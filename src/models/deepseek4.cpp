@@ -670,13 +670,19 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
 ggml_tensor * llama_model_deepseek4::graph::build_top_k_mask(
         ggml_tensor * kq_mask,
         ggml_tensor * top_k,
+        ggml_type mask_type,
         const char * name,
         int il) const {
     GGML_ASSERT(kq_mask);
     GGML_ASSERT(top_k);
-    ggml_tensor * kq_mask_all = ggml_fill(ctx0, kq_mask, -INFINITY);
-    ggml_tensor * kq_mask_rows = ggml_view_4d(ctx0, kq_mask, 1, kq_mask->ne[0], kq_mask->ne[1], kq_mask->ne[3],
-            kq_mask->nb[0], kq_mask->nb[1], kq_mask->nb[2], 0);
+    ggml_tensor * source_mask = kq_mask;
+    if (source_mask->type != mask_type) {
+        source_mask = ggml_cast(ctx0, source_mask, mask_type);
+    }
+
+    ggml_tensor * kq_mask_all = ggml_fill(ctx0, source_mask, -INFINITY);
+    ggml_tensor * kq_mask_rows = ggml_view_4d(ctx0, source_mask, 1, source_mask->ne[0], source_mask->ne[1], source_mask->ne[3],
+            source_mask->nb[0], source_mask->nb[1], source_mask->nb[2], 0);
     kq_mask_all = ggml_view_4d(ctx0, kq_mask_all, 1, kq_mask_all->ne[0], kq_mask_all->ne[1], kq_mask_all->ne[3],
             kq_mask_all->nb[0], kq_mask_all->nb[1], kq_mask_all->nb[2], 0);
 
@@ -739,11 +745,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     cb(k_all, "csa_k_all", il);
 
     ggml_tensor * raw_mask = inp_attn->get_kq_mask();
-    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, "csa_top_k_mask", il);
-    const bool use_fattn = cparams.flash_attn && (!cparams.kv_unified || csa_mask->ne[3] == 1);
-    if (use_fattn && csa_mask->type != GGML_TYPE_F16) {
-        csa_mask = ggml_cast(ctx0, csa_mask, GGML_TYPE_F16);
-    }
+    const bool use_fattn = cparams.flash_attn && (!cparams.kv_unified || inp_csa.kq_mask->ne[3] == 1);
+    const ggml_type mask_type = use_fattn ? GGML_TYPE_F16 : inp_csa.kq_mask->type;
+    ggml_tensor * csa_mask = build_top_k_mask(inp_csa.kq_mask, top_k, mask_type, "csa_top_k_mask", il);
     if (raw_mask->type != csa_mask->type) {
         raw_mask = ggml_cast(ctx0, raw_mask, csa_mask->type);
     }
