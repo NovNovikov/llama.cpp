@@ -49,11 +49,6 @@ using json = nlohmann::ordered_json;
 constexpr int HTTP_POLLING_SECONDS = 1;
 constexpr int CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT = 8192;
 
-static bool server_prefill_profile_enabled() {
-    static const bool enabled = getenv("LLAMA_PREFILL_PROFILE") != nullptr;
-    return enabled;
-}
-
 static uint32_t server_n_outputs_max(const common_params & params) {
     const uint32_t n_batch  = params.n_batch;
 
@@ -4108,33 +4103,12 @@ private:
                         }
                     }
 
-                    if (server_prefill_profile_enabled() && n_tokens_cur > 0) {
-                        SLT_INF(slot,
-                                "prefill_profile: chunk added=%d, cached=%d, processed=%d, batch_total=%d, n_batch=%d, n_ubatch=%d, stop=%s, target=%" PRId64 "\n",
-                                (int) n_tokens_cur,
-                                slot.n_prompt_tokens_cache,
-                                slot.n_prompt_tokens_processed,
-                                batch.size(),
-                                n_batch,
-                                n_ubatch,
-                                chunk_stop_reason,
-                                chunk_stop_target);
-                    }
                 }
 
                 if (!slot_batched) {
                     slot_batched = &slot;
                 }
             });
-
-            if (server_prefill_profile_enabled() && prompt_tokens_batched > 0) {
-                SRV_INF("prefill_profile: assembled prompt batch tokens=%d across %d slot(s), batch_total=%d, n_batch=%d, n_ubatch=%d\n",
-                        prompt_tokens_batched,
-                        prompt_slots_batched,
-                        batch.size(),
-                        n_batch,
-                        n_ubatch);
-            }
         }
     }
 
@@ -4142,19 +4116,6 @@ private:
     // throw std::runtime_error on fatal error
     bool decode(int32_t & n_batch, int32_t off, llama_batch & batch_view) {
         SRV_DBG("n_batch (effective) = %d, off = %d\n", n_batch, off);
-
-        int prompt_slots = 0;
-        if (server_prefill_profile_enabled()) {
-            for (auto & slot : slots) {
-                if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_DONE_PROMPT) {
-                    prompt_slots++;
-                }
-            }
-        }
-        const bool profile_prefill = server_prefill_profile_enabled() && prompt_slots > 0;
-        const int32_t n_batch_before = n_batch;
-        const int32_t batch_tokens = batch_view.n_tokens;
-        const int64_t t_decode_start = profile_prefill ? ggml_time_us() : 0;
 
         auto & slot_batched      = batch.slot_batched;
         auto & alora_scale       = batch.alora_scale;
@@ -4188,7 +4149,6 @@ private:
         }
 
         const int ret = llama_decode(ctx_tgt, batch_view);
-        const double t_decode_ms = profile_prefill ? (ggml_time_us() - t_decode_start) / 1000.0 : 0.0;
 
         metrics.on_decoded(slots);
 
@@ -4238,10 +4198,6 @@ private:
             }
 
             SRV_WRN("failed to find free space in the KV cache, retrying with smaller batch size, off = %d, n_batch = %d, ret = %d\n", off, n_batch, ret);
-            if (profile_prefill) {
-                SRV_INF("prefill_profile: decode retry off=%d, batch_tokens=%d, n_batch=%d -> %d, prompt_slots=%d, time=%.2f ms, ret=%d\n",
-                        off, batch_tokens, n_batch_before, n_batch, prompt_slots, t_decode_ms, ret);
-            }
 
             return false; // retry with the updated n_batch
         }
@@ -4254,11 +4210,6 @@ private:
 
             // TODO: handle error
             throw std::runtime_error("failed to process speculative batch");
-        }
-
-        if (profile_prefill) {
-            SRV_INF("prefill_profile: decode ok off=%d, batch_tokens=%d, n_batch=%d, prompt_slots=%d, time=%.2f ms\n",
-                    off, batch_tokens, n_batch_before, prompt_slots, t_decode_ms);
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
