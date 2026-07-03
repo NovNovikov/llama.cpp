@@ -604,7 +604,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_lid_top_k(
     ggml_tensor * top_k = ggml_cont(ctx0, ggml_top_k(ctx0, indexer_score, n_top_k));
     cb(top_k, "lid_top_k", il);
 
-    llama_prefill_profile_graph_note_lid(nt, n_lid, n_stream, n_top_k, indexer_score, top_k);
+    llama_prefill_profile_graph_note_lid(nt, n_lid, n_stream, n_top_k);
 
     return top_k;
 }
@@ -635,7 +635,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_top_k_mask(
     kq_mask_top_k = ggml_add(ctx0, kq_mask_top_k, kq_mask);
     cb(kq_mask_top_k, name, il);
 
-    llama_prefill_profile_graph_note_top_k_mask(kq_mask, top_k, kq_mask_all, zeros, kq_mask_top_k);
+    llama_prefill_profile_graph_note_top_k_mask(kq_mask, top_k, kq_mask_all, zeros);
 
     return kq_mask_top_k;
 }
@@ -699,7 +699,7 @@ ggml_tensor * llama_model_deepseek4::graph::build_csa_lid_attention(
     ggml_tensor * out = build_attn_mha(q, k_all, k_all, kq_b, kq_mask, sinks, nullptr, kq_scale, il);
     cb(out, "attn_csa_lid", il);
 
-    llama_prefill_profile_graph_note_csa_lid_attention(cur->ne[1], raw_mask->ne[0], inp_csa.kq_mask->ne[0], k_all->ne[3], raw_k, csa_k, k_all, raw_mask, csa_mask, kq_mask);
+    llama_prefill_profile_graph_note_csa_lid_attention(cur->ne[1], raw_mask->ne[0], inp_csa.kq_mask->ne[0], k_all->ne[3]);
 
     return out;
 }

@@ -90,15 +90,6 @@ struct llama_prefill_profile_graph_state {
     uint64_t dense_mask_bytes_max = 0;
     uint64_t zero_rows_bytes_total = 0;
     uint64_t zero_rows_bytes_max = 0;
-    uint64_t lid_score_bytes_max = 0;
-    uint64_t lid_top_k_bytes_max = 0;
-    uint64_t top_k_mask_bytes_max = 0;
-    uint64_t raw_mask_bytes_max = 0;
-    uint64_t csa_mask_bytes_max = 0;
-    uint64_t final_mask_bytes_max = 0;
-    uint64_t raw_k_bytes_max = 0;
-    uint64_t csa_k_bytes_max = 0;
-    uint64_t k_all_bytes_max = 0;
     int64_t mask_n_kv_max = 0;
     int64_t mask_n_batch_max = 0;
     int64_t mask_n_stream_max = 0;
@@ -138,7 +129,7 @@ void llama_prefill_profile_graph_reset() {
     g_prefill_profile_graph_state = {};
 }
 
-void llama_prefill_profile_graph_note_lid(int64_t nt, int64_t n_lid, int64_t n_stream, uint32_t n_top_k, const ggml_tensor * indexer_score, const ggml_tensor * top_k) {
+void llama_prefill_profile_graph_note_lid(int64_t nt, int64_t n_lid, int64_t n_stream, uint32_t n_top_k) {
     if (!llama_prefill_profile_enabled()) {
         return;
     }
@@ -150,11 +141,9 @@ void llama_prefill_profile_graph_note_lid(int64_t nt, int64_t n_lid, int64_t n_s
     s.n_stream_max = std::max(s.n_stream_max, n_stream);
     s.n_top_k_total += n_top_k;
     s.n_top_k_max = std::max<int64_t>(s.n_top_k_max, n_top_k);
-    s.lid_score_bytes_max = std::max<uint64_t>(s.lid_score_bytes_max, ggml_nbytes(indexer_score));
-    s.lid_top_k_bytes_max = std::max<uint64_t>(s.lid_top_k_bytes_max, ggml_nbytes(top_k));
 }
 
-void llama_prefill_profile_graph_note_top_k_mask(const ggml_tensor * kq_mask, const ggml_tensor * top_k, const ggml_tensor * kq_mask_all, const ggml_tensor * zeros, const ggml_tensor * kq_mask_top_k) {
+void llama_prefill_profile_graph_note_top_k_mask(const ggml_tensor * kq_mask, const ggml_tensor * top_k, const ggml_tensor * kq_mask_all, const ggml_tensor * zeros) {
     if (!llama_prefill_profile_enabled()) {
         return;
     }
@@ -165,7 +154,6 @@ void llama_prefill_profile_graph_note_top_k_mask(const ggml_tensor * kq_mask, co
     s.dense_mask_bytes_max = std::max<uint64_t>(s.dense_mask_bytes_max, ggml_nbytes(kq_mask_all));
     s.zero_rows_bytes_total += ggml_nbytes(zeros);
     s.zero_rows_bytes_max = std::max<uint64_t>(s.zero_rows_bytes_max, ggml_nbytes(zeros));
-    s.top_k_mask_bytes_max = std::max<uint64_t>(s.top_k_mask_bytes_max, ggml_nbytes(kq_mask_top_k));
     s.mask_n_kv_max = std::max<int64_t>(s.mask_n_kv_max, kq_mask->ne[0]);
     s.mask_n_batch_max = std::max<int64_t>(s.mask_n_batch_max, kq_mask->ne[1]);
     s.mask_n_stream_max = std::max<int64_t>(s.mask_n_stream_max, kq_mask->ne[3]);
@@ -173,7 +161,7 @@ void llama_prefill_profile_graph_note_top_k_mask(const ggml_tensor * kq_mask, co
     s.n_top_k_max = std::max<int64_t>(s.n_top_k_max, top_k->ne[0]);
 }
 
-void llama_prefill_profile_graph_note_csa_lid_attention(int64_t nt, int64_t raw_kv, int64_t csa_kv, int64_t n_stream, const ggml_tensor * raw_k, const ggml_tensor * csa_k, const ggml_tensor * k_all, const ggml_tensor * raw_mask, const ggml_tensor * csa_mask, const ggml_tensor * kq_mask) {
+void llama_prefill_profile_graph_note_csa_lid_attention(int64_t nt, int64_t raw_kv, int64_t csa_kv, int64_t n_stream) {
     if (!llama_prefill_profile_enabled()) {
         return;
     }
@@ -184,12 +172,6 @@ void llama_prefill_profile_graph_note_csa_lid_attention(int64_t nt, int64_t raw_
     s.raw_kv_max = std::max(s.raw_kv_max, raw_kv);
     s.csa_kv_max = std::max(s.csa_kv_max, csa_kv);
     s.n_stream_max = std::max(s.n_stream_max, n_stream);
-    s.raw_k_bytes_max = std::max<uint64_t>(s.raw_k_bytes_max, ggml_nbytes(raw_k));
-    s.csa_k_bytes_max = std::max<uint64_t>(s.csa_k_bytes_max, ggml_nbytes(csa_k));
-    s.k_all_bytes_max = std::max<uint64_t>(s.k_all_bytes_max, ggml_nbytes(k_all));
-    s.raw_mask_bytes_max = std::max<uint64_t>(s.raw_mask_bytes_max, ggml_nbytes(raw_mask));
-    s.csa_mask_bytes_max = std::max<uint64_t>(s.csa_mask_bytes_max, ggml_nbytes(csa_mask));
-    s.final_mask_bytes_max = std::max<uint64_t>(s.final_mask_bytes_max, ggml_nbytes(kq_mask));
 }
 
 std::string llama_prefill_profile_graph_consume(const ggml_cgraph * gf, const char * phase, int64_t n_tokens, bool reused) {
@@ -224,7 +206,7 @@ std::string llama_prefill_profile_graph_consume(const ggml_cgraph * gf, const ch
     }
 
     return format(
-            "prefill_profile_graph: phase=%s, n_tokens=%lld, reused=%s, nodes=%d, ops={lightning=%d, flash_attn=%d, set_rows=%d, fill=%d, add=%d}, dsv4={lid_calls=%d, csa_calls=%d, mask_calls=%d, nt_max=%lld, n_lid_total=%lld, raw_kv_max=%lld, csa_kv_max=%lld, n_stream_max=%lld, top_k_total=%lld, top_k_max=%lld, mask_n_kv_max=%lld, mask_n_batch_max=%lld, mask_n_stream_max=%lld, lid_score_max_mib=%.2f, lid_top_k_max_mib=%.2f, dense_mask_total_mib=%.2f, dense_mask_max_mib=%.2f, zero_rows_total_mib=%.2f, zero_rows_max_mib=%.2f, top_k_mask_max_mib=%.2f, raw_k_max_mib=%.2f, csa_k_max_mib=%.2f, k_all_max_mib=%.2f, raw_mask_max_mib=%.2f, csa_mask_max_mib=%.2f, final_mask_max_mib=%.2f}\n",
+            "prefill_profile_graph: phase=%s, n_tokens=%lld, reused=%s, nodes=%d, ops={lightning=%d, flash_attn=%d, set_rows=%d, fill=%d, add=%d}, dsv4={lid_calls=%d, csa_calls=%d, mask_calls=%d, nt_max=%lld, n_lid_total=%lld, raw_kv_max=%lld, csa_kv_max=%lld, n_stream_max=%lld, top_k_total=%lld, top_k_max=%lld, mask_n_kv_max=%lld, mask_n_batch_max=%lld, mask_n_stream_max=%lld, dense_mask_total_mib=%.2f, dense_mask_max_mib=%.2f, zero_rows_total_mib=%.2f, zero_rows_max_mib=%.2f}\n",
             phase,
             (long long) n_tokens,
             reused ? "true" : "false",
@@ -247,19 +229,10 @@ std::string llama_prefill_profile_graph_consume(const ggml_cgraph * gf, const ch
             (long long) s.mask_n_kv_max,
             (long long) s.mask_n_batch_max,
             (long long) s.mask_n_stream_max,
-            s.lid_score_bytes_max / 1024.0 / 1024.0,
-            s.lid_top_k_bytes_max / 1024.0 / 1024.0,
             s.dense_mask_bytes_total / 1024.0 / 1024.0,
             s.dense_mask_bytes_max / 1024.0 / 1024.0,
             s.zero_rows_bytes_total / 1024.0 / 1024.0,
-            s.zero_rows_bytes_max / 1024.0 / 1024.0,
-            s.top_k_mask_bytes_max / 1024.0 / 1024.0,
-            s.raw_k_bytes_max / 1024.0 / 1024.0,
-            s.csa_k_bytes_max / 1024.0 / 1024.0,
-            s.k_all_bytes_max / 1024.0 / 1024.0,
-            s.raw_mask_bytes_max / 1024.0 / 1024.0,
-            s.csa_mask_bytes_max / 1024.0 / 1024.0,
-            s.final_mask_bytes_max / 1024.0 / 1024.0);
+            s.zero_rows_bytes_max / 1024.0 / 1024.0);
 }
 
 void replace_all(std::string & s, const std::string & search, const std::string & replace) {
