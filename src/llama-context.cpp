@@ -31,6 +31,11 @@ static llm_graph_type ctx_type_to_graph_type(llama_context_type ctx_type) {
     throw std::runtime_error("Unsupported ctx type");
 }
 
+static bool llama_prefill_profile_enabled() {
+    static const bool enabled = getenv("LLAMA_PREFILL_PROFILE") != nullptr;
+    return enabled;
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -627,11 +632,19 @@ void llama_context::sched_reserve() {
 
     const uint32_t n_outputs_pp = std::min(n_tokens, cparams.n_outputs_max);
 
+    if (llama_prefill_profile_enabled()) {
+        LLAMA_LOG_INFO("%s: prefill_profile reserve n_tokens=%u, n_seqs=%u, n_outputs_pp=%u, n_ubatch=%u, flash_attn=%s, kv_unified=%s\n",
+                __func__,
+                n_tokens,
+                n_seqs,
+                n_outputs_pp,
+                cparams.n_ubatch,
+                cparams.flash_attn ? "enabled" : "disabled",
+                cparams.kv_unified ? "true" : "false");
+    }
+
     // reserve pp (prompt processing) graph first so that buffers are only allocated once
     {
-        if (llama_prefill_profile_enabled() && n_tokens > 1) {
-            llama_prefill_profile_graph_reset();
-        }
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
@@ -644,10 +657,6 @@ void llama_context::sched_reserve() {
             if (!gf) {
                 throw std::runtime_error("failed to allocate compute pp buffers");
             }
-        }
-
-        if (llama_prefill_profile_enabled() && n_tokens > 1) {
-            llama_prefill_profile_append(llama_prefill_profile_graph_consume(gf, "reserve_pp", n_tokens, false));
         }
 
         n_splits_pp = ggml_backend_sched_get_n_splits(sched.get());
@@ -1421,11 +1430,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
-        const bool profile_prefill_graph = llama_prefill_profile_enabled() && ubatch.n_tokens > 1;
-        if (profile_prefill_graph) {
-            llama_prefill_profile_graph_reset();
-        }
-
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -1434,10 +1438,6 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             LLAMA_LOG_ERROR("%s: failed to initialize graph\n", __func__);
             ret = GGML_STATUS_FAILED;
             return nullptr;
-        }
-
-        if (profile_prefill_graph) {
-            llama_prefill_profile_append(llama_prefill_profile_graph_consume(gf, "process_ubatch_build", ubatch.n_tokens, false));
         }
 
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
@@ -2514,16 +2514,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     res->reset();
 
-    const bool profile_prefill_graph = llama_prefill_profile_enabled() && ubatch.n_tokens > 1;
-    if (profile_prefill_graph) {
-        llama_prefill_profile_graph_reset();
-    }
-
     auto * gf = model.build_graph(gparams);
-
-    if (profile_prefill_graph) {
-        llama_prefill_profile_append(llama_prefill_profile_graph_consume(gf, "graph_reserve", ubatch.n_tokens, false));
-    }
 
     this->n_outputs = save_n_outputs;
 

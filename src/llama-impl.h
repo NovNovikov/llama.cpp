@@ -2,7 +2,6 @@
 
 #include "ggml.h" // for ggml_log_level
 
-#include <cstdint>
 #include <string>
 #include <type_traits>
 #include <vector>
@@ -24,13 +23,6 @@
 LLAMA_ATTRIBUTE_FORMAT(2, 3)
 void llama_log_internal        (ggml_log_level level, const char * format, ...);
 void llama_log_callback_default(ggml_log_level level, const char * text, void * user_data);
-bool llama_prefill_profile_enabled();
-void llama_prefill_profile_append(const std::string & text);
-void llama_prefill_profile_graph_reset();
-void llama_prefill_profile_graph_note_lid(int64_t nt, int64_t n_lid, int64_t n_stream, uint32_t n_top_k);
-void llama_prefill_profile_graph_note_top_k_mask(const struct ggml_tensor * kq_mask, const struct ggml_tensor * top_k, const struct ggml_tensor * kq_mask_all, const struct ggml_tensor * zeros);
-void llama_prefill_profile_graph_note_csa_lid_attention(int64_t nt, int64_t raw_kv, int64_t csa_kv, int64_t n_stream);
-std::string llama_prefill_profile_graph_consume(const struct ggml_cgraph * gf, const char * phase, int64_t n_tokens, bool reused);
 
 #define LLAMA_LOG(...)       llama_log_internal(GGML_LOG_LEVEL_NONE , __VA_ARGS__)
 #define LLAMA_LOG_INFO(...)  llama_log_internal(GGML_LOG_LEVEL_INFO , __VA_ARGS__)

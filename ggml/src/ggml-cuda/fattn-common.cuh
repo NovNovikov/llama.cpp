@@ -1102,41 +1102,10 @@ void launch_fattn(
         const int iter_k = K->ne[1] / FATTN_KQ_STRIDE;
 
         KV_max.alloc(ne_KV_max);
-        cudaEvent_t profile_start = nullptr;
-        cudaEvent_t profile_end = nullptr;
-        const bool profile_mask_scan = ggml_cuda_prefill_profile_timing_enabled();
-        if (profile_mask_scan) {
-            CUDA_CHECK(cudaEventCreate(&profile_start));
-            CUDA_CHECK(cudaEventCreate(&profile_end));
-            CUDA_CHECK(cudaEventRecord(profile_start, main_stream));
-        }
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num_KV_max, block_dim_KV_max, 0, main_stream);
         ggml_cuda_kernel_launch(flash_attn_mask_to_KV_max<ncols1>, launch_params,
             (const half2 *) mask->data, KV_max.ptr, iter_k, s31, s33);
         CUDA_CHECK(cudaGetLastError());
-        if (profile_mask_scan) {
-            CUDA_CHECK(cudaEventRecord(profile_end, main_stream));
-            CUDA_CHECK(cudaEventSynchronize(profile_end));
-
-            float elapsed_ms = 0.0f;
-            CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, profile_start, profile_end));
-
-            char profile_msg[512];
-            snprintf(profile_msg, sizeof(profile_msg), "%s: prefill_profile_cuda op=flash_attn_mask_to_KV_max mask=%s q_ne1=%lld k_ne1=%lld ntiles_x=%u n_seqs=%lld iter_k=%d ms=%.3f\n",
-                    __func__,
-                    mask->name ? mask->name : "(unnamed)",
-                    (long long) Q->ne[1],
-                    (long long) K->ne[1],
-                    blocks_num_KV_max.x,
-                    (long long) Q->ne[3],
-                    iter_k,
-                    elapsed_ms);
-            GGML_LOG_INFO("%s", profile_msg);
-            ggml_cuda_prefill_profile_append(profile_msg);
-
-            CUDA_CHECK(cudaEventDestroy(profile_start));
-            CUDA_CHECK(cudaEventDestroy(profile_end));
-        }
     }
 
     const dim3 block_dim(warp_size, nwarps, 1);
