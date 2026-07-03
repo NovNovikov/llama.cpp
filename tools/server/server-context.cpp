@@ -28,6 +28,7 @@
 #include <exception>
 #include <fstream>
 #include <iomanip>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <sstream>
@@ -910,6 +911,129 @@ static void debug_log_generated_output_jsonl(
     }
 
     debug_append_jsonl_record(params.log_generated_output, "--log-generated-output", rec);
+}
+
+static int64_t server_checkpoint_abs_distance(const int64_t a, const int64_t b) {
+    return a > b ? a - b : b - a;
+}
+
+static const common_prompt_checkpoint * server_find_nearest_checkpoint(
+        const std::list<common_prompt_checkpoint> & checkpoints,
+        const int64_t target_nt) {
+    if (target_nt <= 0 || checkpoints.empty()) {
+        return nullptr;
+    }
+
+    const common_prompt_checkpoint * best = nullptr;
+    int64_t best_dist = std::numeric_limits<int64_t>::max();
+
+    for (const auto & ckpt : checkpoints) {
+        const int64_t dist = server_checkpoint_abs_distance(ckpt.n_tokens, target_nt);
+        if (best == nullptr || dist < best_dist) {
+            best = &ckpt;
+            best_dist = dist;
+        }
+    }
+
+    return best;
+}
+
+static std::string server_checkpoint_roles(
+        const server_slot & slot,
+        const std::list<common_prompt_checkpoint> & checkpoints,
+        const std::list<common_prompt_checkpoint>::const_iterator it) {
+    std::vector<std::string> roles;
+
+    if (it == checkpoints.begin()) {
+        roles.emplace_back("oldest");
+    }
+
+    const auto it_last = std::prev(checkpoints.end());
+    if (it == it_last) {
+        roles.emplace_back("newest");
+    } else if (checkpoints.size() >= 2 && it == std::prev(it_last)) {
+        roles.emplace_back("tail");
+    }
+
+    const auto * quarter_ckpt  = server_find_nearest_checkpoint(checkpoints, slot.checkpoint_quarter_nt);
+    const auto * midpoint_ckpt = server_find_nearest_checkpoint(checkpoints, slot.checkpoint_midpoint_nt);
+
+    if (quarter_ckpt != nullptr && quarter_ckpt == &*it) {
+        roles.emplace_back("quarter");
+    }
+    if (midpoint_ckpt != nullptr && midpoint_ckpt == &*it) {
+        roles.emplace_back("midpoint");
+    }
+
+    if (roles.empty()) {
+        roles.emplace_back("middle");
+    }
+
+    std::ostringstream oss;
+    for (size_t i = 0; i < roles.size(); ++i) {
+        if (i > 0) {
+            oss << '+';
+        }
+        oss << roles[i];
+    }
+
+    return oss.str();
+}
+
+static std::list<common_prompt_checkpoint>::iterator server_select_checkpoint_to_evict(
+        server_slot & slot,
+        std::list<common_prompt_checkpoint> & checkpoints) {
+    GGML_ASSERT(!checkpoints.empty());
+
+    const int64_t prompt_total_nt = slot.task ? slot.task->n_tokens() : slot.prompt.n_tokens();
+    const auto * quarter_ckpt  = server_find_nearest_checkpoint(checkpoints, slot.checkpoint_quarter_nt);
+    const auto * midpoint_ckpt = server_find_nearest_checkpoint(checkpoints, slot.checkpoint_midpoint_nt);
+
+    const auto it_last = std::prev(checkpoints.end());
+    const auto it_tail = checkpoints.size() >= 2 ? std::prev(it_last) : checkpoints.end();
+
+    uint64_t best_score = std::numeric_limits<uint64_t>::max();
+    auto best_it = checkpoints.begin();
+
+    for (auto it = checkpoints.begin(); it != checkpoints.end(); ++it) {
+        const auto it_prev = it == checkpoints.begin() ? checkpoints.end() : std::prev(it);
+        const auto it_next = std::next(it);
+
+        const int64_t prev_nt = it_prev == checkpoints.end() ? 0 : it_prev->n_tokens;
+        const int64_t next_nt = it_next == checkpoints.end() ? prompt_total_nt : it_next->n_tokens;
+        const int64_t left_gap        = std::max<int64_t>(0, it->n_tokens - prev_nt);
+        const int64_t right_gap       = std::max<int64_t>(0, next_nt - it->n_tokens);
+        const int64_t span_if_removed = std::max<int64_t>(0, next_nt - prev_nt);
+
+        // Keep long-range anchors plus a short tail, then thin the dense middle
+        // first when the checkpoint count cap is reached.
+        uint64_t keep_score = 0;
+        if (it == checkpoints.begin()) {
+            keep_score += 1000000000000ULL;
+        }
+        if (it == it_last) {
+            keep_score += 900000000000ULL;
+        }
+        if (it_tail != checkpoints.end() && it == it_tail) {
+            keep_score += 400000000000ULL;
+        }
+        if (quarter_ckpt != nullptr && quarter_ckpt == &*it) {
+            keep_score += 500000000000ULL;
+        }
+        if (midpoint_ckpt != nullptr && midpoint_ckpt == &*it) {
+            keep_score += 600000000000ULL;
+        }
+
+        keep_score += (uint64_t) std::min<int64_t>(left_gap, right_gap) * 1024ULL;
+        keep_score += (uint64_t) std::min<int64_t>(span_if_removed, 1 << 20);
+
+        if (keep_score < best_score) {
+            best_score = keep_score;
+            best_it = it;
+        }
+    }
+
+    return best_it;
 }
 
 //
@@ -2781,15 +2905,22 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         while (slot.prompt.checkpoints.size() >= (size_t) params_base.n_ctx_checkpoints) {
-            // make room for the new checkpoint, if needed
-            const auto & cur = slot.prompt.checkpoints.front();
+            // Make room using a retention policy instead of plain FIFO:
+            // keep anchor checkpoints spread across the prompt and thin the
+            // densest middle region first.
+            auto it_rm = server_select_checkpoint_to_evict(slot, slot.prompt.checkpoints);
+            GGML_ASSERT(it_rm != slot.prompt.checkpoints.end());
+
+            const auto & cur = *it_rm;
+            const std::string roles = server_checkpoint_roles(slot, slot.prompt.checkpoints, it_rm);
 
             SLT_WRN(slot,
-                    "erasing old context checkpoint due to --ctx-checkpoints=%d limit"
-                    " (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
-                    params_base.n_ctx_checkpoints, cur.pos_min, cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                    "erasing context checkpoint due to --ctx-checkpoints=%d retention policy"
+                    " (roles = %s, pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                    params_base.n_ctx_checkpoints, roles.c_str(), cur.pos_min, cur.pos_max,
+                    cur.n_tokens, (float) cur.size() / 1024 / 1024);
 
-            slot.prompt.checkpoints.erase(slot.prompt.checkpoints.begin());
+            slot.prompt.checkpoints.erase(it_rm);
         }
 
         auto & cur = slot.prompt.checkpoints.emplace_back();
