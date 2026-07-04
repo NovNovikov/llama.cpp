@@ -2752,7 +2752,3 @@ uint32_t llama_model_target_layer_ids_n(const struct llama_model * model) {
     return (uint32_t) model->target_layer_ids.size();
 }
 
-int32_t llama_model_dspark_markov_rank(const struct llama_model * model) {
-    // markov_w1 is stored as ggml {markov_rank, n_vocab}, so ne[0] is the rank
-    return model->dspark_markov_w1 ? (int32_t) model->dspark_markov_w1->ne[0] : 0;
-}

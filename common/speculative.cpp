@@ -1200,42 +1200,25 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     }
 };
 
-// DSpark = DFlash backbone + a semi-autoregressive Markov head. Reuses the DFlash encoder/decoder
-// graph and the entire process() (target feature extraction + KV-cache injection) unchanged; only
-// the draft() proposal changes: the block is anchor-first (position 0 already predicts the first
-// draft) and sampled left-to-right with a previous-token-conditioned Markov logit bias
-//   bias(prev) = markov_w2 . markov_w1[prev]
-// computed on-device (llama_dspark_markov_bias). Greedy stays lossless (verify is unchanged).
-// NOTE (phase 1): the confidence head is loaded but not used here.
+// DSpark: DFlash backbone + a semi-autoregressive Markov head; reuses process(), only draft() differs.
 struct common_speculative_impl_draft_dspark : public common_speculative_impl_draft_dflash {
-    int32_t n_vocab = 0;
-    std::vector<float> bias_buf; // [n_vocab] per-step Markov bias scratch
-
     common_speculative_impl_draft_dspark(const common_params_speculative & params_in, uint32_t n_seq)
         : common_speculative_impl_draft_dflash(params_in, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
     {
-        auto * ctx_dft = params.ctx_dft;
-        const llama_model * model_dft = llama_get_model(ctx_dft);
-
-        n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_dft));
-        bias_buf.resize((size_t) n_vocab);
-
-        // DSpark stores the block size under "dspark.block_size" (the base read the dflash key)
-        block_size = 7;
+        const llama_model * model_dft = llama_get_model(params.ctx_dft);
         {
             char buf[32] = {};
-            if (llama_model_meta_val_str(model_dft, "dspark.block_size", buf, sizeof(buf)) >= 0) {
-                block_size = std::atoi(buf);
+            if (llama_model_meta_val_str(model_dft, "dspark.block_size", buf, sizeof(buf)) < 0) {
+                GGML_ABORT("DSpark: missing required metadata key 'dspark.block_size'");
             }
+            block_size = std::atoi(buf);
         }
-        // anchor-first: DSpark drafts all block_size positions (DFlash drops position 0)
         if (params.n_max > block_size) {
             params.n_max = block_size;
         }
 
         LOG_INF("%s: adding speculative implementation 'draft-dspark'\n", __func__);
-        LOG_INF("%s: - block_size=%d, n_max=%d, markov_rank=%d\n", __func__,
-                block_size, params.n_max, llama_model_dspark_markov_rank(model_dft));
+        LOG_INF("%s: - block_size=%d, n_max=%d\n", __func__, block_size, params.n_max);
     }
 
     void draft(common_speculative_draft_params_vec & dparams) override {
@@ -1243,15 +1226,16 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl_dra
 
         common_batch_clear(batch);
 
-        std::vector<int32_t>     i_block_beg(n_seq, -1);
-        std::vector<int32_t>     n_block    (n_seq,  0);
-        std::vector<llama_token> anchor     (n_seq,  0);
+        std::vector<int32_t> i_block_beg(n_seq, -1);
+        std::vector<int32_t> n_block    (n_seq,  0);
 
         for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
             auto & dp = dparams[seq_id];
             if (!dp.drafting) {
                 continue;
             }
+
+            common_sampler_reset(smpls[seq_id].get());
 
             const int32_t n = (int32_t) dp.n_past;
 
@@ -1264,11 +1248,11 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl_dra
                 continue;
             }
 
-            // anchor-first block: [id_last, <mask> * (n_draft-1)] -> n_draft positions, all sampled
+            // Submit the whole anchor-first block so the in-graph Markov head can
+            // chain logits from the anchor through the remaining positions.
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_draft;
-            anchor     [seq_id] = dp.id_last;
-            for (int32_t i = 0; i < n_draft; ++i) {
+            for (int32_t i = 0; i < block_size; ++i) {
                 common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
             }
         }
@@ -1291,40 +1275,14 @@ struct common_speculative_impl_draft_dspark : public common_speculative_impl_dra
 
             const int32_t beg = i_block_beg[seq_id];
             const int32_t nb  = n_block[seq_id];
+            auto * smpl = smpls[seq_id].get();
 
-            // snapshot the block's base logits to host first: llama_dspark_markov_bias() reuses the
-            // ctx scheduler, which can clobber the decode output buffer the logits pointer aliases.
-            std::vector<float> base((size_t) nb * n_vocab);
-            bool ok = true;
             for (int32_t i = 0; i < nb; ++i) {
-                const float * logits = llama_get_logits_ith(ctx_dft, beg + i);
-                if (!logits) { ok = false; break; }
-                std::memcpy(base.data() + (size_t) i * n_vocab, logits, (size_t) n_vocab * sizeof(float));
-            }
-            if (!ok) {
-                LOG_WRN("%s: null logits in block\n", __func__);
-                continue;
-            }
-
-            // semi-autoregressive Markov sampling: each draft position conditions on the previous one
-            llama_token prev = anchor[seq_id];
-            for (int32_t i = 0; i < nb; ++i) {
-                // on-device Markov bias for the previous token: bias = markov_w2 . markov_w1[prev]
-                llama_dspark_markov_bias(ctx_dft, &prev, 1, bias_buf.data());
-
-                const float * logits = base.data() + (size_t) i * n_vocab;
-                llama_token best_id  = 0;
-                float       best_val = logits[0] + bias_buf[0];
-                for (int v = 1; v < n_vocab; ++v) {
-                    const float val = logits[v] + bias_buf[v];
-                    if (val > best_val) {
-                        best_val = val;
-                        best_id  = v;
-                    }
-                }
-
-                result.push_back(best_id);
-                prev = best_id;
+                common_sampler_sample(smpl, ctx_dft, beg + i, true);
+                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                const llama_token id = cur_p->data[0].id;
+                common_sampler_accept(smpl, id, true);
+                result.push_back(id);
             }
         }
     }

@@ -1257,8 +1257,15 @@ struct llama_model_dflash : public llama_model_base {
 
 struct llama_model_dspark : public llama_model_dflash {
     llama_model_dspark(const struct llama_model_params & params) : llama_model_dflash(params) {}
-    // reuse load_arch_hparams + build_arch_graph from llama_model_dflash; only load the extra heads
+    void load_arch_hparams(llama_model_loader & ml) override;
     void load_arch_tensors(llama_model_loader & ml) override;
+
+    template <bool is_enc>
+    struct graph : public llama_model_dflash::graph<is_enc> {
+        graph(const llama_model & model, const llm_graph_params & params);
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
 };
 
 
