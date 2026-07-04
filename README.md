@@ -10,27 +10,176 @@
 
 [Manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md)
 
-Upstream-first fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) with a small set of local runtime and server patches kept on top of fresh upstream syncs.
+Upstream-first fork of [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) with a small set of local runtime, speculative decoding, model support, and server patches kept on top of fresh upstream syncs.
 
 ## Fork status
 
 - Default branch: `feature/prefill-checkpoints`
 - Archived TurboQuant branch: `archive/turboquant-prefill`
 - Base: regularly synced with upstream `ggml-org/llama.cpp`
+- Goal: stay close to upstream while keeping a few targeted fixes and experimental features that are useful in long-context server workloads
 
-## What this fork keeps
+## What is different in this fork
 
-- assistant prefill preserved for chat completions and `enable_thinking` flows
-- restored broad prompt checkpoint scheduling for long SWA / hybrid contexts
-- safer checkpoint invalidation after restore, bounded by actual prompt divergence
-- local MTP stability fixes for current Qwen / Gemma server and CLI paths
-- server-side generated-output logging option kept alongside upstream prompt logging
+This fork is not a general rewrite of llama.cpp. The intent is to keep the default branch close to upstream and only carry changes that are either:
 
-## What moved out of the default branch
+- practical fixes for long-running server usage
+- local speculative decoding work that is not fully available upstream yet
+- model support that is useful locally but not in upstream `master`
 
-TurboQuant-specific KV and weight quantization support is no longer part of the main line of this fork. That code stays available in the archived `archive/turboquant-prefill` branch for reference or recovery, but the default branch is now intentionally close to upstream llama.cpp plus the runtime fixes above.
+Everything below this section remains the upstream llama.cpp README. The sections here document the fork-only behavior.
 
-Everything below this section remains the upstream llama.cpp README.
+## Local patches and features
+
+### 1. Server prefill and chat-template fixes
+
+- Assistant prefill is preserved for chat completions when `enable_thinking` or similar chat-template flows would otherwise suppress it.
+- The server keeps behavior closer to "final rendered prompt goes in, model sees it unchanged" instead of locally dropping assistant-prefill text during request assembly.
+- This is mainly relevant for OpenAI-compatible `/v1/chat/completions` workloads using Jinja/chat templates.
+
+### 2. Restored broad checkpoint scheduling for long contexts
+
+This fork keeps a more aggressive and more practical checkpoint strategy for long prompts, especially for SWA / hybrid / recurrent-style models where tail-only checkpoints are often useless.
+
+Local behavior includes:
+
+- restored periodic prompt checkpoint scheduling via `-cpent, --checkpoint-every-n-tokens`
+- checkpoint spacing control via `--checkpoint-min-step`
+- retention logic that prefers keeping useful anchor checkpoints instead of only the newest tail checkpoints
+- safer checkpoint invalidation after restore, bounded by actual prompt divergence instead of blindly wiping everything after the restored point
+- post-midpoint checkpoint spacing adjustments intended to reduce checkpoint churn during very long prefills
+
+Relevant server options exposed by this fork:
+
+- `-ctxcp, --ctx-checkpoints, --swa-checkpoints`
+- `-cpent, --checkpoint-every-n-tokens`
+- `--checkpoint-min-step`
+
+### 3. Draft-MTP / speculative stability fixes
+
+The default branch keeps a set of local speculative-decoding fixes on top of upstream:
+
+- speculative draft/MTP contexts do not export embeddings or pooling state unnecessarily
+- `draft-mtp` avoids exporting target `nextn` state where that caused instability
+- `draft-mtp` state is persisted across checkpoint restore
+- local server/CLI fixes were kept to make current Qwen / Gemma speculative paths less brittle in checkpointed and resumed sessions
+
+These changes are practical runtime fixes, not a promise that every upstream or third-party draft model format is supported.
+
+### 4. DSpark speculative decoding support
+
+This fork carries local DSpark support beyond upstream `master`.
+
+Current state:
+
+- `dspark` architecture is present in the runtime
+- speculative decoding path for DSpark is implemented locally
+- Qwen-side conversion support exists for standalone DSpark draft checkpoints
+- DSpark block-size metadata handling from the upstream PR line is included
+
+Important limitation:
+
+- current DSpark support in this fork still follows the "separate draft model" design
+- embedded DeepSeek-V4-Flash-DSpark packaged inside a single target model is not fully supported yet
+
+In other words: DSpark is present here, but the "DeepSeek model with DSpark baked into the same checkpoint" path still needs dedicated work.
+
+### 5. DeepSeek4 / DSV4 performance work
+
+The fork carries a sizable set of local DeepSeek4-specific runtime changes aimed at reducing prompt-processing cost and making DSV4 paths actually usable.
+
+Highlights:
+
+- `GGML_OP_LIGHTNING_INDEXER` support in the runtime
+- CUDA kernel for `LIGHTNING_INDEXER`
+- local DeepSeek4 wiring for lightning indexer usage
+- restored top-k mask shortcut path
+- fused HC ops for DeepSeek4 CUDA path
+- flash-attention mask trimming / cast cleanup and prompt-tail rebalancing
+- several reserve / scheduling / graph-shape adjustments around DeepSeek4 prefill behavior
+
+This area is the most experimental part of the default branch. It is useful, but it is also the place where local performance tuning and upstream churn most often meet.
+
+### 6. Laguna model support
+
+This fork adds local Laguna support that is not in plain upstream `master`:
+
+- Laguna architecture runtime support
+- Laguna converter support
+- Laguna chat template support
+- Laguna GGUF tensor mapping / metadata handling
+- mixed-RoPE / SWA-related runtime pieces needed by that model family
+
+Relevant files include:
+
+- `src/models/laguna.cpp`
+- `conversion/laguna.py`
+- `models/templates/poolside-Laguna.jinja`
+
+### 7. Extra server debug logging
+
+This fork keeps a local generated-output logging feature in addition to upstream prompt logging:
+
+- `--log-generated-output [PATH]`
+
+Behavior:
+
+- appends one JSONL record per chat/completion request
+- defaults to `./output.log` when the path is omitted
+- intended for debugging rendered-output issues without changing generation behavior
+
+This exists alongside upstream `--log-prompts-dir`, not instead of it.
+
+### 8. Additional low-level fixes carried by the fork
+
+The branch also carries a few targeted runtime/backend fixes that were valuable locally when they were not yet available in the chosen base revision:
+
+- CUDA `top_k` / `argsort` chunking to reduce temporary memory pressure
+- KQ-mask stride overflow / truncation fixes in flash-attention-related CUDA code
+- tensor-parallel plus `--n-cpu-moe` crash fix on MoE models
+- universal CUDA launch bounds for MoE MMVQ kernels
+
+Some of these may later disappear from the fork as they land upstream and the branch is rebased or merged forward.
+
+## What is intentionally not on the default branch anymore
+
+TurboQuant-specific KV and weight quantization support is no longer part of the default branch.
+
+That work is kept in:
+
+- `archive/turboquant-prefill`
+
+Reason:
+
+- it made the branch diverge too far from upstream
+- it complicated merges and speculative/runtime work
+- the current default branch is intentionally "upstream plus targeted fixes", not "everything ever experimented with"
+
+## Stability notes
+
+Not every local feature has the same maturity level.
+
+Generally:
+
+- checkpointing and prefill fixes are part of the expected default-branch behavior
+- generated-output logging is debug-only
+- Laguna support is functional model support
+- DeepSeek4 and DSpark changes are the most actively tuned and therefore the most likely to change between syncs
+
+If you need the most upstream-like behavior, use this branch with fork-specific options disabled where possible. If you need the historical TurboQuant line, use the archived branch instead of expecting it from the default branch.
+
+## Why this fork exists
+
+Upstream llama.cpp moves fast. Some locally important fixes are too niche, too experimental, or too timing-sensitive to wait for clean upstream landing.
+
+This fork exists to keep:
+
+- fresh upstream llama.cpp
+- practical long-context server fixes
+- local speculative-decoding work
+- a few model families and runtime paths that are useful here but not fully covered upstream yet
+
+without permanently turning the project into an unrelated downstream.
 
 LLM inference in C/C++
 
