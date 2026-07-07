@@ -1631,7 +1631,22 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
         }
     }
 
-    // next, remove any cached prompts that are fully contained in the current prompt
+    // calculate checkpoints size to see if it will fit with the prompt
+    size_t checkpoints_size = 0;
+    for (const auto & ckpt : prompt.checkpoints) {
+        checkpoints_size += ckpt.size();
+    }
+
+    const size_t state_size_new = state_size_tgt + state_size_dft + checkpoints_size;
+
+    // skip over-limit entries to avoid disturbing the cache
+    if (limit_size > 0 && state_size_new > limit_size) {
+        SRV_WRN(" - prompt state size %.3f MiB exceeds cache size limit %.3f MiB, skipping\n",
+                state_size_new / (1024.0 * 1024.0), limit_size / (1024.0 * 1024.0));
+        return nullptr;
+    }
+
+    // remove any cached prompts that are fully contained in the current prompt
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->tokens.get_common_prefix(prompt.tokens);
 
@@ -1641,6 +1656,16 @@ server_prompt * server_prompt_cache::alloc(const server_prompt & prompt, size_t 
             it = states.erase(it);
         } else {
             ++it;
+        }
+    }
+
+    if (limit_size > 0) {
+        // make room before allocating the new vectors to avoid breaching the limit
+        while (!states.empty() && size() + state_size_new > limit_size) {
+            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
+                    states.front().size() / (1024.0 * 1024.0));
+
+            states.pop_front();
         }
     }
 
