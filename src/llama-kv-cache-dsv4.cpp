@@ -22,7 +22,7 @@ static constexpr uint32_t DSV4_HCA_RATIO = 128;
 static constexpr uint32_t DSV4_CACHE_PAD = 512;
 
 static constexpr uint32_t DSV4_STATE_MAGIC         = 0x34565344; // DSV4
-static constexpr uint32_t DSV4_STATE_VERSION       = 1;
+static constexpr uint32_t DSV4_STATE_VERSION       = 2;   // v2: partial save now includes base + block caches
 static constexpr uint32_t DSV4_STATE_MODE_FULL     = 0;
 static constexpr uint32_t DSV4_STATE_MODE_PARTIAL  = 1;
 static constexpr uint32_t DSV4_K_CACHE_STATE_VER   = 2;
@@ -1313,23 +1313,24 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     io.write(&version, sizeof(version));
     io.write(&mode,    sizeof(mode));
 
-    kv_raw->state_write(io, seq_id, flags);
+    // DSV4 base + block caches aren't recomputable from a partial re-decode, so save them even in partial mode.
+    const llama_state_seq_flags raw_flags = flags & ~((llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-    if (!partial_only) {
-        const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
+    kv_raw->state_write(io, seq_id, raw_flags);
 
-        //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
-        const uint32_t n_rows_csa = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_size()) : kv_csa->get_size();
-        const uint32_t n_rows_hca = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_HCA_RATIO, kv_hca->get_size()) : kv_hca->get_size();
-        const uint32_t n_rows_lid = seq_id >= 0 ?
-            dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_size()) : kv_lid->get_size();
+    const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
 
-        dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
-        dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
-        dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
-    }
+    //FIXME : note that we conflate token positions with rows, which is not true for multi-modal case.
+    const uint32_t n_rows_csa = seq_id >= 0 ?
+        dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_size()) : kv_csa->get_size();
+    const uint32_t n_rows_hca = seq_id >= 0 ?
+        dsv4_state_n_used_k_rows(pos_max, DSV4_HCA_RATIO, kv_hca->get_size()) : kv_hca->get_size();
+    const uint32_t n_rows_lid = seq_id >= 0 ?
+        dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_size()) : kv_lid->get_size();
+
+    dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
+    dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
+    dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
 
     csa_state->state_write(io, seq_id, flags);
     hca_state->state_write(io, seq_id, flags);
@@ -1361,17 +1362,18 @@ void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
         throw std::runtime_error("DSV4 state flags mismatch");
     }
 
-    kv_raw->state_read(io, seq_id, flags);
+    // Mirror state_write.
+    const llama_state_seq_flags raw_flags = flags & ~((llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
 
-    if (!partial_only) {
-        kv_csa->clear(true);
-        kv_hca->clear(true);
-        kv_lid->clear(true);
+    kv_raw->state_read(io, seq_id, raw_flags);
 
-        dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
-        dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
-        dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
-    }
+    kv_csa->clear(true);
+    kv_hca->clear(true);
+    kv_lid->clear(true);
+
+    dsv4_state_read_k_cache(io, kv_csa.get(), seq_id, flags);
+    dsv4_state_read_k_cache(io, kv_hca.get(), seq_id, flags);
+    dsv4_state_read_k_cache(io, kv_lid.get(), seq_id, flags);
 
     csa_state->state_read(io, seq_id, flags);
     hca_state->state_read(io, seq_id, flags);
