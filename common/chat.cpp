@@ -2691,8 +2691,14 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         }
     }
 
-    if (src.find("<|channel|>") == std::string::npos) {
-        // map developer to system for all models except for GPT-OSS
+    const bool is_gpt_oss_template = src.find("<|channel|>") != std::string::npos;
+    const bool is_deepseek_v4_template =
+        src.find("<tool_result>") != std::string::npos &&
+        src.find("<' + dsml_token + 'tool_calls>") != std::string::npos;
+
+    if (!is_gpt_oss_template && !is_deepseek_v4_template) {
+        // DeepSeek V4 renders developer messages in their original position.
+        // Map the role to system for templates that do not have this support.
         workaround::map_developer_role_to_system(params.messages);
     }
 
@@ -2733,8 +2739,11 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         }
     }
 
-    if (inputs.force_pure_content) {
-        LOG_WRN("Forcing pure content template, will not render reasoning or tools separately.");
+    auto make_pure_content_fallback = [&](const std::string & reason) {
+        if (!reason.empty()) {
+            LOG_WRN("%s\n", reason.c_str());
+        }
+        LOG_WRN("Using pure content fallback template, will not render reasoning or tools separately.");
         // Create the result structure
         common_chat_params data;
         auto params_copy               = params;
@@ -2747,6 +2756,10 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         });
         data.parser                    = parser.save();
         return data;
+    };
+
+    if (inputs.force_pure_content) {
+        return make_pure_content_fallback("Forcing pure content template.");
     }
 
     if (auto result = common_chat_try_specialized_template(tmpl, src, params)) {
@@ -2779,7 +2792,8 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         LOG_DBG("%s: generated parser:\n%s\n\nparser generation prompt: %s\n", __func__, arena.dump(arena.root()).c_str(), auto_params.generation_prompt.c_str());
         return auto_params;
     } catch (const std::exception & e) {
-        throw std::invalid_argument(std::string("Unable to generate parser for this template. Automatic parser generation failed: ") + e.what());
+        return make_pure_content_fallback(
+                std::string("Automatic parser generation failed, falling back to pure content mode: ") + e.what());
     }
 }
 
