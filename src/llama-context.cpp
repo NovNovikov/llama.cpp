@@ -2359,6 +2359,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 void llama_context::output_reorder() {
     const uint64_t n_vocab = model.vocab.n_tokens();
     const uint64_t n_embd  = model.hparams.n_embd;
+    const uint64_t n_embd_nextn = model.hparams.n_embd_nextn();
 
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
@@ -2377,8 +2378,8 @@ void llama_context::output_reorder() {
         }
 
         if (embd_nextn.size > 0) {
-            for (uint64_t k = 0; k < n_embd; k++) {
-                std::swap(embd_nextn.data[i0*n_embd + k], embd_nextn.data[i1*n_embd + k]);
+            for (uint64_t k = 0; k < n_embd_nextn; k++) {
+                std::swap(embd_nextn.data[i0*n_embd_nextn + k], embd_nextn.data[i1*n_embd_nextn + k]);
             }
         }
 
