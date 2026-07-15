@@ -21,6 +21,63 @@ Set of LLM REST APIs and a web UI to interact with llama.cpp.
 
 For the full list of features, please refer to [server's changelog](https://github.com/ggml-org/llama.cpp/issues/9291)
 
+## Fork-specific server notes
+
+This fork keeps `llama-server` close to upstream, but it does carry several local server/runtime patches that matter for long-context and speculative workloads.
+
+### Local server behavior kept in this fork
+
+- assistant prefill is preserved more consistently for chat-completions flows that use Jinja / reasoning-enabled templates
+- periodic prompt checkpoint scheduling is restored via `-cpent, --checkpoint-every-n-tokens`
+- `--checkpoint-min-step` remains only a spacing filter and does not replace periodic scheduling
+- checkpoint retention is biased toward keeping useful anchor checkpoints instead of only the newest tail checkpoints
+- checkpoint invalidation after restore is bounded by real prompt divergence instead of wiping everything after the restored checkpoint
+
+### Checkpointing notes
+
+The server in this fork exposes and uses the following checkpoint-related options:
+
+- `-ctxcp, --ctx-checkpoints, --swa-checkpoints`
+- `-cpent, --checkpoint-every-n-tokens`
+- `-cms, --checkpoint-min-step`
+- `-cram, --cache-ram`
+
+Intended meaning:
+
+- `--ctx-checkpoints` limits how many saved checkpoints a slot may keep
+- `--checkpoint-every-n-tokens` schedules periodic checkpoints during prefill
+- `--checkpoint-min-step` only suppresses checkpoints that are too close together
+- `--cache-ram` is also the RAM budget for saved prompt/cache checkpoint state
+
+This differs from upstream revisions where periodic mid-prompt scheduling was narrowed or removed.
+
+### Speculative decoding notes
+
+The fork also carries local speculative-decoding work on top of upstream:
+
+- `draft-mtp` stability fixes for server resume/checkpoint flows
+- DSpark runtime support for standalone draft models
+
+Current DSpark limitation:
+
+- DSpark is currently documented and implemented as a separate draft model path
+- embedded DeepSeek-V4-Flash-DSpark stored inside a single target model is not fully supported yet
+
+### Extra debug logging kept by the fork
+
+In addition to upstream `--log-prompts-dir`, this fork also keeps:
+
+- `--log-generated-output [PATH]`
+
+Behavior:
+
+- appends one JSONL record per chat/completion request
+- records the final generated output and basic request metadata
+- defaults to `./output.log` if `PATH` is omitted
+- does nothing unless explicitly enabled
+
+This is a fork-local debug feature and is not part of upstream `master`.
+
 ## Usage
 
 <!-- HELP_START -->

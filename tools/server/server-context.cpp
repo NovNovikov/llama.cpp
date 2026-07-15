@@ -1624,9 +1624,12 @@ private:
                 total_gpu_required  += projected_extra_gpu_required;
                 total_host_required += projected_extra_host_required;
 
-                SRV_INF("loaded server state requires %.2f MiB of device memory (host excluded)\n",
+                // Match Task Manager's K (KiB) unit while retaining MiB for CLI readability.
+                SRV_INF("loaded server state requires %.0f K (%.2f MiB) of device memory (host excluded)\n",
+                        total_gpu_required / 1024.0,
                         total_gpu_required / (1024.0 * 1024.0));
-                SRV_INF("loaded server state requires %.2f MiB of host memory\n",
+                SRV_INF("loaded server state requires %.0f K (%.2f MiB) of host memory\n",
+                        total_host_required / 1024.0,
                         total_host_required / (1024.0 * 1024.0));
             } catch (const std::exception & e) {
                 SRV_WRN("failed to estimate loaded server state memory requirement: %s\n", e.what());
