@@ -1818,7 +1818,7 @@ void server_prompt_cache::update() {
             }
 
             SRV_WRN(" - --cache-ram size limit reached, removing oldest cache entry (tokens = %d, checkpoints = %zu, size = %.3f MiB)\n",
-                    states.front().n_tokens(), states.front().checkpoints.size(), states.front().size() / (1024.0 * 1024.0));
+                    states.front().prompt.n_tokens(), states.front().prompt.checkpoints.size(), states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
         }
@@ -1837,7 +1837,7 @@ void server_prompt_cache::update() {
             }
 
             SRV_WRN(" - --cache-ram token limit reached (%zu, est: %zu), removing oldest cache entry (tokens = %d, checkpoints = %zu, size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().n_tokens(), states.front().checkpoints.size(), states.front().size() / (1024.0 * 1024.0));
+                    limit_tokens, limit_tokens_cur, states.front().prompt.n_tokens(), states.front().prompt.checkpoints.size(), states.front().size() / (1024.0 * 1024.0));
 
             states.pop_front();
         }
