@@ -1358,8 +1358,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto * ctx_dft = this->params.ctx_dft;
         GGML_ASSERT(ctx_tgt && ctx_dft && "MTP requires ctx_tgt and ctx_dft to be set");
 
-        n_embd = llama_model_n_embd_nextn(llama_get_model(ctx_dft));
-        GGML_ASSERT(n_embd == llama_model_n_embd_nextn(llama_get_model(ctx_tgt)) &&
+        n_embd = llama_model_n_embd_out(llama_get_model(ctx_dft));
+        GGML_ASSERT(n_embd == llama_model_n_embd(llama_get_model(ctx_tgt)) &&
                 "MTP input row width must match the target h_nextn width");
         n_mtp_layers = std::max(1, (int) llama_model_n_layer_nextn(llama_get_model(ctx_dft)));
 
@@ -1407,15 +1407,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const std::string arch_tgt = common_speculative_get_model_arch(llama_get_model(ctx_tgt));
         const std::string arch_dft = common_speculative_get_model_arch(llama_get_model(ctx_dft));
         const bool is_gemma4_mtp = arch_tgt == "gemma4" && arch_dft == "gemma4-assistant";
-        const bool is_dsv4_mtp   = arch_tgt == "deepseek4" && arch_dft == "deepseek4";
 
         // Qwen/Step-style native MTP consumes the target's pre-norm rows.
         // Gemma4 assistants instead consume the target's post-final-norm hidden
-        // state via t_h_nextn. DeepSeek4 likewise exchanges its full hyper-
-        // connection state through t_h_nextn, whose row width exceeds n_embd.
-        llama_set_embeddings_pre_norm(ctx_tgt, !is_gemma4_mtp && !is_dsv4_mtp);
-        llama_set_embeddings_pre_norm(ctx_dft, !is_dsv4_mtp);
-        llama_set_embeddings_nextn(ctx_tgt, is_gemma4_mtp || is_dsv4_mtp, /*masked*/ false);
+        // state via t_h_nextn, so keep nextn export enabled for that path.
+        llama_set_embeddings_pre_norm(ctx_tgt, !is_gemma4_mtp);
+        llama_set_embeddings_pre_norm(ctx_dft, true);
+        llama_set_embeddings_nextn(ctx_tgt, is_gemma4_mtp, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true,        /*masked*/ true);
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
@@ -1599,17 +1597,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     ? llama_get_embeddings_pre_norm_ith(ctx_tgt, i_batch_beg[seq_id] + i)
                     : llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
                 std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-            }
-
-            // debug: per-row stats of the captured target h_nextn (enable with -lv 2+)
-            {
-                const float * h0 = verify_h[seq_id].data();
-                float mn = h0[0], mx = h0[0]; double sum = 0.0;
-                for (int32_t k = 0; k < n_embd; ++k) {
-                    mn = std::min(mn, h0[k]); mx = std::max(mx, h0[k]); sum += h0[k];
-                }
-                SPC_TRC("verify_h seq=%d rows=%d width=%d row0 min=%.4f max=%.4f mean=%.6f\n",
-                        (int) seq_id, n_rows, n_embd, mn, mx, sum / n_embd);
             }
 
             std::memcpy(pending_h[seq_id].data(),

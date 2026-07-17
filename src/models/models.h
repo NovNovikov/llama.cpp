@@ -1093,12 +1093,6 @@ struct llama_model_deepseek4 : public llama_model_base {
     struct graph : public llm_graph_context {
         graph(const llama_model & model, const llm_graph_params & params);
 
-    protected:
-        // tag-ctor for graph_mtp: initializes the graph context without building the trunk
-        explicit graph(const llm_graph_params & params) : llm_graph_context(params) {}
-
-    public:
-
         ggml_tensor * build_hc_pre(
                 ggml_tensor * x,
                 ggml_tensor * hc_fn,
@@ -1202,11 +1196,6 @@ struct llama_model_deepseek4 : public llama_model_base {
         ggml_tensor * build_hc_sinkhorn(
                 ggml_tensor * comb,
                 int il) const;
-    };
-
-    // LLM_GRAPH_TYPE_DECODER_MTP draft head (NextN block at il == n_layer)
-    struct graph_mtp : public graph {
-        graph_mtp(const llama_model & model, const llm_graph_params & params);
     };
 
     std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;

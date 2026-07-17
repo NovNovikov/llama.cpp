@@ -929,7 +929,7 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
             throw std::runtime_error("no nextn embeddings");
         }
 
-        const uint32_t n_embd = model.hparams.n_embd_nextn();
+        const uint32_t n_embd = model.hparams.n_embd_out();
 
         if (!cparams.embeddings_nextn_masked) {
             // unmasked: nextn rows are stored densely, indexed by raw token position.
@@ -1592,10 +1592,9 @@ int llama_context::encode(const llama_batch & batch_inp) {
     // extract nextn embeddings (hidden state before the final output norm)
     if (embd_nextn.data && t_h_nextn && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
         ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
-        // note: nextn rows can be wider than n_embd_out (e.g. deepseek4 hc state)
         GGML_ASSERT(backend_h != nullptr);
 
-        const uint32_t n_embd = hparams.n_embd_nextn();
+        const uint32_t n_embd = hparams.n_embd_out();
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
         ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
     }
@@ -1770,13 +1769,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const auto & hparams = model.hparams;
 
     const int64_t n_vocab = vocab.n_tokens();
-    int64_t n_embd = hparams.n_embd_inp();
-    // MTP draft batches carry h_nextn rows via the embd channel; for models whose
-    // nextn state is wider than the input embedding (e.g. deepseek4 hyper-connections)
-    // the batch rows are sized accordingly.
-    if (cparams.embeddings_nextn && hparams.n_embd_nextn() > (uint32_t) n_embd) {
-        n_embd = hparams.n_embd_nextn();
-    }
+    const int64_t n_embd  = hparams.n_embd_inp();
 
     // when computing embeddings, all tokens are output
     const bool output_all   = cparams.embeddings;
@@ -2069,7 +2062,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
                 GGML_ASSERT(backend_h != nullptr);
 
-                const uint32_t n_embd  = hparams.n_embd_nextn();
+                const uint32_t n_embd  = hparams.n_embd_out();
                 float * embd_nextn_out = embd_nextn.data + offset*n_embd;
 
                 GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
@@ -2187,13 +2180,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs, int32_t n_outputs_pre_
     logits.size        = has_logits        ? n_vocab*n_outputs_max     : 0;
     embd.size          = has_embd          ? n_embd_out*n_outputs_max  : 0;
     embd_pre_norm.size = has_embd_pre_norm ? n_embd*n_outputs_pre_norm_max : 0;
-    const size_t n_embd_nextn = model.hparams.n_embd_nextn();
-    embd_nextn.size = has_embd_nextn ? n_embd_nextn*n_outputs_max  : 0;
+    embd_nextn.size    = has_embd_nextn    ? n_embd_out*n_outputs_max  : 0;
 
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = n_embd_nextn * n_batch;
+        embd_nextn.size = (size_t) n_embd_out * n_batch;
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -2359,7 +2351,7 @@ void llama_context::extract_layer_inputs(const llm_graph_result * res, size_t to
 void llama_context::output_reorder() {
     const uint64_t n_vocab = model.vocab.n_tokens();
     const uint64_t n_embd  = model.hparams.n_embd;
-    const uint64_t n_embd_nextn = model.hparams.n_embd_nextn();
+    const uint64_t n_embd_nextn = model.hparams.n_embd_out();
 
     for (size_t s = 0; s < output_swaps.size(); ++s) {
         const uint64_t i0 = output_swaps[s].i0;
