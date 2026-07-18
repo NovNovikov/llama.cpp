@@ -49,6 +49,26 @@ using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
 constexpr int CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT = 8192;
+constexpr int CHECKPOINT_PERIODIC_STEP_TAIL = 4096;
+constexpr int CHECKPOINT_PERIODIC_TAIL_TOKENS = 20000;
+
+static int64_t server_checkpoint_periodic_tail_start(const int32_t n_tokens_total) {
+    return std::max<int64_t>(0, n_tokens_total - CHECKPOINT_PERIODIC_TAIL_TOKENS);
+}
+
+static int32_t server_checkpoint_periodic_step(const int32_t n_tokens_total, const int64_t n_tokens, const int32_t step) {
+    return n_tokens >= server_checkpoint_periodic_tail_start(n_tokens_total)
+        ? CHECKPOINT_PERIODIC_STEP_TAIL
+        : std::max(step, CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT);
+}
+
+static int64_t server_checkpoint_periodic_next(const int32_t n_tokens_total, const int64_t n_tokens, const int32_t step) {
+    const int64_t tail_start = server_checkpoint_periodic_tail_start(n_tokens_total);
+    const int64_t next = n_tokens + server_checkpoint_periodic_step(n_tokens_total, n_tokens, step);
+
+    // Always schedule the first tail checkpoint before continuing at 4096-token intervals.
+    return n_tokens < tail_start ? std::min(next, tail_start) : next;
+}
 
 static int32_t server_prompt_tail_batch_limit(int32_t remaining_tokens, int32_t n_batch) {
     if (n_batch <= 0 || remaining_tokens <= n_batch) {
@@ -372,16 +392,17 @@ struct server_slot {
     void init_checkpoint_schedule(const int32_t n_tokens_total, const int32_t n_past, const int32_t step) {
         checkpoint_quarter_nt = n_tokens_total / 4;
         checkpoint_midpoint_nt = n_tokens_total / 2;
-        const int32_t periodic_step = std::max(step, CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT);
-
         checkpoint_quarter_done = checkpoint_quarter_nt <= 0 || n_past >= checkpoint_quarter_nt;
         checkpoint_midpoint_done = checkpoint_midpoint_nt <= 0 || n_past >= checkpoint_midpoint_nt;
 
         next_periodic_checkpoint_nt = -1;
         if (step > 0) {
-            int64_t next = checkpoint_midpoint_nt + periodic_step;
+            int64_t next = checkpoint_midpoint_nt;
             while (next <= n_past) {
-                next += periodic_step;
+                next = server_checkpoint_periodic_next(n_tokens_total, next, step);
+            }
+            if (next == checkpoint_midpoint_nt) {
+                next = server_checkpoint_periodic_next(n_tokens_total, next, step);
             }
             if (next < n_tokens_total) {
                 next_periodic_checkpoint_nt = next;
@@ -1845,8 +1866,10 @@ private:
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
             if (params_base.checkpoint_every_n_tokens > 0) {
-                SRV_INF("periodic context checkpointing enabled: every %d prompt tokens after 50%%\n",
-                        std::max(params_base.checkpoint_every_n_tokens, CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT));
+                SRV_INF("periodic context checkpointing enabled: every %d prompt tokens after 50%%, every %d in the final %d tokens\n",
+                        std::max(params_base.checkpoint_every_n_tokens, CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT),
+                        CHECKPOINT_PERIODIC_STEP_TAIL,
+                        CHECKPOINT_PERIODIC_TAIL_TOKENS);
             } else {
                 SRV_INF("%s", "periodic context checkpointing disabled (use `-cpent N`)\n");
             }
@@ -4216,7 +4239,7 @@ private:
                         if (is_periodic_checkpoint) {
                             SLT_INF(slot,
                                     "creating periodic context checkpoint at n_tokens = %d (interval = %d)\n",
-                                    n_tokens_start, std::max(params_base.checkpoint_every_n_tokens, CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT));
+                                    n_tokens_start, server_checkpoint_periodic_step(slot.task->n_tokens(), n_tokens_start, params_base.checkpoint_every_n_tokens));
                         }
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                         if (is_quarter_checkpoint) {
@@ -4229,7 +4252,8 @@ private:
 
                     if (periodic_checkpointing_enabled && slot.next_periodic_checkpoint_nt > 0) {
                         while (slot.next_periodic_checkpoint_nt <= n_tokens_start) {
-                            slot.next_periodic_checkpoint_nt += std::max(params_base.checkpoint_every_n_tokens, CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT);
+                            slot.next_periodic_checkpoint_nt = server_checkpoint_periodic_next(
+                                slot.task->n_tokens(), slot.next_periodic_checkpoint_nt, params_base.checkpoint_every_n_tokens);
                         }
                     }
 
