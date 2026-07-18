@@ -554,6 +554,15 @@ struct llama_layer {
     struct llama_layer_nextn nextn;
 
     struct llama_layer_switch_lora switch_lora;
+
+    // Inkling
+    struct ggml_tensor * wr             = nullptr;
+    struct ggml_tensor * attn_rel_proj  = nullptr;
+    struct ggml_tensor * shortconv_k    = nullptr;
+    struct ggml_tensor * shortconv_v    = nullptr;
+    struct ggml_tensor * shortconv_attn = nullptr;
+    struct ggml_tensor * shortconv_mlp  = nullptr;
+    struct ggml_tensor * ffn_gscale     = nullptr;
 };
 
 struct llama_device {

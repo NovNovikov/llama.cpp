@@ -150,6 +150,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_NANBEIGE,         "nanbeige"         },
     { LLM_ARCH_QWEN3TTS,         "qwen3tts"         },
     { LLM_ARCH_POCKETTTS,        "pockettts"        },
+    { LLM_ARCH_INKLING,          "inkling"          },
     { LLM_ARCH_UNKNOWN,          "(unknown)"        },
 };
 
@@ -983,6 +984,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
         case LLM_ARCH_DEEPSEEK4:
+        case LLM_ARCH_INKLING:
             return true;
         default:
             return false;
@@ -1042,6 +1044,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_SOLAR_OPEN2:
         case LLM_ARCH_QWEN3TTS:
+        case LLM_ARCH_INKLING:
             return false;
         default:
             return true;
