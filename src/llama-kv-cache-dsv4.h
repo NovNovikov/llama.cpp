@@ -94,6 +94,7 @@ public:
                      uint32_t   n_seq_max,
                      uint32_t   n_ubatch,
                      uint32_t   n_pad,
+                     uint32_t   n_rs_seq,
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse);
 
@@ -149,6 +150,10 @@ private:
     llama_hparams hparams_lid;
 
     const uint32_t n_seq_max;
+
+    // The compressor-state rings are widened by this budget so the newest
+    // tokens can be removed without aliasing an unfinished compressed block.
+    const uint32_t n_rs_seq;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
