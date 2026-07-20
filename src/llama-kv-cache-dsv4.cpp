@@ -51,6 +51,16 @@ static void dsv4_clear_tensor_stream(ggml_tensor * tensor, uint32_t stream) {
     ggml_backend_tensor_memset(tensor, 0, stream*stream_size, stream_size);
 }
 
+static uint32_t dsv4_state_n_used_k_rows(llama_pos pos_max, uint32_t ratio, uint32_t kv_size) {
+    if (pos_max < 0) {
+        return 0;
+    }
+
+    const uint64_t n_rows = ((uint64_t) pos_max + 1)/ratio;
+
+    return (uint32_t) std::min<uint64_t>(kv_size, n_rows);
+}
+
 static int64_t dsv4_stream_offset(uint32_t n_stream, llama_seq_id seq_id, uint32_t size) {
     if (n_stream <= 1) {
         return 0;
