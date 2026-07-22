@@ -1,173 +1,207 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable, TYPE_CHECKING
+from collections.abc import Iterable
+from typing import TYPE_CHECKING
 
 import torch
 
 if TYPE_CHECKING:
     from torch import Tensor
 
-from .llama import LlamaModel
-from .base import ModelBase, TextModel, gguf
+from .base import ModelBase, TextModel, gguf, logger
 
 
 @ModelBase.register("LagunaForCausalLM")
 class LagunaModel(TextModel):
     model_arch = gguf.MODEL_ARCH.LAGUNA
+    _experts: list[dict] | None = None
+    _gate_types: list[str] | None = None
 
-    def set_gguf_parameters(self):
+    # --- vocab ---------------------------------------------------------------
+
+    def set_vocab(self) -> None:
+        self._set_vocab_gpt2()
+
+        # Some Laguna releases wrap the chat template in tokenizer_config.json as
+        # "{% include 'chat_template.jinja' %}", which SpecialVocab embeds verbatim
+        # and llama.cpp's jinja engine cannot process. Prefer the resolved template
+        # from the chat_template.jinja file so the GGUF is self-contained.
+        tmpl_file = self.dir_model / "chat_template.jinja"
+        if tmpl_file.is_file():
+            self.gguf_writer.add_chat_template(tmpl_file.read_text(encoding="utf-8"))
+            logger.info("gguf: embedded resolved chat_template.jinja (overriding include directive)")
+
+        # eos_token_id is a list [2, 24]: token 2 (EOS, also BOS) and token 24
+        # (</assistant>, the turn-end). _set_vocab_gpt2 only records the scalar
+        # eos, so register the extra id as eot; llama.cpp folds eot into its EOG
+        # set, so the model halts on </assistant> natively.
+        eos_ids = self.hparams.get("eos_token_id")
+        if isinstance(eos_ids, list):
+            bos_id = self.hparams.get("bos_token_id")
+            extra = [e for e in eos_ids if e != bos_id]
+            if extra:
+                self.gguf_writer.add_eot_token_id(extra[0])
+                logger.info(f"gguf: registered eot_token_id={extra[0]} from eos list {eos_ids}")
+
+    def get_vocab_base(self) -> tuple[list[str], list[int], str]:
+        # </assistant> is the assistant turn-end (registered as eot below). The
+        # HF tokenizer flags it special=false, so the base classifies it as
+        # USER_DEFINED and llama.cpp renders its text into generated content,
+        # leaking "</assistant>" and breaking response parsing. It is a control
+        # marker, so promote it to CONTROL: llama.cpp then treats it as
+        # end-of-generation and suppresses its text.
+        tokens, toktypes, tokpre = super().get_vocab_base()
+        for i, tok in enumerate(tokens):
+            if tok == "</assistant>":
+                toktypes[i] = gguf.TokenType.CONTROL
+                logger.info(f"gguf: marked </assistant> (id {i}) as CONTROL token")
+        return tokens, toktypes, tokpre
+
+    # --- hparams -------------------------------------------------------------
+
+    def set_gguf_parameters(self) -> None:
+        super().set_gguf_parameters()
         hparams = self.hparams
 
-        # Handle rope_parameters: can be nested (full_attention / sliding_attention) or flat
-        rope_params = hparams.get("rope_parameters", {})
-        if "full_attention" in rope_params or "sliding_attention" in rope_params:
-            full_rope = rope_params.get("full_attention", {})
-            swa_rope = rope_params.get("sliding_attention", {})
-            self.rope_parameters["full_attention"] = full_rope
-            self.rope_parameters["sliding_attention"] = swa_rope
-        else:
-            self.rope_parameters["full_attention"] = rope_params
+        # super() does not emit vocab_size for the gpt2 vocab path; head_count is
+        # overridden with a per-layer array (XS.2 varies heads per layer via
+        # num_attention_heads_per_layer; M.1 is uniform and omits it).
+        self.gguf_writer.add_vocab_size(hparams["vocab_size"])
 
-        super().set_gguf_parameters()
+        per_layer_heads = hparams.get("num_attention_heads_per_layer")
+        if not per_layer_heads:
+            per_layer_heads = [hparams["num_attention_heads"]] * hparams["num_hidden_layers"]
+        assert len(per_layer_heads) == hparams["num_hidden_layers"], (
+            f"num_attention_heads_per_layer length {len(per_layer_heads)} != "
+            f"num_hidden_layers {hparams['num_hidden_layers']}"
+        )
+        self.gguf_writer.add_head_count(per_layer_heads)
 
-        n_layers = hparams["num_hidden_layers"]
-        n_head_base = hparams["num_attention_heads"]
-        n_kv_base = hparams.get("num_key_value_heads", n_head_base)
+        # Resolve + validate the attention gate type now so an inconsistent
+        # `gating` field fails at conversion time. See _attn_gate_types.
+        self._attn_gate_types()
 
-        layer_types = hparams.get("layer_types", ["full_attention"] * n_layers)
+        # SWA window size (M.1 has none -> key omitted, swa_type stays NONE).
+        sliding_window = hparams.get("sliding_window") or 0
+        if sliding_window > 0:
+            self.gguf_writer.add_sliding_window(sliding_window)
 
-        # Per-layer head counts: use num_attention_heads_per_layer if available
-        heads_per_layer = hparams.get("num_attention_heads_per_layer", None)
-        kv_per_layer = hparams.get("num_key_value_heads_per_layer", None)
-
-        head_arr = []
-        kv_arr = []
-        swa_pat = []
-        for i, lt in enumerate(layer_types[:n_layers]):
-            if heads_per_layer is not None:
-                head_arr.append(heads_per_layer[i])
-            else:
-                head_arr.append(n_head_base)
-            if kv_per_layer is not None:
-                kv_arr.append(kv_per_layer[i])
-            else:
-                kv_arr.append(n_kv_base)
-            swa_pat.append(lt == "sliding_attention")
-
-        self.gguf_writer.add_head_count(head_arr)
-        self.gguf_writer.add_head_count_kv(kv_arr)
-
-        # SWA window
-        self.gguf_writer.add_sliding_window(hparams["sliding_window"])
-        self.gguf_writer.add_sliding_window_pattern(swa_pat)
-
-        # Per-layer value length (head_dim)
-        head_dim = hparams.get("head_dim", hparams["hidden_size"] // n_head_base)
-        self.gguf_writer.add_value_length(head_dim)
-
-        # Partial rotary is data-driven: write rope.dimension_count for the global
-        # (full-attention) layers and rope.dimension_count_swa for sliding layers.
-        # Laguna-M uses full rotary (1.0) on every layer; Laguna-XS uses half rotary
-        # (0.5) on global layers and full rotary on SWA layers.
-        full_rope    = self.rope_parameters.get("full_attention", {})
-        partial_full = full_rope.get("partial_rotary_factor", 1.0)
-        self.gguf_writer.add_rope_dimension_count(int(head_dim * partial_full))
-        swa_rope = self.rope_parameters.get("sliding_attention")
-        if swa_rope is not None:
-            partial_swa = swa_rope.get("partial_rotary_factor", 1.0)
-            self.gguf_writer.add_rope_dimension_count_swa(int(head_dim * partial_swa))
-
-        # Attention output gate mode: per-head (broadcasts across head_dim, Laguna-XS)
-        # vs per-element (one gate per (head, head_dim) channel, Laguna-M). Default is
-        # per-element to match configuration_laguna.py (gating defaults to True/per-element).
-        self.gguf_writer.add_attention_gate_per_head(hparams.get("gating", "per-element") == "per-head")
-
-        # MoE params
-        n_experts = hparams["num_experts"]
-        n_experts_used = hparams["num_experts_per_tok"]
-        self.gguf_writer.add_expert_count(n_experts)
-        self.gguf_writer.add_expert_used_count(n_experts_used)
+        # MoE (expert_count / expert_used_count come from super().set_gguf_parameters())
         self.gguf_writer.add_expert_feed_forward_length(hparams["moe_intermediate_size"])
+        self.gguf_writer.add_expert_shared_feed_forward_length(hparams["shared_expert_intermediate_size"])
+        self.gguf_writer.add_expert_weights_norm(True)  # HF reference always sum-normalises after top-k
+        self.gguf_writer.add_expert_weights_scale(float(hparams["moe_routed_scaling_factor"]))
+        self.gguf_writer.add_expert_gating_func(gguf.ExpertGatingFuncType.SIGMOID)
 
-        if (shared_dim := hparams.get("shared_expert_intermediate_size")) is not None and shared_dim > 0:
-            self.gguf_writer.add_expert_shared_feed_forward_length(shared_dim)
-            self.gguf_writer.add_expert_shared_count(1)
-
-        if (routing_scale := hparams.get("moe_routed_scaling_factor")) is not None:
-            self.gguf_writer.add_expert_weights_scale(routing_scale)
-
-        # Laguna always normalizes MoE routing weights before applying routed_scaling_factor
-        self.gguf_writer.add_expert_weights_norm(True)
-
-        # Dense lead layers (from mlp_layer_types: first 'dense' layers)
-        mlp_types = hparams.get("mlp_layer_types", [])
+        # Leading dense layers (XS.2 has 1, M.1 has 3) before the MoE layers.
+        mlp_layer_types: list[str] = hparams["mlp_layer_types"]
         leading_dense = 0
-        for mt in mlp_types:
-            if mt == "dense":
+        for t in mlp_layer_types:
+            if t == "dense":
                 leading_dense += 1
             else:
                 break
         self.gguf_writer.add_leading_dense_block_count(leading_dense)
 
-        # Hard-fail if moe_apply_router_weight_on_input is True
-        if hparams.get("moe_apply_router_weight_on_input", False):
-            raise ValueError("moe_apply_router_weight_on_input=True is not supported by llama.cpp for Laguna")
+        # Per-layer-type RoPE dimension count (partial rotary). base emits
+        # rope_freq_base(_swa) and the YaRN params from self.rope_parameters.
+        head_dim = hparams["head_dim"]
+        full_rope = self.rope_parameters["full_attention"]
+        self.gguf_writer.add_rope_dimension_count(
+            int(head_dim * float(full_rope.get("partial_rotary_factor", 1.0))))
+        swa_rope = self.rope_parameters.get("sliding_attention")
+        if swa_rope is not None:
+            self.gguf_writer.add_rope_dimension_count_swa(
+                int(head_dim * float(swa_rope.get("partial_rotary_factor", 1.0))))
 
-    def set_vocab(self) -> None:
-        super().set_vocab()
-        # tokenizer_config.json stores "{% include 'chat_template.jinja' %}" (HF indirection).
-        # SpecialVocab writes that verbatim; overwrite with the resolved file content.
-        template_file = self.dir_model / "chat_template.jinja"
-        if template_file.is_file():
-            self.gguf_writer.add_chat_template(template_file.read_text(encoding="utf-8"))
-        # config.json has eos_token_id: [2, 24]; SpecialVocab only registers the first as EOS.
-        # Token 24 (</assistant>) is the end-of-turn token — register it as EOT so llama.cpp
-        # adds it to special_eog_ids and generation stops at turn boundaries.
-        eos_ids = self.hparams.get("eos_token_id", [])
-        if isinstance(eos_ids, list):
-            for tok_id in eos_ids[1:]:
-                self.gguf_writer.add_eot_token_id(tok_id)
+    def _attn_gate_types(self) -> list[str]:
+        """Per-layer attention output gate type: "per_head" or "per_element".
 
-    _experts: list[dict[str, Tensor]] | None = None
+        `gating_types` (per layer) is authoritative when present; otherwise the
+        scalar `gating` field is used (the "per-element"/"per-head" string, or
+        the legacy boolean True == per-head, as in Laguna-XS.2).
+
+        Fails loudly when the model is per-element but the `gating` field does
+        not declare that as a string: runtimes that key off `gating` (vLLM,
+        transformers) ignore gating_types and read a bare boolean True as
+        per-head, silently corrupting the model. Surfacing it here keeps a
+        broken checkpoint from being packaged as if it were fine.
+        """
+        if self._gate_types is not None:
+            return self._gate_types
+        hparams = self.hparams
+        n_layer = hparams["num_hidden_layers"]
+        gating = hparams.get("gating")
+        gating_types = hparams.get("gating_types")
+
+        def _norm(t: object) -> str:
+            sval = str(t).replace("-", "_")
+            if sval in ("per_element", "per_head"):
+                return sval
+            raise ValueError(f"Laguna: unrecognised attention gate type {t!r}")
+
+        if gating_types:
+            assert len(gating_types) == n_layer, (
+                f"gating_types length {len(gating_types)} != num_hidden_layers {n_layer}")
+            types = [_norm(t) for t in gating_types]
+        elif isinstance(gating, str):
+            types = [_norm(gating)] * n_layer
+        elif gating is True:
+            types = ["per_head"] * n_layer
+        else:
+            raise ValueError(
+                f"Laguna: cannot determine attention gate type "
+                f"(gating={gating!r}, gating_types={gating_types!r})")
+
+        if any(t == "per_element" for t in types) and not (
+                isinstance(gating, str) and _norm(gating) == "per_element"):
+            raise ValueError(
+                f"Laguna config declares a per-element attention gate but "
+                f"`gating`={gating!r} is not the string \"per-element\". Runtimes that "
+                f"read `gating` (vLLM, transformers) will mis-handle this checkpoint as "
+                f"per-head. Set gating=\"per-element\" in the source config.")
+
+        self._gate_types = types
+        return types
+
+    # --- tensor handling -----------------------------------------------------
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
-        # Squeeze attention gate tensors
-        if name.endswith(".self_attn.g_proj.weight"):
-            data_torch = data_torch.squeeze().contiguous()
-
-        # Buffer individual expert weight tensors and stack when all collected for a layer
-        if bid is not None and re.match(r"model\.layers\.\d+\.mlp\.experts\.\d+\.(gate_proj|up_proj|down_proj)\.weight$", name):
-            n_experts = self.find_hparam(["moe_num_experts", "num_experts"])
-
+        # Per-expert MoE weights: model.layers.{bid}.mlp.experts.{xid}.{w}.weight.
+        # Only the NUMBERED per-expert weights are stacked; the router bias
+        # (mlp.experts.e_score_correction_bias) takes the normal mapping path.
+        if re.search(r"mlp\.experts\.\d+\.", name):
+            n_experts = self.find_hparam(["num_local_experts", "num_experts"])
+            assert bid is not None
             if self._experts is None:
                 self._experts = [{} for _ in range(self.block_count)]
-
             self._experts[bid][name] = data_torch
-
-            if len(self._experts[bid]) >= n_experts * 3:
-                # Stack per-expert tensors into merged 3D tensors
-                for w_name in ["down_proj", "gate_proj", "up_proj"]:
-                    datas: list[Tensor] = []
-                    for xid in range(n_experts):
-                        ename = f"model.layers.{bid}.mlp.experts.{xid}.{w_name}.weight"
-                        datas.append(self._experts[bid][ename])
-                        del self._experts[bid][ename]
-
-                    data_torch = torch.stack(datas, dim=0)
-                    merged_name = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
-
-                    yield from super().modify_tensors(data_torch, merged_name, bid)
+            needed = [f"model.layers.{bid}.mlp.experts.{x}.{w}.weight"
+                      for x in range(n_experts) for w in ("gate_proj", "up_proj", "down_proj")]
+            if all(e in self._experts[bid] for e in needed):
+                for w_name in ["gate_proj", "up_proj", "down_proj"]:
+                    datas = [self._experts[bid][f"model.layers.{bid}.mlp.experts.{x}.{w_name}.weight"]
+                             for x in range(n_experts)]
+                    stacked = torch.stack(datas, dim=0)
+                    merged = f"model.layers.{bid}.mlp.experts.{w_name}.weight"
+                    yield from TextModel.modify_tensors(self, stacked, merged, bid)
+                self._experts[bid].clear()
                 return
-            else:
-                return
+            return
+        # Cross-check the gate projection width against the declared gate type;
+        # a mismatch means the weights and config disagree -> fail, do not guess.
+        if bid is not None and name.endswith("self_attn.g_proj.weight"):
+            heads = (self.hparams.get("num_attention_heads_per_layer")
+                     or [self.hparams["num_attention_heads"]] * self.hparams["num_hidden_layers"])
+            n_head = heads[bid]
+            head_dim = self.hparams["head_dim"]
+            gate_type = self._attn_gate_types()[bid]
+            expected = n_head * head_dim if gate_type == "per_element" else n_head
+            out_features = int(data_torch.shape[0])
+            if out_features != expected:
+                raise ValueError(
+                    f"Laguna layer {bid}: g_proj output width {out_features} contradicts the "
+                    f"declared {gate_type} gate (expected {expected}); weights and config disagree.")
 
-        yield from super().modify_tensors(data_torch, name, bid)
-
-    def prepare_tensors(self):
-        super().prepare_tensors()
-
-        if self._experts is not None:
-            experts = [k for d in self._experts for k in d.keys()]
-            if len(experts) > 0:
-                raise ValueError(f"Unprocessed experts: {experts}")
+        yield from TextModel.modify_tensors(self, data_torch, name, bid)
