@@ -274,7 +274,7 @@ struct common_chat_params {
     std::string                         generation_prompt;
     bool                                supports_thinking    = false;
     std::string                         thinking_start_tag;  // e.g., "<think>"
-    std::string                         thinking_end_tag;    // e.g., "</think>"
+    std::vector<std::string>            thinking_end_tags;   // e.g., "</think>"
     std::string                         reasoning_tool_call_start;
     std::vector<common_grammar_trigger> grammar_triggers;
     std::vector<std::string>            preserved_tokens;
@@ -302,7 +302,9 @@ struct common_chat_parser_params {
     common_chat_parser_params(const common_chat_params & chat_params) {
         format                    = chat_params.format;
         generation_prompt         = chat_params.generation_prompt;
-        thinking_end_tag          = chat_params.thinking_end_tag;
+        if (!chat_params.thinking_end_tags.empty()) {
+            thinking_end_tag = chat_params.thinking_end_tags.front();
+        }
         reasoning_tool_call_start = chat_params.reasoning_tool_call_start;
     }
 };
