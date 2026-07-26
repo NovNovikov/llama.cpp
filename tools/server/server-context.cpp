@@ -1457,8 +1457,7 @@ private:
 
                         auto mparams_tgt_probe = common_model_params_to_llama(params_base);
                         mparams_tgt_probe.no_alloc  = true;
-                        mparams_tgt_probe.use_mmap  = false;
-                        mparams_tgt_probe.use_mlock = false;
+                        mparams_tgt_probe.load_mode = LLAMA_LOAD_MODE_NONE;
 
                         auto cparams_tgt_probe = common_context_params_to_llama(params_base);
                         cparams_tgt_probe.n_rs_seq = 0;
