@@ -2795,6 +2795,7 @@ void llama_vocab::impl::load(llama_model_loader & ml, const LLM_KV & kv) {
                     || t.first == "<|call|>"   // o200k_harmony
                     || t.first == "<|flush|>"  // solar-open
                     || t.first == "<|calls|>"  // solar-open
+                    || t.first == "<|im:end|>" // solar-open2 (assistant turn end; generation_config eos=[<|endoftext|>,<|im:end|>])
                     || t.first == "<end_of_turn>"
                     || t.first == "<|endoftext|>"
                     || t.first == "</s>"      // paddleocr

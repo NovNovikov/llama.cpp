@@ -2747,6 +2747,165 @@ static common_chat_params common_chat_params_init_minicpm5(const common_chat_tem
     return data;
 }
 
+// Solar Open 2 (upstage) - tool calls use marker-delimited key/value args, not
+// JSON:  <|tool_call:start|>{name}\n
+//          <|tool_arg:start|>{key}<|tool_arg:value|>{value}<|tool_arg:end|>\n
+//          ...
+//        <|tool_call:end|>
+// String values are emitted bare; non-strings are tojson'd (render_tool_arguments
+// in the template). Reasoning is <|think:start|>..<|think:end|>. Structurally this
+// mirrors MiniCPM5's <function><param> format, so this is modelled on it.
+static common_chat_params common_chat_params_init_solar_open2(const common_chat_template &          tmpl,
+                                                              const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    // NOTE: the framework's diff-based generation_prompt detection returns EMPTY for
+    // this template. Solar defaults add_generation_prompt to `true` when the key is
+    // absent (`... if add_generation_prompt is defined else true`), but
+    // direct_apply_impl omits the key when it is false -- so the with/without renders
+    // are identical and the diff is empty. Derive the generation prompt directly as
+    // the trailing assistant turn instead (works for both reasoning-on, which ends in
+    // <|think:start|>, and reasoning-off, which ends in <|think:start|><|think:end|>).
+    {
+        static const std::string marker = "<|im:start|>assistant<|im:content|>";
+        auto pos = data.prompt.rfind(marker);
+        data.generation_prompt = (pos == std::string::npos) ? std::string() : data.prompt.substr(pos);
+    }
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking = true;
+    // Only tokens the model EMITS mid-turn and the parser must see in the output
+    // belong here — preserved tokens are rendered into the text instead of stripped.
+    // The <|im:*|> delimiters must NOT be listed: <|im:start|>/<|im:content|> are
+    // prompt-only, and <|im:end|> is the end-of-turn stop (id 129, registered as EOT).
+    // Preserving <|im:end|> makes the server render it into content before stopping.
+    data.preserved_tokens  = {
+        "<|tool_call:start|>",
+        "<|tool_call:end|>",
+        "<|tool_arg:start|>",
+        "<|tool_arg:value|>",
+        "<|tool_arg:end|>",
+        "<|think:start|>",
+        "<|think:end|>",
+    };
+
+    data.thinking_start_tag = "<|think:start|>";
+    data.thinking_end_tags  = {"<|think:end|>"};
+
+    data.message_delimiters = {
+        { COMMON_CHAT_ROLE_ASSISTANT, "<|im:start|>assistant<|im:content|>" },
+        { COMMON_CHAT_ROLE_TOOL,      "<|im:start|>tool<|im:content|>"      },
+        { COMMON_CHAT_ROLE_USER,      "<|im:start|>user<|im:content|>"      },
+        { COMMON_CHAT_ROLE_SYSTEM,    "<|im:start|>system<|im:content|>"    },
+    };
+
+    auto has_tools           = inputs.tools.is_array() && !inputs.tools.empty();
+    auto has_response_format = inputs.json_schema.is_object() && !inputs.json_schema.empty();
+    auto extract_reasoning   = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+    auto include_grammar     = has_response_format || (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE);
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto generation_prompt = p.literal("<|im:start|>assistant<|im:content|>");
+
+        // Solar ALWAYS emits a think block: with reasoning on the generation prompt
+        // ends with <|think:start|> and the model produces {reasoning}<|think:end|>;
+        // with reasoning off the prompt already carries an empty
+        // <|think:start|><|think:end|>. Either way it must be consumed structurally
+        // (this is why the block is NOT gated on extract_reasoning like MiniCPM's).
+        // p.reasoning captures the span; the server keeps it only when it asked for it.
+        (void) extract_reasoning;
+        auto reasoning = p.optional(p.optspace("<|think:start|>") +
+                                    p.reasoning(p.until("<|think:end|>")) +
+                                    p.literal("<|think:end|>")) + p.space();
+
+        if (has_response_format) {
+            return generation_prompt + reasoning + p.content(p.schema(p.json(), "response-format", inputs.json_schema));
+        }
+
+        if (has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE) {
+            // Bare string value: everything up to the close marker (no CDATA in Solar).
+            auto string_value = p.ac(
+                p.tool_arg_string_value(p.until("<|tool_arg:end|>")) +
+                p.tool_arg_close(p.literal("<|tool_arg:end|>")), "<|tool_arg:end|>");
+
+            auto tool_choice = p.choice();
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto &      function = tool.at("function");
+                const std::string name     = function.at("name");
+                auto              params   = function.contains("parameters") ? function.at("parameters") : json::object();
+
+                auto args = p.eps();
+                if (params.contains("properties") && params.at("properties").is_object() && !params.at("properties").empty()) {
+                    auto schema_info = common_schema_info();
+                    schema_info.resolve_refs(params);
+
+                    auto arg_choice = p.choice();
+                    for (const auto & [prop_name, prop_schema] : params.at("properties").items()) {
+                        auto value_parser = p.eps();
+                        if (schema_info.resolves_to_string(prop_schema)) {
+                            value_parser = string_value;
+                        } else {
+                            value_parser = p.tool_arg_json_value(
+                                    p.schema(p.json(), "tool-" + name + "-arg-" + prop_name + "-schema", prop_schema, false)
+                                ) + p.tool_arg_close(p.literal("<|tool_arg:end|>"));
+                        }
+
+                        auto arg_rule = p.tool_arg(
+                            p.tool_arg_open(p.literal("<|tool_arg:start|>") +
+                                            p.tool_arg_name(p.literal(prop_name)) +
+                                            p.literal("<|tool_arg:value|>")) +
+                            value_parser
+                        );
+
+                        arg_choice |= arg_rule;
+                    }
+                    args = p.zero_or_more(arg_choice + p.space());
+                }
+
+                auto tool_parser = p.tool(
+                    p.tool_open(p.literal("<|tool_call:start|>") + p.tool_name(p.literal(name)) + p.literal("\n"))
+                    << p.tool_args(args)
+                    << p.tool_close(p.literal("<|tool_call:end|>")));
+
+                tool_choice |= p.rule("tool-" + name, tool_parser);
+            });
+
+            auto max_calls  = inputs.parallel_tool_calls ? -1 : 1;
+            auto tool_calls = p.trigger_rule("tool-call", p.repeat(tool_choice + p.space(), 1, max_calls));
+
+            auto content = p.content(p.until("<|tool_call:start|>"));
+
+            return generation_prompt + reasoning + content + tool_calls + p.end();
+        }
+
+        return generation_prompt + reasoning + p.content(p.rest()) + p.end();
+    });
+
+    data.parser = parser.save();
+
+    if (include_grammar) {
+        data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
+        data.grammar      = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto & function = tool.at("function");
+                auto         schema   = function.contains("parameters") ? function.at("parameters") : json::object();
+                builder.resolve_refs(schema);
+            });
+            if (has_response_format) {
+                auto schema = inputs.json_schema;
+                builder.resolve_refs(schema);
+            }
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+
+        data.grammar_triggers = {
+            { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<|tool_call:start|>" },
+        };
+    }
+
+    return data;
+}
+
 static json common_chat_extra_context() {
     json ctx = json::object();
     std::chrono::system_clock::time_point now = std::chrono::system_clock::now();
@@ -2850,6 +3009,15 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         return common_chat_params_init_minicpm5(tmpl, params);
     }
 
+    // Solar Open 2 (upstage) - marker-delimited key/value tool args. The
+    // <|tool_arg:value|> separator is unique to this template; the auto-parser
+    // can't reconstruct the non-JSON arg encoding, so use a dedicated handler.
+    if (src.find("<|tool_call:start|>") != std::string::npos &&
+        src.find("<|tool_arg:value|>") != std::string::npos) {
+        LOG_DBG("Using specialized template: Solar Open 2\n");
+        return common_chat_params_init_solar_open2(tmpl, params);
+    }
+
     return std::nullopt;
 }
 
@@ -2923,7 +3091,14 @@ static common_chat_params common_chat_templates_apply_jinja(const struct common_
         workaround::requires_non_null_content(params.messages);
     }
 
-    if (tmpl.original_caps().supports_object_arguments) {
+    if (tmpl.original_caps().supports_object_arguments ||
+        // Solar Open 2: its template renders tool_call arguments via
+        // `tool_arguments|items`, i.e. it iterates the object rather than
+        // accessing named keys. The capability probe only detects the latter
+        // (arguments.<key> access), so it misses this template and leaves the
+        // arguments as a JSON string -> `|items` then fails on a String. Force
+        // the string->object normalization for it (keyed on its unique marker).
+        src.find("<|tool_arg:value|>") != std::string::npos) {
         workaround::func_args_not_string(params.messages);
     }
 

@@ -2151,6 +2151,26 @@ struct llama_model_kimi_linear : public llama_model_base {
 };
 
 
+// Solar Open 2 (upstage): hybrid stack, 48 layers as [softmax x1, linear x3] x12.
+// The linear layers are KDA, identical to Kimi Linear except allow_neg_eigval=True
+// (beta = 2*sigmoid). The softmax layers are plain GQA with NoPE and an
+// ELEMENTWISE sigmoid output gate (note: step35's gate is head-wise -- different
+// tensor shape, do not copy that broadcast).
+struct llama_model_solar_open2 : public llama_model_base {
+    llama_model_solar_open2(const struct llama_model_params & params) : llama_model_base(params) {}
+    void load_arch_hparams(llama_model_loader & ml) override;
+    void load_arch_tensors(llama_model_loader & ml) override;
+
+    struct graph : public llm_build_delta_net_base {
+        graph(const llama_model & model, const llm_graph_params & params);
+
+        const llama_model & model;
+    };
+
+    std::unique_ptr<llm_graph_context> build_arch_graph(const llm_graph_params & params) const override;
+};
+
+
 struct llama_model_step35 : public llama_model_base {
     llama_model_step35(const struct llama_model_params & params) : llama_model_base(params) {}
     void load_arch_hparams(llama_model_loader & ml) override;

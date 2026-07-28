@@ -357,6 +357,13 @@ const func_builtins & global_builtins() {
         }},
         {"namespace", [](const func_args & args) -> value {
             auto out = mk_val<value_object>();
+            // A jinja2 Namespace is a plain attribute holder, not a dict: it has
+            // no built-in items()/keys()/values() methods, so an attribute named
+            // e.g. `items` (namespace(items=[])) must resolve to that attribute,
+            // not to a built-in. Without this, `ns.items` returns the built-in
+            // function and `ns.items + [...]` fails ("+ between Function and
+            // Array"). Matches the loop/context objects, which also opt out.
+            out->has_builtins = false;
             for (const auto & arg : args.get_args()) {
                 if (!is_val<value_kwarg>(arg)) {
                     throw raised_exception("namespace() arguments must be kwargs");
