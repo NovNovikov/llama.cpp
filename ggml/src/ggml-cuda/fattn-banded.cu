@@ -247,8 +247,9 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     const ggml_tensor * rel_indices = dst->src[7];
 
     // route F16/BF16 K/V to the MMA kernel; keep this FP32 kernel for mixed types and strided rel
-    if (!rel_proj && k->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F32 &&
+    if (k->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F32 &&
         rel->type == GGML_TYPE_F32 && ggml_is_contiguous(rel) &&
+        (!rel_proj || (rel->ne[0] <= 16 && q->ne[3] == 1)) &&
         // MMA ABI indexes rel by Q's batch: a singleton rel batch must take the stride-aware fallback
         rel->ne[3] == q->ne[3] && rel->ne[0] <= (1 << 20)) {
         ggml_cuda_flash_attn_ext(ctx, dst);

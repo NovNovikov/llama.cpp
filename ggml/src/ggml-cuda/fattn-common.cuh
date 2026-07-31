@@ -41,12 +41,20 @@ typedef void (* fattn_kernel_t)(
                             const int32_t ne31, const int32_t ne32, const int32_t ne33,
                             const int32_t nb31, const int32_t nb32, const int64_t nb33);
 
+struct ggml_cuda_fattn_direct_rel_data {
+    const float   * rel_input;
+    const float   * rel_proj;
+    const int32_t * rel_indices;
+    int32_t d_rel;
+};
+
 typedef float (*vec_dot_KQ_t)(
     const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8 , const void * __restrict__ Q_ds);
 
 struct ggml_cuda_flash_attn_ext_f16_extra_data {
     uintptr_t K;
     uintptr_t V;
+    uintptr_t direct_rel;
     uintptr_t end;
 };
 
@@ -81,7 +89,22 @@ static inline ggml_cuda_flash_attn_ext_f16_extra_data ggml_cuda_flash_attn_ext_g
         }
     }
 
+    if (dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED && dst->src[6]) {
+        data.end = GGML_PAD(data.end, alignof(ggml_cuda_fattn_direct_rel_data));
+        data.direct_rel = data.end;
+        data.end += sizeof(ggml_cuda_fattn_direct_rel_data);
+    }
+
     return data;
+}
+
+static __global__ void fattn_direct_rel_init(
+        ggml_cuda_fattn_direct_rel_data * data,
+        const float * rel_input, const float * rel_proj, const int32_t * rel_indices,
+        int32_t d_rel) {
+    if (threadIdx.x == 0) {
+        *data = { rel_input, rel_proj, rel_indices, d_rel };
+    }
 }
 
 template <int D, int nthreads>
@@ -985,6 +1008,7 @@ void launch_fattn(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * rel   = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED ? dst->src[5] : nullptr;
     const ggml_tensor * sinks = rel ? rel : dst->src[4];
+    const bool direct_rel = rel && dst->src[6];
 
     ggml_tensor * KQV = dst;
 
@@ -1193,11 +1217,16 @@ void launch_fattn(
     memcpy(&max_bias,      (const float *) KQV->op_params + 1, sizeof(float));
     memcpy(&logit_softcap, (const float *) KQV->op_params + 2, sizeof(float));
 
-    // banded op reuses the MMA ABI: negative max_bias tags the branch, sinks_ptr carries rel_logits, -max_bias is E
-    if (rel) {
+    // Banded attention reuses the MMA ABI: a negative max_bias tags the branch.
+    if (rel && !direct_rel) {
         GGML_ASSERT(rel->type == GGML_TYPE_F32 && ggml_is_contiguous(rel));
         GGML_ASSERT(rel->ne[0] <= (1 << 20)); // exactly representable in float
         max_bias = -float(rel->ne[0]);
+    } else if (rel) {
+        const int64_t rel_extent = dst->src[6]->ne[1];
+        GGML_ASSERT(rel_extent > 0 && rel_extent <= (1 << 20));
+        // The fractional tag makes the kernel treat sinks as a compact direct-bias descriptor.
+        max_bias = -float(rel_extent) - 0.5f;
     }
 
     if (logit_softcap != 0.0f) {
@@ -1214,6 +1243,20 @@ void launch_fattn(
     // TODO other tensor dimensions after removal of WMMA kernel:
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
+    const char * sinks_data = sinks ? (const char *) sinks->data : nullptr;
+    if (direct_rel) {
+        GGML_ASSERT(f16_extra.direct_rel != 0);
+        const ggml_cuda_kernel_launch_params direct_init_params =
+            ggml_cuda_kernel_launch_params(dim3(1, 1, 1), dim3(1, 1, 1), 0, main_stream);
+        ggml_cuda_kernel_launch(fattn_direct_rel_init, direct_init_params,
+            (ggml_cuda_fattn_direct_rel_data *) f16_extra.direct_rel,
+            (const float *) rel->data,
+            (const float *) dst->src[6]->data,
+            dst->src[7] ? (const int32_t *) dst->src[7]->data : nullptr,
+            (int32_t) rel->ne[0]);
+        sinks_data = (const char *) f16_extra.direct_rel;
+    }
+
     GGML_ASSERT(block_dim.x % warp_size == 0);
 
         ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks_num, block_dim, nbytes_shared, main_stream);
@@ -1222,7 +1265,7 @@ void launch_fattn(
         K_data,
         V_data,
         mask ? ((const char *) mask->data) : nullptr,
-        sinks ? ((const char *) sinks->data) : nullptr,
+        sinks_data,
         KV_max.ptr,
         !stream_k && parallel_blocks > 1 ? dst_tmp.ptr : (float *) KQV->data, dst_tmp_meta.ptr,
         scale, max_bias, m0, m1, n_head_log2, logit_softcap,

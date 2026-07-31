@@ -5,6 +5,29 @@
 
 using namespace ggml_cuda_mma;
 
+static __device__ __forceinline__ float fattn_direct_rel_bias(
+        const float * rel_data, int64_t q_idx, int head, int64_t kv_idx, int n_q, int n_head, int n_kv, int rel_extent) {
+    const ggml_cuda_fattn_direct_rel_data & data = *(const ggml_cuda_fattn_direct_rel_data *) rel_data;
+    const float * rel_input = data.rel_input;
+    int64_t rel_dist = q_idx + (int64_t(n_kv) - n_q) - kv_idx;
+    if (data.rel_indices) {
+        const int32_t flat = data.rel_indices[q_idx*n_kv + kv_idx];
+        rel_dist = flat % (rel_extent + 1);
+    }
+    if (rel_dist < 0 || rel_dist >= rel_extent) {
+        return 0.0f;
+    }
+    float result = 0.0f;
+#pragma unroll
+    for (int d = 0; d < 16; ++d) {
+        if (d >= data.d_rel) {
+            break;
+        }
+        result += rel_input[(q_idx*n_head + head)*data.d_rel + d] * data.rel_proj[rel_dist*data.d_rel + d];
+    }
+    return result;
+}
+
 // Config options for the MMA kernel.
 // Should not affect results, only speed/register pressure/shared memory use.
 struct fattn_mma_config {
@@ -705,9 +728,11 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
         }
     }
     float KQ_rowsum_add[cols_per_thread] = {0.0f};
+    const bool direct_bias = rel_extent < 0;
+    const int bias_extent = direct_bias ? -rel_extent - 1 : rel_extent;
 
     if constexpr (cols_per_warp == 8) {
-        if (rel_f) {
+    if (rel_f) {
 #pragma unroll
             for (int i00 = 0; i00 < nbatch_fa; i00 += np*T_C_KQ::I) {
                 const int i0 = i00 + (threadIdx.y % np)*T_C_KQ::I;
@@ -721,9 +746,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int64_t kv_idx = int64_t(k_VKQ_0) + i;
                     const int64_t dist   = q_idx + (int64_t(ne11) - ne01.z) - kv_idx;
                     if (q_idx < ne01.z && head_q0 + c < ne02 && kv_idx < ne11 &&
-                            dist >= 0 && dist < rel_extent) {
-                        KQ_C[i00/(np*T_C_KQ::I)].x[l] +=
-                            rel_f[(q_idx*ne02 + head_q0 + c)*rel_extent + dist];
+                            (direct_bias || (dist >= 0 && dist < bias_extent))) {
+                        KQ_C[i00/(np*T_C_KQ::I)].x[l] += direct_bias
+                            ? fattn_direct_rel_bias(rel_f, q_idx, head_q0 + c, kv_idx, ne01.z, ne02, ne11, bias_extent)
+                            : rel_f[(q_idx*ne02 + head_q0 + c)*bias_extent + dist];
                     }
                 }
             }
@@ -804,9 +830,10 @@ static __device__ __forceinline__ void flash_attn_ext_f16_iter(
                     const int64_t kv_idx = int64_t(k_VKQ_0) + i;
                     const int64_t dist   = q_idx + (int64_t(ne11) - ne01.z) - kv_idx;
                     if (q_idx < ne01.z && head_q0 + c < ne02 && kv_idx < ne11 &&
-                            dist >= 0 && dist < rel_extent) {
-                        KQ_C[i00/(np*T_C_KQ::J)].x[l] +=
-                            rel_f[(q_idx*ne02 + head_q0 + c)*rel_extent + dist];
+                            (direct_bias || (dist >= 0 && dist < bias_extent))) {
+                        KQ_C[i00/(np*T_C_KQ::J)].x[l] += direct_bias
+                            ? fattn_direct_rel_bias(rel_f, q_idx, head_q0 + c, kv_idx, ne01.z, ne02, ne11, bias_extent)
+                            : rel_f[(q_idx*ne02 + head_q0 + c)*bias_extent + dist];
                     }
                 }
             }
@@ -1795,7 +1822,8 @@ static __global__ void flash_attn_ext_f16(
     float      * GGML_CUDA_RESTRICT dst      = dst_ptr;
     float2     * GGML_CUDA_RESTRICT dst_meta = dst_meta_ptr;
     const bool banded_bias = max_bias < 0.0f;
-    const int  rel_extent  = banded_bias ? int(-max_bias) : 0;
+    const bool direct_bias = banded_bias && (-max_bias != floorf(-max_bias));
+    const int  rel_extent  = banded_bias ? (direct_bias ? -int(-max_bias) - 1 : int(-max_bias)) : 0;
 
     // Skip unused kernel variants for faster compilation:
     if (use_logit_softcap && !(DKQ == 128 || DKQ == 256 || DKQ == 512)) {
@@ -1883,7 +1911,8 @@ static __global__ void flash_attn_ext_f16(
         const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
         const float * sinks_f = sinks && !banded_bias ? (const float *) sinks + zt_Q : nullptr;
         const float * rel_f = banded_bias ?
-            (const float *) sinks + int64_t(sequence)*ne01.z*ne02*rel_extent : nullptr;
+            (direct_bias ? (const float *) sinks :
+             (const float *) sinks + int64_t(sequence)*ne01.z*ne02*rel_extent) : nullptr;
 
         const float slope = banded_bias ? 1.0f :
             (ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f);
@@ -1932,7 +1961,8 @@ static __global__ void flash_attn_ext_f16(
     const half2 * V_h2 = V_is_K_view ? K_h2 : (const half2 *) (V + nb23*sequence + nb22*z_KV);
     const float * sinks_f = sinks && !banded_bias ? (const float *) sinks + zt_Q : nullptr;
     const float * rel_f = banded_bias ?
-        (const float *) sinks + int64_t(sequence)*ne01.z*ne02*rel_extent : nullptr;
+        (direct_bias ? (const float *) sinks :
+         (const float *) sinks + int64_t(sequence)*ne01.z*ne02*rel_extent) : nullptr;
 
     const float slope = banded_bias ? 1.0f :
         (ncols2 == 1 ? get_alibi_slope(max_bias, zt_Q, n_head_log2, m0, m1) : 1.0f);
