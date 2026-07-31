@@ -238,6 +238,13 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         const auto * cache = hparams.is_swa(il) ? mctx_attn->get_swa() : mctx_attn->get_base();
         const uint32_t n_kv_flash = hparams.is_swa(il) ? n_kv_banded_swa : n_kv_flash_base;
 
+        // The direct relative-bias kernel is intentionally memory-bounded for prefill, but its
+        // scalar reduction is the wrong tradeoff for a one-token decode.  In that case the
+        // dense bias is only O(n_kv * n_head) and the regular CUDA FA kernel is much faster.
+        if (n_tokens == 1) {
+            return false;
+        }
+
         // get_n_kv_pos_contiguous() is 0 for multi-sequence ubatches; the reserve context reports full n_kv
         return cparams.flash_attn &&
             n_kv_flash > 0 &&
