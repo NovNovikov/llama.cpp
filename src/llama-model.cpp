@@ -2279,7 +2279,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     // layer filters, so pick the right one here
                     llama_memory_hybrid::layer_filter_cb filter_attn = nullptr;
                     llama_memory_hybrid::layer_filter_cb filter_recr = nullptr;
-                    if (arch == LLM_ARCH_FALCON_H1) {
+                    if (arch == LLM_ARCH_FALCON_H1 || arch == LLM_ARCH_INKLING) {
                         filter_attn = [&](uint32_t) { return true; };
                         filter_recr = [&](uint32_t) { return true; };
                     } else if (arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE) {
