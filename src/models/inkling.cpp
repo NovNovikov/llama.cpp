@@ -229,7 +229,8 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
     bool needs_rel_idx_global = false;
 
     const auto banded_cache_type_supported = [](ggml_type type) {
-        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16;
+        return type == GGML_TYPE_F32 || type == GGML_TYPE_F16 || type == GGML_TYPE_BF16 ||
+            type == GGML_TYPE_Q8_0;
     };
 
     const auto use_banded_flash = [&](int il) {
@@ -449,10 +450,10 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
             if (v_trans) {
                 v_fa = ggml_transpose(ctx0, v_fa);
             }
-            if (k_fa->type == GGML_TYPE_F32) {
+            if (k_fa->type != GGML_TYPE_F16 && k_fa->type != GGML_TYPE_BF16) {
                 k_fa = ggml_cast(ctx0, k_fa, GGML_TYPE_F16);
             }
-            if (v_fa->type == GGML_TYPE_F32) {
+            if (v_fa->type != GGML_TYPE_F16 && v_fa->type != GGML_TYPE_BF16) {
                 v_fa = ggml_cast(ctx0, v_fa, GGML_TYPE_F16);
             }
 
