@@ -5547,6 +5547,29 @@ struct ggml_tensor * ggml_flash_attn_ext_banded_direct(
     return result;
 }
 
+struct ggml_tensor * ggml_flash_attn_ext_banded_direct_indexed(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * rel_input,
+        struct ggml_tensor  * rel_proj,
+        struct ggml_tensor  * rel_indices,
+        float                 scale,
+        int64_t               rel_extent) {
+    GGML_ASSERT(rel_indices != NULL);
+    GGML_ASSERT(rel_indices->type == GGML_TYPE_I32);
+    GGML_ASSERT(rel_indices->ne[0] == k->ne[1]);
+    GGML_ASSERT(rel_indices->ne[1] == q->ne[1]);
+
+    struct ggml_tensor * result = ggml_flash_attn_ext_banded_direct(
+        ctx, q, k, v, mask, rel_input, rel_proj, scale, rel_extent);
+    result->src[7] = rel_indices;
+
+    return result;
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {

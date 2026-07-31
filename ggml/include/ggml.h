@@ -2457,6 +2457,20 @@ extern "C" {
             float                 scale,
             int64_t               rel_extent);
 
+    // direct relative-position bias with an explicit [n_kv, n_batch] flattened index tensor.
+    // Each index is batch*(rel_extent + 1) + rel_dist; rel_dist == rel_extent means no bias.
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_banded_direct_indexed(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * rel_input,
+            struct ggml_tensor  * rel_proj,
+            struct ggml_tensor  * rel_indices,
+            float                 scale,
+            int64_t               rel_extent);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);

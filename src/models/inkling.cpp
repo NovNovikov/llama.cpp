@@ -223,6 +223,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
 
     const uint32_t n_kv_flash_base = cparams.flash_attn ? mctx_attn->get_base()->get_n_kv_pos_contiguous() : 0;
     const uint32_t n_kv_flash_swa  = cparams.flash_attn ? mctx_attn->get_swa ()->get_n_kv_pos_contiguous() : 0;
+    const uint32_t n_kv_banded_swa = cparams.flash_attn ? mctx_attn->get_swa ()->get_n_kv() : 0;
 
     bool has_global = false;
     bool needs_rel_idx_local  = false;
@@ -235,7 +236,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
 
     const auto use_banded_flash = [&](int il) {
         const auto * cache = hparams.is_swa(il) ? mctx_attn->get_swa() : mctx_attn->get_base();
-        const uint32_t n_kv_flash = hparams.is_swa(il) ? n_kv_flash_swa : n_kv_flash_base;
+        const uint32_t n_kv_flash = hparams.is_swa(il) ? n_kv_banded_swa : n_kv_flash_base;
 
         // get_n_kv_pos_contiguous() is 0 for multi-sequence ubatches; the reserve context reports full n_kv
         return cparams.flash_attn &&
@@ -249,21 +250,24 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
 
     for (int il = 0; il < n_layer; ++il) {
         if (hparams.is_swa(il)) {
-            needs_rel_idx_local |= !use_banded_flash(il);
+            // The SWA cache is a physical ring: K/V are not ordered by absolute position after
+            // its first wrap. The direct banded kernel consumes these indices to recover the
+            // correct relative distance without materializing dense bias logits.
+            needs_rel_idx_local = true;
         } else {
             has_global = true;
             needs_rel_idx_global |= !use_banded_flash(il);
         }
     }
 
-    if (cparams.flash_attn && (needs_rel_idx_local || needs_rel_idx_global)) {
+    if (cparams.flash_attn && needs_rel_idx_global) {
         const auto * base = mctx_attn->get_base();
         const auto * swa  = mctx_attn->get_swa();
-        LLAMA_LOG_WARN("%s: banded Flash Attention unavailable; using dense relative bias "
-                       "(base n_kv = %u, K = %s, V = %s; SWA n_kv = %u, K = %s, V = %s; "
+        LLAMA_LOG_WARN("%s: global banded Flash Attention unavailable; using dense relative bias "
+                       "(base n_kv = %u, K = %s, V = %s; SWA contiguous n_kv = %u, banded n_kv = %u, K = %s, V = %s; "
                        "head_dim = %lld, n_head = %u, n_head_kv = %u)\n",
                 __func__, n_kv_flash_base, ggml_type_name(base->type_k()), ggml_type_name(base->type_v()),
-                n_kv_flash_swa, ggml_type_name(swa->type_k()), ggml_type_name(swa->type_v()),
+                n_kv_flash_swa, n_kv_banded_swa, ggml_type_name(swa->type_k()), ggml_type_name(swa->type_v()),
                 (long long) head_dim, hparams.n_head(0), hparams.n_head_kv(0));
     }
 
@@ -434,7 +438,7 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
             ggml_tensor * k_fa = cache->get_k(ctx0, il);
             ggml_tensor * v_fa = cache->get_v(ctx0, il);
 
-            const int64_t n_kv_flash = is_swa ? n_kv_flash_swa : n_kv_flash_base;
+            const int64_t n_kv_flash = is_swa ? n_kv_banded_swa : n_kv_flash_base;
             GGML_ASSERT(n_stream == 1 && n_kv_flash <= k_fa->ne[2]);
 
             k_fa = ggml_view_4d(ctx0, k_fa,
@@ -478,8 +482,11 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
                     n_kv_flash, mask->ne[1], mask->ne[2], mask->ne[3],
                     mask->nb[1], mask->nb[2], mask->nb[3], 0));
 
-            cur = ggml_flash_attn_ext_banded_direct(ctx0, q_fa, k_fa, v_fa, mask, r_fa, proj_f32,
-                    1.0f/float(head_dim), rel_extent);
+            cur = is_swa
+                ? ggml_flash_attn_ext_banded_direct_indexed(ctx0, q_fa, k_fa, v_fa, mask, r_fa, proj_f32, rel_idx_swa,
+                        1.0f/float(head_dim), rel_extent)
+                : ggml_flash_attn_ext_banded_direct(ctx0, q_fa, k_fa, v_fa, mask, r_fa, proj_f32,
+                        1.0f/float(head_dim), rel_extent);
             ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
 

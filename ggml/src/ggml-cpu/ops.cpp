@@ -8532,6 +8532,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * rel   = dst->src[5];
     const ggml_tensor * rel_proj = dst->src[6];
+    const ggml_tensor * rel_indices = dst->src[7];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8662,7 +8663,12 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
 
             if (rel) {
                 // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention)
-                const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+                int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
+                if (rel_indices) {
+                    const int32_t flat = *(const int32_t *) ((const char *) rel_indices->data +
+                        (size_t) ic * rel_indices->nb[0] + (size_t) iq1 * rel_indices->nb[1]);
+                    rel_dist = flat % (rel_proj->ne[1] + 1);
+                }
                 const int64_t rel_extent = rel_proj ? rel_proj->ne[1] : rel->ne[0];
                 if (rel_dist >= 0 && rel_dist < rel_extent) {
                     s += rel_proj

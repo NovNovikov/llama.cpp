@@ -29,6 +29,7 @@ static __global__ void flash_attn_ext_banded_f32(
         const char * __restrict__ mask,
         const char * __restrict__ rel,
         const char * __restrict__ rel_proj,
+        const int32_t * __restrict__ rel_indices,
         float      * __restrict__ dst,
         float scale,
         int type_k,
@@ -63,7 +64,9 @@ static __global__ void flash_attn_ext_banded_f32(
         int64_t rel_ne0,
         int64_t rel_ne3,
         uint64_t p_nb0,
-        uint64_t p_nb1) {
+        uint64_t p_nb1,
+        uint64_t i_nb0,
+        uint64_t i_nb1) {
     constexpr int values_per_lane = D / WARP_SIZE;
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
     static_assert(D % WARP_SIZE == 0, "head dimension must be divisible by warp size");
@@ -105,7 +108,11 @@ static __global__ void flash_attn_ext_banded_f32(
         dot = warp_reduce_sum(dot);
 
         float score = dot * scale;
-        const int64_t rel_dist = iq + q_offset - ik;
+        int64_t rel_dist = iq + q_offset - ik;
+        if (rel_indices) {
+            const int32_t flat = *(const int32_t *) ((const char *) rel_indices + uint64_t(ik)*i_nb0 + uint64_t(iq)*i_nb1);
+            rel_dist = flat % (rel_extent + 1);
+        }
         float rel_bias = 0.0f;
         if (rel_dist >= 0 && rel_dist < rel_extent) {
             if (rel_proj) {
@@ -187,6 +194,7 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     const ggml_tensor * m   = dst->src[3];
     const ggml_tensor * rel = dst->src[5];
     const ggml_tensor * rel_proj = dst->src[6];
+    const ggml_tensor * rel_indices = dst->src[7];
     if (!q || !k || !v || !rel || q->type != GGML_TYPE_F32) {
         return false;
     }
@@ -217,6 +225,11 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
             rel_proj->nb[0] != sizeof(float))) {
         return false;
     }
+    if (rel_indices && (rel_proj == nullptr || rel_indices->type != GGML_TYPE_I32 ||
+            rel_indices->ne[0] != k->ne[1] || rel_indices->ne[1] != q->ne[1] ||
+            rel_indices->nb[0] != sizeof(int32_t))) {
+        return false;
+    }
     return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&
         q->ne[2] % m->ne[2] == 0 && q->ne[3] % m->ne[3] == 0);
 #endif
@@ -231,6 +244,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     const ggml_tensor * m   = dst->src[3];
     const ggml_tensor * rel = dst->src[5];
     const ggml_tensor * rel_proj = dst->src[6];
+    const ggml_tensor * rel_indices = dst->src[7];
 
     // route F16/BF16 K/V to the MMA kernel; keep this FP32 kernel for mixed types and strided rel
     if (!rel_proj && k->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F32 &&
@@ -255,14 +269,16 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     flash_attn_ext_banded_f32<D, warps_per_block><<<blocks, threads, 0, stream>>>( \
         (const char *) q->data, (const char *) k->data, (const char *) v->data, \
         m ? (const char *) m->data : nullptr, (const char *) rel->data, \
-        rel_proj ? (const char *) rel_proj->data : nullptr, (float *) dst->data, \
+        rel_proj ? (const char *) rel_proj->data : nullptr, \
+        rel_indices ? (const int32_t *) rel_indices->data : nullptr, (float *) dst->data, \
         scale, k->type, v->type, rel->type, q->ne[1], k->ne[1], q->ne[2], k->ne[2], q->ne[3], \
         rel_extent, m ? m->ne[2] : 1, m ? m->ne[3] : 1, \
         q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
         v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
         rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[0], rel->ne[3], \
-        rel_proj ? rel_proj->nb[0] : 0, rel_proj ? rel_proj->nb[1] : 0)
+        rel_proj ? rel_proj->nb[0] : 0, rel_proj ? rel_proj->nb[1] : 0, \
+        rel_indices ? rel_indices->nb[0] : 0, rel_indices ? rel_indices->nb[1] : 0)
 
     if (q->ne[0] == 64) {
         LAUNCH_BANDED(64);
