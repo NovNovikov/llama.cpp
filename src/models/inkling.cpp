@@ -238,10 +238,10 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         const auto * cache = hparams.is_swa(il) ? mctx_attn->get_swa() : mctx_attn->get_base();
         const uint32_t n_kv_flash = hparams.is_swa(il) ? n_kv_banded_swa : n_kv_flash_base;
 
-        // The direct relative-bias kernel is intentionally memory-bounded for prefill, but its
-        // scalar reduction is the wrong tradeoff for a one-token decode.  In that case the
-        // dense bias is only O(n_kv * n_head) and the regular CUDA FA kernel is much faster.
-        if (n_tokens == 1) {
+        // The direct relative-bias kernel is intentionally memory-bounded for large prefills,
+        // but its scalar reduction loses to the regular Tensor Core FA kernel on small
+        // ubatches.  At 512 tokens the temporary dense bias is 1/8 of the 4096-token case.
+        if (n_tokens <= 512) {
             return false;
         }
 
