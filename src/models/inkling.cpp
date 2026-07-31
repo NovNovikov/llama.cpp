@@ -256,6 +256,17 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         }
     }
 
+    if (cparams.flash_attn && (needs_rel_idx_local || needs_rel_idx_global)) {
+        const auto * base = mctx_attn->get_base();
+        const auto * swa  = mctx_attn->get_swa();
+        LLAMA_LOG_WARN("%s: banded Flash Attention unavailable; using dense relative bias "
+                       "(base n_kv = %u, K = %s, V = %s; SWA n_kv = %u, K = %s, V = %s; "
+                       "head_dim = %lld, n_head = %u, n_head_kv = %u)\n",
+                __func__, n_kv_flash_base, ggml_type_name(base->type_k()), ggml_type_name(base->type_v()),
+                n_kv_flash_swa, ggml_type_name(swa->type_k()), ggml_type_name(swa->type_v()),
+                (long long) head_dim, hparams.n_head(0), hparams.n_head_kv(0));
+    }
+
     auto inp = std::make_unique<llm_graph_input_inkling>(hparams, mctx_hyb);
 
     if (hparams.inkling_log_n_floor > 0 && has_global) {
