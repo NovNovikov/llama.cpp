@@ -392,6 +392,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
 
     // banded bias lives in the F16 MMA loop; F32 K/V keeps the dedicated FP32 warp kernel
     if (dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED &&
+        dst->src[6] == nullptr &&
         dst->src[5]->type == GGML_TYPE_F32 && K->type != GGML_TYPE_F32 && V->type != GGML_TYPE_F32 &&
         dst->src[5]->ne[3] == Q->ne[3] &&
         turing_mma_available(cc) && (Q->ne[0] == 64 || Q->ne[0] == 128) && V->ne[0] == Q->ne[0]) {

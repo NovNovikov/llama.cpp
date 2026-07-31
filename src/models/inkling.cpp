@@ -375,19 +375,19 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
         }
 
         // relative position bias
-        ggml_tensor * r2 = ggml_reshape_2d(ctx0, r, d_rel, n_head*n_tokens);
+        //
+        // Keep r in its compact [d_rel, n_head, n_tokens] form for the CUDA fused path.
+        // Materializing rel [rel_extent, n_head, n_tokens] costs 512 MiB per global Inkling
+        // layer at a 4096-token ubatch and must not be part of the fused graph.
+        r = ggml_reshape_3d(ctx0, r, d_rel, n_head, n_tokens);
+        if (tau && !is_swa) {
+            // Applying tau before the projection is algebraically equivalent and preserves the
+            // compact representation used by the direct fused kernel.
+            r = ggml_mul(ctx0, r, tau);
+        }
 
         // proj stored [E, d_rel]; transpose so ggml_mul_mat contracts over d_rel
         ggml_tensor * proj = ggml_cont(ctx0, ggml_transpose(ctx0, layer.attn_rel_proj)); // {d_rel, E}
-
-        ggml_tensor * rel = ggml_mul_mat(ctx0, proj, r2); // {E, n_head*n_tokens}
-        ggml_mul_mat_set_prec(rel, GGML_PREC_F32_PEDANTIC);
-        rel = ggml_reshape_3d(ctx0, rel, rel_extent, n_head, n_tokens);
-
-        if (tau && !is_swa) {
-            rel = ggml_mul(ctx0, rel, tau);
-        }
-        cb(rel, "inkling_rel_logits", il);
 
         auto * inp_attn = inp_hybrid->get_attn();
         const int64_t n_stream = (is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask())->ne[3];
@@ -457,14 +457,17 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
                 v_fa = ggml_cast(ctx0, v_fa, GGML_TYPE_F16);
             }
 
-            ggml_tensor * rel_fa = ggml_reshape_4d(ctx0, rel,
-                    rel_extent, n_head, n_tokens/n_stream, n_stream);
+            // Dequantize the tiny relative-bias projection once, then evaluate its d_rel=16
+            // dot product inside the attention warp. This avoids the enormous rel tensor.
+            ggml_tensor * proj_f32 = ggml_cast(ctx0, proj, GGML_TYPE_F32);
+            ggml_tensor * r_fa = ggml_reshape_4d(ctx0, r,
+                    d_rel, n_head, n_tokens/n_stream, n_stream);
             ggml_tensor * mask = is_swa ? inp_attn->get_kq_mask_swa() : inp_attn->get_kq_mask();
             mask = ggml_cont(ctx0, ggml_view_4d(ctx0, mask,
                     n_kv_flash, mask->ne[1], mask->ne[2], mask->ne[3],
                     mask->nb[1], mask->nb[2], mask->nb[3], 0));
 
-            cur = ggml_flash_attn_ext_banded(ctx0, q_fa, k_fa, v_fa, mask, rel_fa,
+            cur = ggml_flash_attn_ext_banded_direct(ctx0, q_fa, k_fa, v_fa, mask, r_fa, proj_f32,
                     1.0f/float(head_dim), rel_extent);
             ggml_flash_attn_ext_set_prec(cur, GGML_PREC_F32);
             res->add_fused_node({LLM_FUSED_OP_FLASH_ATTN, cur, il});
@@ -478,6 +481,12 @@ llama_model_inkling::graph::graph(const llama_model & model, const llm_graph_par
             }
             cur = build_lora_mm(layer.wo, cur);
         } else {
+            ggml_tensor * r2 = ggml_reshape_2d(ctx0, r, d_rel, n_head*n_tokens);
+            ggml_tensor * rel = ggml_mul_mat(ctx0, proj, r2); // {E, n_head*n_tokens}
+            ggml_mul_mat_set_prec(rel, GGML_PREC_F32_PEDANTIC);
+            rel = ggml_reshape_3d(ctx0, rel, rel_extent, n_head, n_tokens);
+            cb(rel, "inkling_rel_logits", il);
+
             // soft_max_ext scales kq + kq_b jointly: fold 1/head_dim into q to keep the bias unscaled
             q = ggml_scale(ctx0, q, 1.0f/float(head_dim));
 

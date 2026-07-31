@@ -8491,6 +8491,32 @@ static inline float ggml_flash_attn_ext_banded_load(
     }
 }
 
+static inline float ggml_flash_attn_ext_banded_direct_load(
+        const ggml_tensor * rel_input,
+        const ggml_tensor * rel_proj,
+        int64_t iq1,
+        int64_t iq2,
+        int64_t iq3,
+        int64_t rel_idx) {
+    GGML_ASSERT(rel_input->type == GGML_TYPE_F32);
+    GGML_ASSERT(rel_proj->type == GGML_TYPE_F32);
+
+    float result = 0.0f;
+    for (int64_t id = 0; id < rel_input->ne[0]; ++id) {
+        const float input = *(const float *) ((const char *) rel_input->data +
+            (size_t) id  * rel_input->nb[0] +
+            (size_t) iq2 * rel_input->nb[1] +
+            (size_t) iq1 * rel_input->nb[2] +
+            (size_t) (iq3 % rel_input->ne[3]) * rel_input->nb[3]);
+        const float proj = *(const float *) ((const char *) rel_proj->data +
+            (size_t) id      * rel_proj->nb[0] +
+            (size_t) rel_idx * rel_proj->nb[1]);
+        result += input * proj;
+    }
+
+    return result;
+}
+
 static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
         const ggml_compute_params * params,
         ggml_tensor * dst,
@@ -8505,6 +8531,7 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
     const ggml_tensor * rel   = dst->src[5];
+    const ggml_tensor * rel_proj = dst->src[6];
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
@@ -8636,8 +8663,11 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
             if (rel) {
                 // the offset aligns a short decode Q block to the tail of K (FA4 seqlen_k - seqlen_q convention)
                 const int64_t rel_dist = iq1 + (nek1 - neq1) - ic;
-                if (rel_dist >= 0 && rel_dist < rel->ne[0]) {
-                    s += ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
+                const int64_t rel_extent = rel_proj ? rel_proj->ne[1] : rel->ne[0];
+                if (rel_dist >= 0 && rel_dist < rel_extent) {
+                    s += rel_proj
+                        ? ggml_flash_attn_ext_banded_direct_load(rel, rel_proj, iq1, iq2, iq3, rel_dist)
+                        : ggml_flash_attn_ext_banded_load(rel, iq1, iq2, iq3, rel_dist);
                 }
             }
 

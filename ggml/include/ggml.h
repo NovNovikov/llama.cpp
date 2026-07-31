@@ -2442,6 +2442,21 @@ extern "C" {
             float                 scale,
             int64_t               rel_extent);
 
+    // variant of ggml_flash_attn_ext_banded that computes the relative-position bias in the
+    // attention kernel instead of materializing rel_logits:
+    //   rel_input: [d_rel, n_head, n_batch, ne3]
+    //   rel_proj:  [d_rel, rel_extent]
+    GGML_API struct ggml_tensor * ggml_flash_attn_ext_banded_direct(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * q,
+            struct ggml_tensor  * k,
+            struct ggml_tensor  * v,
+            struct ggml_tensor  * mask,
+            struct ggml_tensor  * rel_input,
+            struct ggml_tensor  * rel_proj,
+            float                 scale,
+            int64_t               rel_extent);
+
     GGML_API void ggml_flash_attn_ext_set_prec(
             struct ggml_tensor * a,
             enum ggml_prec       prec);

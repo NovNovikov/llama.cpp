@@ -5495,6 +5495,58 @@ struct ggml_tensor * ggml_flash_attn_ext_banded(
     return result;
 }
 
+struct ggml_tensor * ggml_flash_attn_ext_banded_direct(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * v,
+        struct ggml_tensor  * mask,
+        struct ggml_tensor  * rel_input,
+        struct ggml_tensor  * rel_proj,
+        float                 scale,
+        int64_t               rel_extent) {
+    GGML_ASSERT(ggml_can_mul_mat(k, q));
+    GGML_ASSERT(q->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[3] == k->ne[3]);
+    GGML_ASSERT(q->ne[3] == v->ne[3]);
+    GGML_ASSERT(q->ne[2] % k->ne[2] == 0);
+    GGML_ASSERT(q->ne[2] % v->ne[2] == 0);
+
+    GGML_ASSERT(rel_input != NULL && rel_proj != NULL);
+    GGML_ASSERT(rel_input->type == GGML_TYPE_F32);
+    GGML_ASSERT(rel_proj->type == GGML_TYPE_F32);
+    GGML_ASSERT(rel_extent > 0);
+    GGML_ASSERT(rel_input->ne[1] == q->ne[2]);
+    GGML_ASSERT(rel_input->ne[2] == q->ne[1]);
+    GGML_ASSERT(rel_input->ne[3] == 1 || rel_input->ne[3] == q->ne[3]);
+    GGML_ASSERT(rel_proj->ne[0] == rel_input->ne[0]);
+    GGML_ASSERT(rel_proj->ne[1] == rel_extent);
+
+    if (mask) {
+        GGML_ASSERT(mask->type == GGML_TYPE_F16);
+        GGML_ASSERT(ggml_is_contiguous(mask));
+        GGML_ASSERT(q->ne[2] % mask->ne[2] == 0);
+        GGML_ASSERT(q->ne[3] % mask->ne[3] == 0);
+    }
+
+    int64_t ne[4] = { v->ne[0], q->ne[2], q->ne[1], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    float params[] = { scale, 0.0f, 0.0f };
+    ggml_set_op_params(result, params, sizeof(params));
+    memcpy(result->op_params + 16, &rel_extent, sizeof(rel_extent));
+
+    result->op     = GGML_OP_FLASH_ATTN_EXT_BANDED;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = v;
+    result->src[3] = mask;
+    result->src[5] = rel_input;
+    result->src[6] = rel_proj;
+
+    return result;
+}
+
 void ggml_flash_attn_ext_set_prec(
         struct ggml_tensor * a,
         enum ggml_prec       prec) {

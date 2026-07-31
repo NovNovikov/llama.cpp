@@ -28,6 +28,7 @@ static __global__ void flash_attn_ext_banded_f32(
         const char * __restrict__ v,
         const char * __restrict__ mask,
         const char * __restrict__ rel,
+        const char * __restrict__ rel_proj,
         float      * __restrict__ dst,
         float scale,
         int type_k,
@@ -59,7 +60,10 @@ static __global__ void flash_attn_ext_banded_f32(
         uint64_t r_nb1,
         uint64_t r_nb2,
         uint64_t r_nb3,
-        int64_t rel_ne3) {
+        int64_t rel_ne0,
+        int64_t rel_ne3,
+        uint64_t p_nb0,
+        uint64_t p_nb1) {
     constexpr int values_per_lane = D / WARP_SIZE;
     static_assert(D == 64 || D == 128, "banded FA supports head dimensions 64 and 128");
     static_assert(D % WARP_SIZE == 0, "head dimension must be divisible by warp size");
@@ -101,14 +105,27 @@ static __global__ void flash_attn_ext_banded_f32(
         dot = warp_reduce_sum(dot);
 
         float score = dot * scale;
-        if (lane == 0) {
-            const int64_t rel_dist = iq + q_offset - ik;
-            if (rel_dist >= 0 && rel_dist < rel_extent) {
+        const int64_t rel_dist = iq + q_offset - ik;
+        float rel_bias = 0.0f;
+        if (rel_dist >= 0 && rel_dist < rel_extent) {
+            if (rel_proj) {
+                if (lane < rel_ne0) {
+                    const char * rel_value = rel +
+                        uint64_t(lane)*r_nb0 + uint64_t(ih)*r_nb1 +
+                        uint64_t(iq)*r_nb2 + uint64_t(ib % rel_ne3)*r_nb3;
+                    const char * proj_value = rel_proj + uint64_t(lane)*p_nb0 + uint64_t(rel_dist)*p_nb1;
+                    rel_bias = *(const float *) rel_value * *(const float *) proj_value;
+                }
+                rel_bias = warp_reduce_sum(rel_bias);
+            } else if (lane == 0) {
                 const char * rel_value = rel +
                     uint64_t(rel_dist)*r_nb0 + uint64_t(ih)*r_nb1 +
                     uint64_t(iq)*r_nb2 + uint64_t(ib % rel_ne3)*r_nb3;
-                score += fattn_banded_load(rel_value, type_rel);
+                rel_bias = fattn_banded_load(rel_value, type_rel);
             }
+        }
+        if (lane == 0) {
+            score += rel_bias;
             if (mask) {
                 const char * mask_value = mask + uint64_t(ik)*sizeof(half) +
                     uint64_t(iq)*m_nb1 + uint64_t(ih % mask_ne2)*m_nb2 +
@@ -169,12 +186,13 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
     const ggml_tensor * v   = dst->src[2];
     const ggml_tensor * m   = dst->src[3];
     const ggml_tensor * rel = dst->src[5];
+    const ggml_tensor * rel_proj = dst->src[6];
     if (!q || !k || !v || !rel || q->type != GGML_TYPE_F32) {
         return false;
     }
     if (!fattn_banded_type_supported(k->type) ||
         !fattn_banded_type_supported(v->type) ||
-        !fattn_banded_type_supported(rel->type)) {
+        (!rel_proj && !fattn_banded_type_supported(rel->type))) {
         return false;
     }
     if ((q->ne[0] != 64 && q->ne[0] != 128) || v->ne[0] != q->ne[0] || k->ne[0] != q->ne[0]) {
@@ -194,6 +212,11 @@ bool ggml_cuda_flash_attn_ext_banded_supported(int device, const ggml_tensor * d
         (rel->ne[3] != 1 && rel->ne[3] != q->ne[3])) {
         return false;
     }
+    if (rel_proj && (rel->type != GGML_TYPE_F32 || rel_proj->type != GGML_TYPE_F32 ||
+            rel_proj->ne[0] != rel->ne[0] || rel_proj->ne[1] <= 0 ||
+            rel_proj->nb[0] != sizeof(float))) {
+        return false;
+    }
     return !m || (m->type == GGML_TYPE_F16 && ggml_is_contiguous(m) &&
         q->ne[2] % m->ne[2] == 0 && q->ne[3] % m->ne[3] == 0);
 #endif
@@ -207,9 +230,10 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     const ggml_tensor * v   = dst->src[2];
     const ggml_tensor * m   = dst->src[3];
     const ggml_tensor * rel = dst->src[5];
+    const ggml_tensor * rel_proj = dst->src[6];
 
     // route F16/BF16 K/V to the MMA kernel; keep this FP32 kernel for mixed types and strided rel
-    if (k->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F32 &&
+    if (!rel_proj && k->type != GGML_TYPE_F32 && v->type != GGML_TYPE_F32 &&
         rel->type == GGML_TYPE_F32 && ggml_is_contiguous(rel) &&
         // MMA ABI indexes rel by Q's batch: a singleton rel batch must take the stride-aware fallback
         rel->ne[3] == q->ne[3] && rel->ne[0] <= (1 << 20)) {
@@ -220,7 +244,7 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
     float scale;
     memcpy(&scale, dst->op_params, sizeof(scale));
     // the tensor extent (not op_params) is authoritative after graph cloning
-    const int64_t rel_extent = rel->ne[0];
+    const int64_t rel_extent = rel_proj ? rel_proj->ne[1] : rel->ne[0];
 
     constexpr int warps_per_block = 4;
     const dim3 blocks((q->ne[1] + warps_per_block - 1) / warps_per_block, q->ne[2], q->ne[3]);
@@ -230,13 +254,15 @@ void ggml_cuda_flash_attn_ext_banded(ggml_backend_cuda_context & ctx, ggml_tenso
 #define LAUNCH_BANDED(D) \
     flash_attn_ext_banded_f32<D, warps_per_block><<<blocks, threads, 0, stream>>>( \
         (const char *) q->data, (const char *) k->data, (const char *) v->data, \
-        m ? (const char *) m->data : nullptr, (const char *) rel->data, (float *) dst->data, \
+        m ? (const char *) m->data : nullptr, (const char *) rel->data, \
+        rel_proj ? (const char *) rel_proj->data : nullptr, (float *) dst->data, \
         scale, k->type, v->type, rel->type, q->ne[1], k->ne[1], q->ne[2], k->ne[2], q->ne[3], \
         rel_extent, m ? m->ne[2] : 1, m ? m->ne[3] : 1, \
         q->nb[1], q->nb[2], q->nb[3], k->nb[0], k->nb[1], k->nb[2], k->nb[3], \
         v->nb[0], v->nb[1], v->nb[2], v->nb[3], \
         m ? m->nb[1] : 0, m ? m->nb[2] : 0, m ? m->nb[3] : 0, \
-        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[3])
+        rel->nb[0], rel->nb[1], rel->nb[2], rel->nb[3], rel->ne[0], rel->ne[3], \
+        rel_proj ? rel_proj->nb[0] : 0, rel_proj ? rel_proj->nb[1] : 0)
 
     if (q->ne[0] == 64) {
         LAUNCH_BANDED(64);

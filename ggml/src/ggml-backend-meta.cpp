@@ -762,6 +762,8 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         GGML_ASSERT(tensor->src[3] == nullptr || src_ss[3].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         // rel_logits is [E, H, Q, B], so its head shard is axis 1.
         GGML_ASSERT(                             src_ss[5].axis == GGML_BACKEND_SPLIT_AXIS_1);
+        // The direct variant receives [d_rel, H, Q, B] plus a small shared projection.
+        GGML_ASSERT(tensor->src[6] == nullptr || src_ss[6].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED);
         return {GGML_BACKEND_SPLIT_AXIS_1, {0}, {1}, 1};
     };
 
