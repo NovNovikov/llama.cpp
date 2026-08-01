@@ -8530,9 +8530,10 @@ static void ggml_compute_forward_flash_attn_ext_f16_one_chunk(
     const ggml_tensor * v     = dst->src[2];
     const ggml_tensor * mask  = dst->src[3];
     const ggml_tensor * sinks = dst->src[4];
-    const ggml_tensor * rel   = dst->src[5];
-    const ggml_tensor * rel_proj = dst->src[6];
-    const ggml_tensor * rel_indices = dst->src[7];
+    const bool is_banded = dst->op == GGML_OP_FLASH_ATTN_EXT_BANDED;
+    const ggml_tensor * rel   = is_banded ? dst->src[5] : nullptr;
+    const ggml_tensor * rel_proj = is_banded ? dst->src[6] : nullptr;
+    const ggml_tensor * rel_indices = is_banded ? dst->src[7] : nullptr;
 
     GGML_TENSOR_LOCALS(int64_t, neq, q,   ne)
     GGML_TENSOR_LOCALS(size_t,  nbq, q,   nb)
