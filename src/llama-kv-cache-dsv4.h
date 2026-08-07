@@ -72,7 +72,6 @@ private:
 
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
-
     size_t total_size() const;
 };
 
@@ -163,10 +162,6 @@ private:
     const uint32_t n_rs_seq;
 
     std::vector<uint32_t> rs_idx;
-
-    // The compressor-state rings are widened by this budget so the newest
-    // tokens can be removed without aliasing an unfinished compressed block.
-    const uint32_t n_rs_seq;
 
     std::unique_ptr<llama_kv_cache_iswa> kv_raw;
     std::unique_ptr<llama_kv_cache>      kv_csa;
