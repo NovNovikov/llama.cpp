@@ -85,6 +85,9 @@ struct llama_context {
     float * get_embeddings_ith(int32_t i);
     float * get_embeddings_seq(llama_seq_id seq_id);
 
+    float * get_embeddings_pre_norm();
+    float * get_embeddings_pre_norm_ith(int32_t i);
+
     float * get_embeddings_nextn();
     float * get_embeddings_nextn_ith(int32_t i);
 
@@ -113,6 +116,7 @@ struct llama_context {
     void set_abort_callback(bool (*abort_callback)(void * data), void * abort_callback_data);
 
     void set_embeddings (bool value);
+    void set_embeddings_pre_norm(bool value);
     void set_embeddings_nextn(bool value, bool masked);
     void set_embeddings_layer_inp(uint32_t lid, bool enable);
     void set_nextn_layer_offset(int32_t offset);
@@ -223,7 +227,7 @@ private:
 
     // Make sure enough space is available for outputs.
     // Returns max number of outputs for which space was reserved.
-    uint32_t output_reserve(int32_t n_outputs);
+    uint32_t output_reserve(int32_t n_outputs, int32_t n_outputs_pre_norm = -1);
 
     void output_reorder();
 
@@ -294,6 +298,10 @@ private:
     // embeddings output (2-dimensional array: [n_outputs][n_embd])
     // populated only when pooling_type == LLAMA_POOLING_TYPE_NONE
     buffer_view<float> embd = {nullptr, 0};
+
+    // hidden state before the final output norm
+    buffer_view<float> embd_pre_norm = {nullptr, 0};
+    int32_t n_outputs_pre_norm = 0;
 
     // hidden state required by the nextn layers (2-dimensional array: [n_outputs][n_embd])
     // populated only when cparams.embeddings_nextn is enabled and the model graph
