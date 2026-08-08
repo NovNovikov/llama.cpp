@@ -209,6 +209,15 @@ static ggml_tensor * dsv4_append_zero_row(ggml_context * ctx, ggml_tensor * t, b
     return ggml_concat(ctx, t, row, 1);
 }
 
+static ggml_tensor * dsv4_with_zero_dep(ggml_context * ctx, ggml_tensor * t, ggml_tensor * dep) {
+    if (dep == nullptr) {
+        return t;
+    }
+
+    ggml_tensor * zero = ggml_scale(ctx, ggml_sum(ctx, dep), 0.0f);
+    return ggml_add(ctx, t, zero);
+}
+
 struct dsv4_state_tensors {
     ggml_tensor * kv;
     ggml_tensor * score;
@@ -1045,6 +1054,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_csa()->cpy_k(ctx0,
                     kv_comp_csa_state, inp_dsv4->get_csa().state_write_idxs, il));
 
+        csa_state_kv    = dsv4_with_zero_dep(ctx0, csa_state_kv,    kv_comp_csa_state);
+        csa_state_score = dsv4_with_zero_dep(ctx0, csa_state_score, kv_comp_csa_state);
+
         ggml_tensor * csa_snapshot_source_kv = ggml_concat(ctx0,
                 csa_restored.kv, csa_state_kv, 1);
         ggml_tensor * csa_snapshot_source_score = ggml_concat(ctx0,
@@ -1114,6 +1126,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_lid()->cpy_k(ctx0,
                     kv_comp_lid_state, inp_dsv4->get_lid().state_write_idxs, il));
 
+        lid_state_kv    = dsv4_with_zero_dep(ctx0, lid_state_kv,    kv_comp_lid_state);
+        lid_state_score = dsv4_with_zero_dep(ctx0, lid_state_score, kv_comp_lid_state);
+
         ggml_tensor * lid_snapshot_source_kv = ggml_concat(ctx0,
                 lid_restored.kv, lid_state_kv, 1);
         ggml_tensor * lid_snapshot_source_score = ggml_concat(ctx0,
@@ -1173,6 +1188,9 @@ ggml_tensor * llama_model_deepseek4::graph::build_attention_impl(
 
         ggml_build_forward_expand(gf, inp_dsv4->mctx->get_hca()->cpy_k(ctx0,
                     kv_comp_hca, inp_dsv4->get_hca().state_write_idxs, il));
+
+        hca_state_kv    = dsv4_with_zero_dep(ctx0, hca_state_kv,    kv_comp_hca);
+        hca_state_score = dsv4_with_zero_dep(ctx0, hca_state_score, kv_comp_hca);
     }
 
     if (ratio == DSV4_HCA_RATIO && inp_dsv4->get_hca().state_pos) {
