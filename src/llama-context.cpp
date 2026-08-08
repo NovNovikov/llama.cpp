@@ -2573,7 +2573,11 @@ llm_graph_cb llama_context::graph_get_cb() const {
         // FIXME: fix in ggml_backend_sched
         const bool full_offload = model.n_gpu_layers() > model.hparams.n_layer_all;
         if (ubatch.n_tokens < 32 || full_offload) {
-            if (il != -1 && (strcmp(name, "norm") == 0 || strcmp(name, "l_last") == 0)) {
+            const bool layer_has_host_experts = il != -1 && model.layers[il].ffn_gate_exps != nullptr &&
+                model.layers[il].ffn_gate_exps->buffer != nullptr &&
+                ggml_backend_buffer_is_host(model.layers[il].ffn_gate_exps->buffer);
+            const bool force_layer_last = strcmp(name, "l_last") == 0 && !layer_has_host_experts;
+            if (il != -1 && (strcmp(name, "norm") == 0 || force_layer_last)) {
                 const auto & dev_layer = model.dev_layer(il);
                 for (const auto & backend : backends) {
                     if (ggml_backend_get_device(backend.get()) == dev_layer) {
