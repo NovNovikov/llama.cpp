@@ -1339,11 +1339,9 @@ llama_model_deepseek4::graph::graph(const llama_model & model, const llm_graph_p
                 &post, &comb, il);
         cb(cur, "hc_ffn_pre", il);
 
-        if (cparams.n_rs_seq > 0) {
-            ggml_build_forward_expand(gf, residual);
-            ggml_build_forward_expand(gf, post);
-            ggml_build_forward_expand(gf, comb);
-        }
+        ggml_build_forward_expand(gf, residual);
+        ggml_build_forward_expand(gf, post);
+        ggml_build_forward_expand(gf, comb);
 
         cur = build_norm(cur, model.layers[il].ffn_norm, nullptr, LLM_NORM_RMS, il);
         cb(cur, "ffn_norm", il);
