@@ -3140,7 +3140,7 @@ static common_chat_params common_chat_params_init_solar_open2(const common_chat_
             foreach_function(inputs.tools, [&](const json & tool) {
                 const auto & function = tool.at("function");
                 const std::string name = function.at("name");
-                const auto params = function.contains("parameters") ? function.at("parameters") : json::object();
+                auto params = function.contains("parameters") ? function.at("parameters") : json::object();
                 auto args = p.eps();
 
                 if (params.contains("properties") && params.at("properties").is_object() && !params.at("properties").empty()) {
