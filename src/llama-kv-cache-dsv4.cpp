@@ -799,7 +799,6 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
     llama_kv_cache_dsv4_context::comp_plan plan;
     plan.n_visible.resize(ubatch.n_tokens);
     plan.n_stream = dsv4_comp_graph_n_stream(ubatch, n_stream);
-    plan.n_kv = kv_size;
 
     if (ubatch.n_tokens == 0) {
         return plan;
@@ -807,6 +806,27 @@ static llama_kv_cache_dsv4_context::comp_plan dsv4_build_reserve_comp_plan(
 
     const uint32_t n_seqs       = std::max<uint32_t>(1, ubatch.n_seqs);
     const uint32_t n_seq_tokens = std::max<uint32_t>(1, ubatch.n_seq_tokens);
+
+    if (n_rs_seq == 0) {
+        // Without recurrent-state rollback, reserve only the compressed rows
+        // visible to the synthetic reserve batch. Reserving the full cache
+        // width creates full-context CSA/LID masks solely for graph sizing.
+        for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
+            const uint32_t pos = i / n_seqs;
+            const int64_t n_visible = (int64_t) (pos + 1) / ratio;
+            plan.n_visible[i] = (int32_t) n_visible;
+            plan.n_kv = std::max(plan.n_kv, n_visible);
+        }
+
+        plan.n_kv = std::min<int64_t>(plan.n_kv, kv_size);
+        if (plan.n_kv > 0) {
+            plan.n_kv = GGML_PAD(plan.n_kv, 256u);
+        }
+    } else {
+        // Rollback snapshots require a fixed-width reserve graph.
+        plan.n_kv = kv_size;
+    }
+
     const uint64_t n_blocks_u64 = (uint64_t) n_seqs*((n_seq_tokens + ratio - 1)/ratio);
     const size_t n_blocks = (size_t) std::max<uint64_t>(1, n_blocks_u64);
     GGML_ASSERT((uint64_t) n_blocks == std::max<uint64_t>(1, n_blocks_u64));
