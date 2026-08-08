@@ -1199,7 +1199,6 @@ struct llama_model_deepseek4 : public llama_model_base {
         ggml_tensor * build_top_k_mask(
                 ggml_tensor * kq_mask,
                 ggml_tensor * top_k,
-                ggml_type mask_type,
                 const char * name,
                 int il) const;
 
