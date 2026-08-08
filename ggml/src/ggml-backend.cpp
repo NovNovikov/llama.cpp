@@ -944,9 +944,6 @@ static int ggml_backend_sched_backend_id_from_cur(ggml_backend_sched_t sched, st
     // skip ROPE since the rope freqs tensor is too small to choose a backend based on it
     allow = allow && tensor->op != GGML_OP_ROPE;
 
-    // skip FLASH_ATTN_EXT since the sinks tensor is too small to choose a based based on it
-    allow = allow && tensor->op != GGML_OP_FLASH_ATTN_EXT;
-
     if (allow) {
         for (int i = 0; i < GGML_MAX_SRC; i++) {
             const struct ggml_tensor * src = tensor->src[i];
