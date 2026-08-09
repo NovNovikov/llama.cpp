@@ -3963,6 +3963,7 @@ private:
                     const auto & spans = slot.task->params.message_spans;
                     const auto first_assistant_pos = spans.first_assistant_message_pos();
                     const auto last_assistant_end  = spans.last_assistant_message_end();
+                    const auto fifth_last_assistant_pos = spans.nth_last_assistant_message_pos(5);
                     const char * chunk_stop_reason = "prompt_exhausted";
                     int64_t chunk_stop_target = -1;
                     int32_t batch_fill_limit = n_batch;
@@ -4044,9 +4045,7 @@ private:
                     // Create at most three checkpoints, always at a natural batch boundary:
                     // - the batch containing the first assistant-message start;
                     // - the batch containing the last assistant-message end;
-                    // - the final prompt batch.
-                    // The last-assistant target may equal the prompt end; in that case it
-                    // shares the final batch checkpoint instead of creating another one.
+                    // - the batch containing the fifth assistant-message start from the end.
                     const bool is_first_assistant_checkpoint =
                         first_assistant_pos >= n_tokens_start &&
                         first_assistant_pos <  n_tokens_end;
@@ -4054,11 +4053,14 @@ private:
                         last_assistant_end >= n_tokens_start &&
                         (last_assistant_end < n_tokens_end ||
                          (is_last_prompt_batch && last_assistant_end == n_tokens_end));
+                    const bool is_fifth_last_assistant_checkpoint =
+                        fifth_last_assistant_pos >= n_tokens_start &&
+                        fifth_last_assistant_pos <  n_tokens_end;
 
                     do_checkpoint = do_checkpoint && (
                         is_first_assistant_checkpoint ||
                         is_last_assistant_checkpoint ||
-                        is_last_prompt_batch);
+                        is_fifth_last_assistant_checkpoint);
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
                     if (do_checkpoint && pos_min < 0) {
@@ -4083,10 +4085,10 @@ private:
                                     "creating last-assistant-end context checkpoint at n_tokens = %d (target = %d)\n",
                                     n_tokens_start, last_assistant_end);
                         }
-                        if (is_last_prompt_batch && !is_last_assistant_checkpoint) {
+                        if (is_fifth_last_assistant_checkpoint) {
                             SLT_INF(slot,
-                                    "creating final-batch context checkpoint at n_tokens = %d\n",
-                                    n_tokens_start);
+                                    "creating fifth-last-assistant context checkpoint at n_tokens = %d (target = %d)\n",
+                                    n_tokens_start, fifth_last_assistant_pos);
                         }
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
                     }

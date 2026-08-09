@@ -1692,8 +1692,8 @@ static void test_msg_token_delimiters_split() {
         assert_equals<int32_t>(9, result.last_assistant_message_end());
     }
 
-    // Checkpoint scheduling needs the first assistant start and the end of the
-    // last assistant span, not the latest user-message start.
+    // Checkpoint scheduling needs the first assistant start, the end of the last
+    // assistant span, and the fifth assistant span from the end.
     {
         common_chat_msg_spans spans;
         spans.add(COMMON_CHAT_ROLE_USER,      0, 4);
@@ -1704,6 +1704,22 @@ static void test_msg_token_delimiters_split() {
 
         assert_equals<int32_t>(4,  spans.first_assistant_message_pos());
         assert_equals<int32_t>(19, spans.last_assistant_message_end());
+        assert_equals<int32_t>(-1, spans.nth_last_assistant_message_pos(5));
+    }
+
+    {
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT,  0, 4);
+        spans.add(COMMON_CHAT_ROLE_USER,       4, 3);
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT,  7, 5);
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT, 12, 6);
+        spans.add(COMMON_CHAT_ROLE_SYSTEM,    18, 2);
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT, 20, 7);
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT, 27, 8);
+
+        assert_equals<int32_t>(0,  spans.nth_last_assistant_message_pos(5));
+        assert_equals<int32_t>(7,  spans.nth_last_assistant_message_pos(4));
+        assert_equals<int32_t>(27, spans.nth_last_assistant_message_pos(1));
     }
 
     // Content before the first delimiter is not captured as a span

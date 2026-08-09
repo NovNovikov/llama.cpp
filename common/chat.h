@@ -206,6 +206,18 @@ struct common_chat_msg_spans {
         }
         return -1;
     }
+
+    int32_t nth_last_assistant_message_pos(size_t n) const {
+        if (n == 0) {
+            return -1;
+        }
+        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_ASSISTANT && --n == 0) {
+                return (int32_t) it->pos;
+            }
+        }
+        return -1;
+    }
 };
 
 struct common_chat_msg_delimiter {
