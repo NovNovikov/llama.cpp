@@ -48,27 +48,6 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
-constexpr int CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT = 8192;
-constexpr int CHECKPOINT_PERIODIC_STEP_TAIL = 4096;
-constexpr int CHECKPOINT_PERIODIC_TAIL_TOKENS = 20000;
-
-static int64_t server_checkpoint_periodic_tail_start(const int32_t n_tokens_total) {
-    return std::max<int64_t>(0, n_tokens_total - CHECKPOINT_PERIODIC_TAIL_TOKENS);
-}
-
-static int32_t server_checkpoint_periodic_step(const int32_t n_tokens_total, const int64_t n_tokens, const int32_t step) {
-    return n_tokens >= server_checkpoint_periodic_tail_start(n_tokens_total)
-        ? CHECKPOINT_PERIODIC_STEP_TAIL
-        : std::max(step, CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT);
-}
-
-static int64_t server_checkpoint_periodic_next(const int32_t n_tokens_total, const int64_t n_tokens, const int32_t step) {
-    const int64_t tail_start = server_checkpoint_periodic_tail_start(n_tokens_total);
-    const int64_t next = n_tokens + server_checkpoint_periodic_step(n_tokens_total, n_tokens, step);
-
-    // Always schedule the first tail checkpoint before continuing at 4096-token intervals.
-    return n_tokens < tail_start ? std::min(next, tail_start) : next;
-}
 
 static int32_t server_prompt_tail_batch_limit(int32_t remaining_tokens, int32_t n_batch) {
     if (n_batch <= 0 || remaining_tokens <= n_batch) {
@@ -243,11 +222,6 @@ struct server_slot {
 
     int32_t n_prompt_tokens_cache     = 0;
     int32_t n_prompt_tokens_processed = 0;
-    int64_t checkpoint_quarter_nt = -1;
-    int64_t checkpoint_midpoint_nt = -1;
-    int64_t next_periodic_checkpoint_nt = -1;
-    bool checkpoint_quarter_done = false;
-    bool checkpoint_midpoint_done = false;
 
     size_t last_nl_pos = 0;
 
@@ -347,11 +321,6 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
-        checkpoint_quarter_nt = -1;
-        checkpoint_midpoint_nt = -1;
-        next_periodic_checkpoint_nt = -1;
-        checkpoint_quarter_done = false;
-        checkpoint_midpoint_done = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -386,27 +355,6 @@ struct server_slot {
 
         // clear multimodal state
         mbatch.reset();
-    }
-
-    void init_checkpoint_schedule(const int32_t n_tokens_total, const int32_t n_past, const int32_t step) {
-        checkpoint_quarter_nt = n_tokens_total / 4;
-        checkpoint_midpoint_nt = n_tokens_total / 2;
-        checkpoint_quarter_done = checkpoint_quarter_nt <= 0 || n_past >= checkpoint_quarter_nt;
-        checkpoint_midpoint_done = checkpoint_midpoint_nt <= 0 || n_past >= checkpoint_midpoint_nt;
-
-        next_periodic_checkpoint_nt = -1;
-        if (step > 0) {
-            int64_t next = checkpoint_midpoint_nt;
-            while (next <= n_past) {
-                next = server_checkpoint_periodic_next(n_tokens_total, next, step);
-            }
-            if (next == checkpoint_midpoint_nt) {
-                next = server_checkpoint_periodic_next(n_tokens_total, next, step);
-            }
-            if (next < n_tokens_total) {
-                next_periodic_checkpoint_nt = next;
-            }
-        }
     }
 
     void init_sampler() const {
@@ -939,31 +887,6 @@ static void debug_log_generated_output_jsonl(
     debug_append_jsonl_record(params.log_generated_output, "--log-generated-output", rec);
 }
 
-static int64_t server_checkpoint_abs_distance(const int64_t a, const int64_t b) {
-    return a > b ? a - b : b - a;
-}
-
-static const common_prompt_checkpoint * server_find_nearest_checkpoint(
-        const std::list<common_prompt_checkpoint> & checkpoints,
-        const int64_t target_nt) {
-    if (target_nt <= 0 || checkpoints.empty()) {
-        return nullptr;
-    }
-
-    const common_prompt_checkpoint * best = nullptr;
-    int64_t best_dist = std::numeric_limits<int64_t>::max();
-
-    for (const auto & ckpt : checkpoints) {
-        const int64_t dist = server_checkpoint_abs_distance(ckpt.n_tokens, target_nt);
-        if (best == nullptr || dist < best_dist) {
-            best = &ckpt;
-            best_dist = dist;
-        }
-    }
-
-    return best;
-}
-
 static std::string server_checkpoint_roles(
         const server_slot & slot,
         const std::list<common_prompt_checkpoint> & checkpoints,
@@ -979,16 +902,6 @@ static std::string server_checkpoint_roles(
         roles.emplace_back("newest");
     } else if (checkpoints.size() >= 2 && it == std::prev(it_last)) {
         roles.emplace_back("tail");
-    }
-
-    const auto * quarter_ckpt  = server_find_nearest_checkpoint(checkpoints, slot.checkpoint_quarter_nt);
-    const auto * midpoint_ckpt = server_find_nearest_checkpoint(checkpoints, slot.checkpoint_midpoint_nt);
-
-    if (quarter_ckpt != nullptr && quarter_ckpt == &*it) {
-        roles.emplace_back("quarter");
-    }
-    if (midpoint_ckpt != nullptr && midpoint_ckpt == &*it) {
-        roles.emplace_back("midpoint");
     }
 
     if (roles.empty()) {
@@ -1012,9 +925,6 @@ static std::list<common_prompt_checkpoint>::iterator server_select_checkpoint_to
     GGML_ASSERT(!checkpoints.empty());
 
     const int64_t prompt_total_nt = slot.task ? slot.task->n_tokens() : slot.prompt.n_tokens();
-    const auto * quarter_ckpt  = server_find_nearest_checkpoint(checkpoints, slot.checkpoint_quarter_nt);
-    const auto * midpoint_ckpt = server_find_nearest_checkpoint(checkpoints, slot.checkpoint_midpoint_nt);
-
     const auto it_last = std::prev(checkpoints.end());
     const auto it_tail = checkpoints.size() >= 2 ? std::prev(it_last) : checkpoints.end();
 
@@ -1043,13 +953,6 @@ static std::list<common_prompt_checkpoint>::iterator server_select_checkpoint_to
         if (it_tail != checkpoints.end() && it == it_tail) {
             keep_score += 400000000000ULL;
         }
-        if (quarter_ckpt != nullptr && quarter_ckpt == &*it) {
-            keep_score += 500000000000ULL;
-        }
-        if (midpoint_ckpt != nullptr && midpoint_ckpt == &*it) {
-            keep_score += 600000000000ULL;
-        }
-
         keep_score += (uint64_t) std::min<int64_t>(left_gap, right_gap) * 1024ULL;
         keep_score += (uint64_t) std::min<int64_t>(span_if_removed, 1 << 20);
 
@@ -1864,14 +1767,6 @@ private:
         if (params_base.n_ctx_checkpoints > 0) {
             SRV_TRC("context checkpoints enabled, max = %d, min spacing = %d\n",
                     params_base.n_ctx_checkpoints, params_base.checkpoint_min_step);
-            if (params_base.checkpoint_every_n_tokens > 0) {
-                SRV_INF("periodic context checkpointing enabled: every %d prompt tokens after 50%%, every %d in the final %d tokens\n",
-                        std::max(params_base.checkpoint_every_n_tokens, CHECKPOINT_PERIODIC_STEP_AFTER_MIDPOINT),
-                        CHECKPOINT_PERIODIC_STEP_TAIL,
-                        CHECKPOINT_PERIODIC_TAIL_TOKENS);
-            } else {
-                SRV_INF("%s", "periodic context checkpointing disabled (use `-cpent N`)\n");
-            }
         } else {
             SRV_TRC("%s", "context checkpoints disabled\n");
         }
@@ -3970,10 +3865,6 @@ private:
 
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
-                        slot.init_checkpoint_schedule(
-                            slot.task->n_tokens(),
-                            n_past,
-                            params_base.checkpoint_every_n_tokens);
 
                         slot.prompt.tokens.keep_first(n_past);
 
@@ -4069,9 +3960,9 @@ private:
                         has_mtmd = true;
                     }
 
-                    const bool periodic_checkpointing_enabled = params_base.checkpoint_every_n_tokens > 0;
                     const auto & spans = slot.task->params.message_spans;
-                    const auto last_user_pos = spans.last_user_message_pos();
+                    const auto first_assistant_pos = spans.first_assistant_message_pos();
+                    const auto last_assistant_end  = spans.last_assistant_message_end();
                     const char * chunk_stop_reason = "prompt_exhausted";
                     int64_t chunk_stop_target = -1;
                     int32_t batch_fill_limit = n_batch;
@@ -4130,9 +4021,10 @@ private:
                     }
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
-                    const bool is_last_user_message = n_tokens_start == last_user_pos;
+                    const auto n_tokens_end   = slot.prompt.n_tokens();
+                    const bool is_last_prompt_batch = n_tokens_end == slot.task->n_tokens();
                     // entire prompt has been processed
-                    if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
+                    if (is_last_prompt_batch) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
 
                         GGML_ASSERT(batch.size() > 0);
@@ -4149,42 +4041,24 @@ private:
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
-                    // Checkpoints are created only at natural batch boundaries. Since they
-                    // are created before the current batch is decoded, their token position
-                    // is the batch start rather than the prompt end.
-                    bool is_quarter_checkpoint = false;
-                    bool is_midpoint_checkpoint = false;
-                    bool is_periodic_checkpoint = false;
-                    bool is_user_boundary_checkpoint = false;
+                    // Create at most three checkpoints, always at a natural batch boundary:
+                    // - the batch containing the first assistant-message start;
+                    // - the batch containing the last assistant-message end;
+                    // - the final prompt batch.
+                    // The last-assistant target may equal the prompt end; in that case it
+                    // shares the final batch checkpoint instead of creating another one.
+                    const bool is_first_assistant_checkpoint =
+                        first_assistant_pos >= n_tokens_start &&
+                        first_assistant_pos <  n_tokens_end;
+                    const bool is_last_assistant_checkpoint =
+                        last_assistant_end >= n_tokens_start &&
+                        (last_assistant_end < n_tokens_end ||
+                         (is_last_prompt_batch && last_assistant_end == n_tokens_end));
 
-                    if (do_checkpoint) {
-                        is_quarter_checkpoint =
-                            !slot.checkpoint_quarter_done &&
-                            slot.checkpoint_quarter_nt > 0 &&
-                            n_tokens_start >= slot.checkpoint_quarter_nt;
-
-                        is_midpoint_checkpoint =
-                            !slot.checkpoint_midpoint_done &&
-                            slot.checkpoint_midpoint_nt > 0 &&
-                            n_tokens_start >= slot.checkpoint_midpoint_nt;
-
-                        // Keep latest-user checkpoints only as optional extras when the
-                        // boundary already matches a natural batch start.
-                        is_user_boundary_checkpoint =
-                            is_last_user_message &&
-                            n_tokens_start == last_user_pos;
-
-                        is_periodic_checkpoint =
-                            periodic_checkpointing_enabled &&
-                            slot.next_periodic_checkpoint_nt > 0 &&
-                            n_tokens_start >= slot.next_periodic_checkpoint_nt;
-
-                        // Keep latest-user checkpoints as optional extras, but make broad
-                        // prompt coverage the primary scheduling strategy.
-                        if (!(is_quarter_checkpoint || is_midpoint_checkpoint || is_periodic_checkpoint || is_user_boundary_checkpoint)) {
-                            do_checkpoint = false;
-                        }
-                    }
+                    do_checkpoint = do_checkpoint && (
+                        is_first_assistant_checkpoint ||
+                        is_last_assistant_checkpoint ||
+                        is_last_prompt_batch);
                     // nothing to checkpoint yet
                     // TODO: is this check needed?
                     if (do_checkpoint && pos_min < 0) {
@@ -4194,55 +4068,27 @@ private:
                     // do not checkpoint after mtmd chunks
                     do_checkpoint = do_checkpoint && !has_mtmd;
 
-                    bool skipped_by_min_step = false;
-                    if (do_checkpoint && !slot.prompt.checkpoints.empty()) {
-                        const int64_t last_n_tokens = slot.prompt.checkpoints.back().n_tokens;
-                        if (n_tokens_start <= last_n_tokens + params_base.checkpoint_min_step) {
-                            do_checkpoint = false;
-                            skipped_by_min_step = true;
-                        }
-                    }
-
-                    if (skipped_by_min_step) {
-                        const int64_t last_n_tokens = slot.prompt.checkpoints.back().n_tokens;
-                        SLT_INF(slot,
-                                "skipped context checkpoint at n_tokens = %d due to --checkpoint-min-step=%d (last checkpoint n_tokens = %" PRId64 ")\n",
-                                n_tokens_start, params_base.checkpoint_min_step, last_n_tokens);
-                    }
                     SLT_DBG(slot, "main/do_checkpoint = %s, pos_min = %d, pos_max = %d\n", do_checkpoint ? "yes" : "no", pos_min, pos_max);
 
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
-                        if (is_quarter_checkpoint) {
+                        if (is_first_assistant_checkpoint) {
                             SLT_INF(slot,
-                                    "creating quarter context checkpoint at n_tokens = %d (target = %" PRId64 ")\n",
-                                    n_tokens_start, slot.checkpoint_quarter_nt);
+                                    "creating first-assistant context checkpoint at n_tokens = %d (target = %d)\n",
+                                    n_tokens_start, first_assistant_pos);
                         }
-                        if (is_midpoint_checkpoint) {
+                        if (is_last_assistant_checkpoint) {
                             SLT_INF(slot,
-                                    "creating midpoint context checkpoint at n_tokens = %d (target = %" PRId64 ")\n",
-                                    n_tokens_start, slot.checkpoint_midpoint_nt);
+                                    "creating last-assistant-end context checkpoint at n_tokens = %d (target = %d)\n",
+                                    n_tokens_start, last_assistant_end);
                         }
-                        if (is_periodic_checkpoint) {
+                        if (is_last_prompt_batch && !is_last_assistant_checkpoint) {
                             SLT_INF(slot,
-                                    "creating periodic context checkpoint at n_tokens = %d (interval = %d)\n",
-                                    n_tokens_start, server_checkpoint_periodic_step(slot.task->n_tokens(), n_tokens_start, params_base.checkpoint_every_n_tokens));
+                                    "creating final-batch context checkpoint at n_tokens = %d\n",
+                                    n_tokens_start);
                         }
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
-                        if (is_quarter_checkpoint) {
-                            slot.checkpoint_quarter_done = true;
-                        }
-                        if (is_midpoint_checkpoint) {
-                            slot.checkpoint_midpoint_done = true;
-                        }
-                    }
-
-                    if (periodic_checkpointing_enabled && slot.next_periodic_checkpoint_nt > 0) {
-                        while (slot.next_periodic_checkpoint_nt <= n_tokens_start) {
-                            slot.next_periodic_checkpoint_nt = server_checkpoint_periodic_next(
-                                slot.task->n_tokens(), slot.next_periodic_checkpoint_nt, params_base.checkpoint_every_n_tokens);
-                        }
                     }
 
                 }

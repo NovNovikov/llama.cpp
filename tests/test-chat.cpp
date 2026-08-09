@@ -1687,6 +1687,23 @@ static void test_msg_token_delimiters_split() {
         assert_equals(true,  result.is_user_start(0));
         assert_equals(false, result.is_user_start(4));  // assistant span
         assert_equals(true,  result.is_user_start(9));
+
+        assert_equals<int32_t>(4, result.first_assistant_message_pos());
+        assert_equals<int32_t>(9, result.last_assistant_message_end());
+    }
+
+    // Checkpoint scheduling needs the first assistant start and the end of the
+    // last assistant span, not the latest user-message start.
+    {
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_USER,      0, 4);
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT, 4, 7);
+        spans.add(COMMON_CHAT_ROLE_SYSTEM,   11, 3);
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT, 14, 5);
+        spans.add(COMMON_CHAT_ROLE_USER,     19, 4);
+
+        assert_equals<int32_t>(4,  spans.first_assistant_message_pos());
+        assert_equals<int32_t>(19, spans.last_assistant_message_end());
     }
 
     // Content before the first delimiter is not captured as a span

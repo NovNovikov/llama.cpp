@@ -188,6 +188,24 @@ struct common_chat_msg_spans {
         }
         return -1;
     }
+
+    int32_t first_assistant_message_pos() const {
+        for (const auto & span : spans) {
+            if (span.role == COMMON_CHAT_ROLE_ASSISTANT) {
+                return (int32_t) span.pos;
+            }
+        }
+        return -1;
+    }
+
+    int32_t last_assistant_message_end() const {
+        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_ASSISTANT) {
+                return (int32_t) (it->pos + it->len);
+            }
+        }
+        return -1;
+    }
 };
 
 struct common_chat_msg_delimiter {
