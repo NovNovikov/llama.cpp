@@ -2145,6 +2145,13 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
         THINK_START,
         THINK_END,
     };
+    // Keep role boundaries available to raw /completion requests as well.
+    // The server tokenizes the already-rendered prompt and uses these markers
+    // to place DSV4 context checkpoints without splitting decode batches.
+    data.message_delimiters = {
+        { COMMON_CHAT_ROLE_ASSISTANT, GEN_PROMPT       },
+        { COMMON_CHAT_ROLE_USER,      "<｜User｜>" },
+    };
 
     if (inputs.has_continuation()) {
         const auto & msg = inputs.continue_msg;

@@ -6861,6 +6861,35 @@ static void test_deepseek_v4_tool_result_ordering() {
     }
 }
 
+static void test_deepseek_v4_message_delimiters() {
+    LOG_DBG("%s\n", __func__);
+
+    for (const auto & tmpl : {
+            "models/templates/deepseek-ai-DeepSeek-V3.2.jinja",
+            "models/templates/deepseek-ai-DeepSeek-V4.jinja",
+            "models/templates/deepseek-ai-DeepSeek-V4-Flash-0731.jinja",
+        }) {
+        auto tmpls = read_templates(tmpl);
+
+        common_chat_templates_inputs inputs;
+        inputs.messages = {
+            { "user",      "Question" },
+            { "assistant", "Answer"   },
+            { "developer", "Follow-up instruction" },
+            { "user",      "Follow-up" },
+        };
+
+        const auto params = common_chat_templates_apply(tmpls.get(), inputs);
+        const auto & delimiters = params.message_delimiters.delimiters;
+
+        assert_equals<size_t>(2, delimiters.size());
+        assert_equals(COMMON_CHAT_ROLE_ASSISTANT, delimiters[0].role);
+        assert_equals<std::string>("<｜Assistant｜>", delimiters[0].delimiter);
+        assert_equals(COMMON_CHAT_ROLE_USER, delimiters[1].role);
+        assert_equals<std::string>("<｜User｜>", delimiters[1].delimiter);
+    }
+}
+
 static void test_reasoning_budget_tokens_per_request() {
     LOG_DBG("%s\n", __func__);
     // Use Qwen3 template which has <think>...</think> reasoning markers.
@@ -7084,6 +7113,7 @@ int main(int argc, char ** argv) {
         test_developer_role_to_system_workaround();
         test_deepseek_v4_thinking_retention();
         test_deepseek_v4_tool_result_ordering();
+        test_deepseek_v4_message_delimiters();
         test_template_generation_prompt();
         test_reasoning_budget_tokens_per_request();
         test_reasoning_budget_message_per_request();
