@@ -4614,8 +4614,29 @@ std::unique_ptr<server_res_generator> server_routes::handle_completions_impl(
 
         // tasks.reserve(inputs.size()); // TODO: this is inaccurate due to child tasks
 
-        // message delimiters for checkpointing
+        // Message delimiters for checkpointing. Chat endpoints provide these after
+        // rendering their request. Native /completion clients often submit an
+        // already-rendered prompt, so recover the equivalent delimiters from the
+        // loaded template when the request did not provide any.
         auto delimiters = common_chat_msg_delimiters_parse(json_value(data, "message_delimiters", json::array()));
+        if (delimiters.delimiters.empty() && meta->chat_params.tmpls) {
+            try {
+                common_chat_templates_inputs inputs;
+                inputs.messages = {
+                    { "user",      "" },
+                    { "assistant", "" },
+                };
+                inputs.use_jinja           = meta->chat_params.use_jinja;
+                inputs.reasoning_format    = meta->chat_params.reasoning_format;
+                inputs.enable_thinking     = meta->chat_params.enable_thinking;
+                inputs.chat_template_kwargs = meta->chat_params.chat_template_kwargs;
+                inputs.force_pure_content  = meta->chat_params.force_pure_content;
+
+                delimiters = common_chat_templates_apply(meta->chat_params.tmpls.get(), inputs).message_delimiters;
+            } catch (const std::exception & e) {
+                SRV_WRN("failed to derive checkpoint message delimiters from chat template: %s\n", e.what());
+            }
+        }
         delimiters.tokenize(ctx_server.vocab);
 
         for (size_t i = 0; i < inputs.size(); i++) {
