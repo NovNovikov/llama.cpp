@@ -3166,6 +3166,7 @@ static common_chat_params common_chat_params_init_solar_open2(const common_chat_
                         arg_choice |= p.tool_arg(
                             p.tool_arg_open(p.literal("<|tool_arg:start|>") +
                                             p.tool_arg_name(p.literal(prop_name)) +
+                                            p.literal("<|tool_arg:value|>")) + value_parser);
                     }
                     args = p.zero_or_more(arg_choice + p.space());
                 }
@@ -3199,6 +3200,7 @@ static common_chat_params common_chat_params_init_solar_open2(const common_chat_
             }
             parser.build_grammar(builder, data.grammar_lazy);
         });
+        data.grammar_triggers = {{ COMMON_GRAMMAR_TRIGGER_TYPE_WORD, "<|tool_call:start|>" }};
     }
 
     return data;
