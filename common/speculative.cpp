@@ -1829,13 +1829,6 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         std::memcpy(pending_h[seq_id].data(), ptr, (size_t) n_embd * sizeof(float));
     }
 
-    bool need_embd() const override {
-        return false;
-    }
-
-    bool need_embd_nextn() const override {
-        return true;
-    }
 };
 
 // state of self-speculation (simple implementation, not ngram-map)
