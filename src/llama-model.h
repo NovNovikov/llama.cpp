@@ -624,8 +624,9 @@ struct llama_model {
     struct ggml_tensor * per_layer_model_proj = nullptr;
     struct ggml_tensor * per_layer_proj_norm  = nullptr;
 
-    // eagle3
-    struct ggml_tensor * fc  = nullptr;  // feature fusion layer
+    // eagle3 / dflash feature fusion layer
+    struct ggml_tensor * fc   = nullptr;
+    struct ggml_tensor * fc_s = nullptr;
     // dspark heads (loaded by llama_model_dspark; consumed in the speculative loop)
     struct ggml_tensor * dspark_markov_w1 = nullptr; // [markov_rank, n_vocab]
     struct ggml_tensor * dspark_markov_w2 = nullptr; // [markov_rank, n_vocab]
