@@ -4298,6 +4298,10 @@ private:
                 slot.t_print_last = t_now;
                 slot.n_decoded_last = 0;
                 slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                // The last prompt batch transitions to DONE_PROMPT before decode,
+                // so it cannot emit the periodic prefill report while batching.
+                // Report it now, after that batch has actually completed.
+                slot.print_timings_pp();
                 metrics.on_prompt_eval(slot);
             }
 
