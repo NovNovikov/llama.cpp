@@ -208,6 +208,9 @@ public:
 
     std::vector<char> serialize() const;
     static server_tokens deserialize(const llama_tokens & packed, bool has_mtmd);
+    // per-request media signal (has_mtmd is server-wide and wrong here): true if this
+    // prompt contains ANY media chunk (image/audio); a text-only prompt has an empty media map.
+    bool has_media() const { return !map_idx_to_media.empty(); }
 
     // for compatibility with speculative decoding
     void set_token(llama_pos pos, llama_token id);
