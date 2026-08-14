@@ -1590,6 +1590,46 @@ void llama_kv_cache_dsv4::state_write(llama_io_write_i & io, llama_seq_id seq_id
     lid_state->state_write(io, seq_id, flags, rs_idx);
 }
 
+void llama_kv_cache_dsv4::state_write_range(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1,
+        llama_state_seq_flags flags) const {
+    const bool partial_only = flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
+
+    const uint32_t magic   = DSV4_STATE_MAGIC;
+    const uint32_t version = DSV4_STATE_VERSION;
+    const uint32_t mode    = partial_only ? DSV4_STATE_MODE_PARTIAL : DSV4_STATE_MODE_FULL;
+
+    io.write(&magic,   sizeof(magic));
+    io.write(&version, sizeof(version));
+    io.write(&mode,    sizeof(mode));
+
+    // Only raw attention KV is append-only. The compressed block caches and
+    // compressor states are bounded summaries of the entire prefix, so the tip
+    // node must carry their complete current state and state_read() replaces it.
+    const llama_state_seq_flags raw_flags = flags & ~((llama_state_seq_flags) LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+    kv_raw->state_write_range(io, seq_id, p0, p1, raw_flags);
+
+    const llama_pos pos_max = seq_id >= 0 ? kv_raw->seq_pos_max(seq_id) : -1;
+
+    const uint32_t n_rows_csa = seq_id >= 0 ?
+        dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_csa->get_size()) : kv_csa->get_size();
+    const uint32_t n_rows_hca = seq_id >= 0 ?
+        dsv4_state_n_used_k_rows(pos_max, DSV4_HCA_RATIO, kv_hca->get_size()) : kv_hca->get_size();
+    const uint32_t n_rows_lid = seq_id >= 0 ?
+        dsv4_state_n_used_k_rows(pos_max, DSV4_CSA_RATIO, kv_lid->get_size()) : kv_lid->get_size();
+
+    dsv4_state_write_k_cache(io, kv_csa.get(), seq_id, flags, n_rows_csa);
+    dsv4_state_write_k_cache(io, kv_hca.get(), seq_id, flags, n_rows_hca);
+    dsv4_state_write_k_cache(io, kv_lid.get(), seq_id, flags, n_rows_lid);
+
+    csa_state->state_write(io, seq_id, flags, rs_idx);
+    hca_state->state_write(io, seq_id, flags, rs_idx);
+    lid_state->state_write(io, seq_id, flags, rs_idx);
+}
+
 void llama_kv_cache_dsv4::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     uint32_t magic;
     uint32_t version;

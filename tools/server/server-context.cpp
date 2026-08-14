@@ -786,6 +786,11 @@ static constexpr uint32_t SLOT_META_VERSION_MEDIA = 2u;
 static constexpr uint32_t SLOT_META_VERSION_NODE = 3u;
 // v4 combines the v2 media tail with the v3 delta-node tail, in that order.
 static constexpr uint32_t SLOT_META_VERSION_MEDIA_NODE = 4u;
+// v5/v6 identify range snapshots written after DSV4 gained a real range-state
+// serializer. Older v3/v4 DSV4 deltas can contain a second complete raw KV and
+// must remain permanently ineligible for automatic restore.
+static constexpr uint32_t SLOT_META_VERSION_SAFE_NODE = 5u;
+static constexpr uint32_t SLOT_META_VERSION_SAFE_MEDIA_NODE = 6u;
 static constexpr uint32_t SLOT_META_MEDIA_MAX = 4096u;
 static constexpr uint32_t SLOT_META_ID_MAX    = 256u;
 
@@ -1147,7 +1152,7 @@ static bool slot_meta_write(const std::string & state_filepath,
         put_u32((uint32_t)(v >> 32));
     };
     put_u32(SLOT_META_MAGIC);
-    put_u32(is_node ? (media.empty() ? SLOT_META_VERSION_NODE : SLOT_META_VERSION_MEDIA_NODE)
+    put_u32(is_node ? (media.empty() ? SLOT_META_VERSION_SAFE_NODE : SLOT_META_VERSION_SAFE_MEDIA_NODE)
                     : (media.empty() ? SLOT_META_VERSION      : SLOT_META_VERSION_MEDIA));
     put_u64(fp.fp_model);
     put_u32(fp.fp_n_vocab);
@@ -1226,7 +1231,8 @@ static bool slot_meta_read(const std::string & state_filepath,
                            uint64_t * parent_out   = nullptr,  // delta-node fields (v3); for a v1
                            uint32_t * range_lo_out = nullptr,  // whole snapshot they default to a
                            uint32_t * range_hi_out = nullptr,  // root covering [0, tok_count)
-                           std::vector<server_media_record> * media_out = nullptr) {
+                           std::vector<server_media_record> * media_out = nullptr,
+                           uint32_t * version_out = nullptr) {
     fp_out = model_fp{};
     toks_out.clear();
     if (media_out) {
@@ -1260,7 +1266,8 @@ static bool slot_meta_read(const std::string & state_filepath,
     }
     if (magic != SLOT_META_MAGIC ||
         (version != SLOT_META_VERSION && version != SLOT_META_VERSION_MEDIA &&
-         version != SLOT_META_VERSION_NODE && version != SLOT_META_VERSION_MEDIA_NODE)) {
+         version != SLOT_META_VERSION_NODE && version != SLOT_META_VERSION_MEDIA_NODE &&
+         version != SLOT_META_VERSION_SAFE_NODE && version != SLOT_META_VERSION_SAFE_MEDIA_NODE)) {
         return false;
     }
     model_fp fp;
@@ -1292,7 +1299,8 @@ static bool slot_meta_read(const std::string & state_filepath,
     }
     // v1/v3 are text-only layouts. Reject NULL cells rather than letting a damaged or relabelled
     // media sidecar bypass its projector and media-identity checks.
-    if (version == SLOT_META_VERSION || version == SLOT_META_VERSION_NODE) {
+    if (version == SLOT_META_VERSION || version == SLOT_META_VERSION_NODE ||
+        version == SLOT_META_VERSION_SAFE_NODE) {
         for (const llama_token tok : toks_out) {
             if (tok == LLAMA_TOKEN_NULL) {
                 toks_out.clear();
@@ -1301,7 +1309,8 @@ static bool slot_meta_read(const std::string & state_filepath,
         }
     }
     std::vector<server_media_record> media;
-    if (version == SLOT_META_VERSION_MEDIA || version == SLOT_META_VERSION_MEDIA_NODE) {
+    if (version == SLOT_META_VERSION_MEDIA || version == SLOT_META_VERSION_MEDIA_NODE ||
+        version == SLOT_META_VERSION_SAFE_MEDIA_NODE) {
         uint32_t n_media = 0;
         if (!get_u64(fp.fp_mmproj) || !get_u32(n_media) || n_media == 0 || n_media > SLOT_META_MEDIA_MAX) {
             toks_out.clear();
@@ -1350,7 +1359,8 @@ static bool slot_meta_read(const std::string & state_filepath,
     uint64_t parent_id = 0;
     uint32_t range_lo  = 0;
     uint32_t range_hi  = tok_count;
-    if (version == SLOT_META_VERSION_NODE || version == SLOT_META_VERSION_MEDIA_NODE) {
+    if (version == SLOT_META_VERSION_NODE || version == SLOT_META_VERSION_MEDIA_NODE ||
+        version == SLOT_META_VERSION_SAFE_NODE || version == SLOT_META_VERSION_SAFE_MEDIA_NODE) {
         if (!get_u64(parent_id) || !get_u32(range_lo) || !get_u32(range_hi)) {
             toks_out.clear();
             return false;
@@ -1364,6 +1374,7 @@ static bool slot_meta_read(const std::string & state_filepath,
     if (range_lo_out) { *range_lo_out = range_lo; }
     if (range_hi_out) { *range_hi_out = range_hi; }
     if (media_out)    { *media_out    = std::move(media); }
+    if (version_out)  { *version_out  = version; }
     fp_out = fp;
     return true;
 }
@@ -2471,15 +2482,33 @@ private:
     // Auto-snapshot filename: model-fp prefix lets the startup scan reject foreign-model files by
     // name before opening anything; chain-hash + token-count make it deterministic across processes
     // (a same-prefix save from another process yields the same name -> atomic-rename-idempotent).
-    // Standalone snapshots use a distinct suffix so they can replace legacy delta snapshots at the
-    // same logical prefix without renaming over a file that may still be open on Windows.
-    std::string auto_state_filename(uint64_t chain_hash, size_t n_tokens, bool standalone = false) const {
+    // Whole and range snapshots have separate names. Besides making their role explicit, this keeps
+    // new, safe range states away from the pre-v5 delta files that saved a full DSV4 raw KV.
+    std::string auto_state_filename(uint64_t chain_hash, size_t n_tokens) const {
         char buf[112]; // "auto-" + 16 hex fp + "-" + 16 hex hash + "-" + count + "-whole.bin" < 112
-        snprintf(buf, sizeof(buf), standalone
-                 ? "auto-%016" PRIx64 "-%016" PRIx64 "-%zu-whole.bin"
-                 : "auto-%016" PRIx64 "-%016" PRIx64 "-%zu.bin",
+        snprintf(buf, sizeof(buf), "auto-%016" PRIx64 "-%016" PRIx64 "-%zu-whole.bin",
                  cur_fp.fp_model, chain_hash, n_tokens);
         return params_base.slot_save_path + std::string(buf);
+    }
+
+    std::string auto_delta_state_filename(uint64_t chain_hash, size_t n_tokens) const {
+        char buf[116]; // same as whole, with the distinct "-delta-v2.bin" suffix
+        snprintf(buf, sizeof(buf), "auto-%016" PRIx64 "-%016" PRIx64 "-%zu-delta-v2.bin",
+                 cur_fp.fp_model, chain_hash, n_tokens);
+        return params_base.slot_save_path + std::string(buf);
+    }
+
+    std::string auto_parent_state_filename(uint64_t chain_hash, size_t n_tokens) const {
+        const std::string delta = auto_delta_state_filename(chain_hash, n_tokens);
+        std::error_code ec;
+        if (std::filesystem::exists(delta, ec) && !ec) {
+            return delta;
+        }
+        return auto_state_filename(chain_hash, n_tokens);
+    }
+
+    static bool slot_meta_is_safe_delta(uint32_t version) {
+        return version == SLOT_META_VERSION_SAFE_NODE || version == SLOT_META_VERSION_SAFE_MEDIA_NODE;
     }
 
     // Insert a snapshot at a boundary it reaches. Multiple snapshots are RETAINED per boundary
@@ -2560,13 +2589,14 @@ private:
             std::vector<server_media_record> media;
             uint64_t parent_id = 0;
             uint32_t range_lo = 0;
-            if (!slot_meta_read(p, fp, toks, &parent_id, &range_lo, nullptr, &media)) {
+            uint32_t meta_version = 0;
+            if (!slot_meta_read(p, fp, toks, &parent_id, &range_lo, nullptr, &media, &meta_version)) {
                 continue; // no/short/corrupt meta -> not indexable (invariant 4)
             }
             if (!(fp == cur_fp)) {
                 continue; // foreign model / requant / different ctx geometry (invariant 3)
             }
-            if (parent_id != 0 || range_lo != 0) {
+            if ((parent_id != 0 || range_lo != 0) && !slot_meta_is_safe_delta(meta_version)) {
                 continue; // legacy delta snapshots are unsafe to compose-load
             }
             const auto bhs = auto_block_hashes(toks, media, params_base.slot_save_block,
@@ -2838,8 +2868,10 @@ private:
         uint64_t disk_parent_id = 0;
         uint32_t disk_range_lo  = 0;
         uint32_t disk_range_hi  = 0;
+        uint32_t disk_meta_version = 0;
         if (!slot_meta_read(cand.state_path, disk_fp, disk_toks,
-                            &disk_parent_id, &disk_range_lo, &disk_range_hi, &disk_media)) {
+                            &disk_parent_id, &disk_range_lo, &disk_range_hi, &disk_media,
+                            &disk_meta_version)) {
             SLT_INF(slot, "auto-restore: disk candidate rejected (invalid metadata), file=%s\n",
                     cand.state_path.c_str());
             return 0; // invariant 4
@@ -2855,13 +2887,10 @@ private:
             : (disk_media.empty() ? "whole" : "media-whole");
         SLT_INF(slot, "auto-restore: disk candidate kind=%s, tokens=%zu, file=%s\n",
                 disk_kind, disk_toks.size(), cand.state_path.c_str());
-        // Loading a base followed by a range-state delta with NO_CLEAR can leave the
-        // physical KV allocator full even though the restored sequence has only the
-        // advertised number of tokens. A subsequent prefill then fails at a seemingly
-        // arbitrary position. Never restore that unsafe format: it is a cache miss, not
-        // a request failure. New automatic snapshots are written as standalone states.
-        if (disk_is_delta) {
-            SLT_WRN(slot, "auto-restore: disk delta snapshot disabled after unsafe KV allocation restore; recomputing, file=%s\n",
+        // v3/v4 deltas predate DSV4's real range serializer and can contain a second
+        // complete raw KV. They remain cache misses forever; v5/v6 is the safe format.
+        if (disk_is_delta && !slot_meta_is_safe_delta(disk_meta_version)) {
+            SLT_WRN(slot, "auto-restore: unsafe legacy disk delta snapshot skipped, file=%s\n",
                     cand.state_path.c_str());
             return 0;
         }
@@ -2959,19 +2988,24 @@ private:
                 if (chain.size() > MAX_CHAIN_DEPTH) {
                     return 0; // pathological depth -> cold prefill (invariant 4)
                 }
-                const std::string parent_path = auto_state_filename(cur_parent_id, cur_range_lo);
+                const std::string parent_path = auto_parent_state_filename(cur_parent_id, cur_range_lo);
                 model_fp     parent_fp;
                 llama_tokens parent_toks;
                 std::vector<server_media_record> parent_media;
                 uint64_t     parent_parent_id = 0;
                 uint32_t     parent_lo        = 0;
                 uint32_t     parent_hi        = 0;
+                uint32_t     parent_meta_version = 0;
                 if (!slot_meta_read(parent_path, parent_fp, parent_toks,
-                                    &parent_parent_id, &parent_lo, &parent_hi, &parent_media)) {
+                                    &parent_parent_id, &parent_lo, &parent_hi, &parent_media,
+                                    &parent_meta_version)) {
                     return 0; // parent meta missing/corrupt -> cold prefill
                 }
                 if (!(parent_fp == cur_fp)) {
                     return 0; // fingerprint drift on the parent -> cold prefill
+                }
+                if ((parent_parent_id != 0 || parent_lo != 0) && !slot_meta_is_safe_delta(parent_meta_version)) {
+                    return 0; // never compose a legacy range state
                 }
                 // contiguity: the parent must end exactly where its child begins.
                 if (parent_hi != cur_range_lo) {
@@ -3152,10 +3186,10 @@ private:
         bool     have_parent = false;
         uint64_t parent_id   = 0;
         uint32_t parent_hi   = 0;
-        // The range-state compose loader is disabled above until it can restore a
-        // chain without corrupting the allocator's free-cell accounting. Retain the
-        // implementation for that future fix, but publish only whole snapshots now.
-        const bool incremental_state_restore_safe = false;
+        // DSV4 now serializes only the raw-KV range in a delta (its bounded
+        // compressor state is deliberately carried by the tip). New nodes are v5/v6
+        // and restore only against an explicit safe-format gate above.
+        const bool incremental_state_restore_safe = true;
         if (incremental_state_restore_safe && params_base.slot_save_incremental) {
             for (const auto_cache_entry & cand : auto_index_lookup(toks, media, /*max_attempts=*/SIZE_MAX)) {
                 model_fp     disk_fp;
@@ -3199,7 +3233,7 @@ private:
                 }
                 // parent_id = the parent node's chain_hash = the last whole-block boundary hash of its
                 // token prefix. Since disk_toks == toks[0:parent_hi], this reproduces the parent's own
-                // full_hash, so auto_state_filename(parent_id, parent_hi) is exactly the parent's file
+                // full_hash, so the parent hash + token count resolves to exactly the parent's file
                 // (the deterministic link U4's restore walk resolves). The parent cleared save_floor >=
                 // block, so its prefix has at least one boundary; guard defensively regardless.
                 const llama_tokens prefix(toks.begin(), toks.begin() + parent_size);
@@ -3221,7 +3255,9 @@ private:
             }
         }
 
-        const std::string fname = auto_state_filename(full_hash, toks.size(), !have_parent);
+        const std::string fname = have_parent
+            ? auto_delta_state_filename(full_hash, toks.size())
+            : auto_state_filename(full_hash, toks.size());
         // cross-process atomicity: the temp path MUST be unique per writer. The final
         // name (fname) is deterministic (fp + chain hash + tok count), so two processes sharing one
         // --slot-save-path would otherwise both stream a multi-GB state into the SAME "<fname>.tmp"
