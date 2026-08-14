@@ -1385,6 +1385,10 @@ struct server_slot {
     // flush at most once per idle period (auto_save_slot_if_useful's dedup covers any re-attempt).
     bool auto_idle_flushed = false;
 
+    // Cold-prefill shared-context base target. The prefill loop stops exactly at
+    // this block-aligned position, saves the whole resident state, then disarms.
+    int32_t ctx_save_pos = -1;
+
     // generation props
     int32_t n_ctx       = 0;  // context size per slot
     int32_t n_keep      = 0;
@@ -1498,6 +1502,7 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         n_prompt_tokens_cache = 0;
+        ctx_save_pos = -1;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -5754,6 +5759,14 @@ private:
                 if (slot.state == SLOT_STATE_PROCESSING_PROMPT || slot.state == SLOT_STATE_STARTED) {
                     const auto & input_tokens = slot.task->tokens;
 
+                    // The preceding decode has completed, so the resident KV now represents exactly
+                    // [0, ctx_save_pos). Publish the shared base before adding any suffix tokens.
+                    if (slot.state == SLOT_STATE_PROCESSING_PROMPT &&
+                        slot.ctx_save_pos > 0 && slot.prompt.n_tokens() == slot.ctx_save_pos) {
+                        auto_save_slot_if_useful(slot);
+                        slot.ctx_save_pos = -1;
+                    }
+
                     // used to determine the number of tokens added to the batch for the current slot
                     const auto n_tokens_prev = batch.size();
 
@@ -6242,6 +6255,29 @@ private:
 
                         slot.prompt.tokens.keep_first(n_past);
 
+                        // Arm a one-shot whole-state base save at the first user-message boundary.
+                        // It is deliberately cold/text/generative only: a warm disk/RAM reuse already
+                        // has the valuable prefix, and media has separate chunk-safe cache semantics.
+                        slot.ctx_save_pos = -1;
+                        if (auto_cache_enabled() && slot.task->need_sampling() &&
+                            slot.alora_invocation_start <= 0 &&
+                            are_lora_equal(slot.lora, params_base.lora_adapters) &&
+                            !input_tokens.has_media()) {
+                            // do_slot_restore() clears the prompt bookkeeping before replacing its
+                            // token stream. Re-read the immutable task span here so a failed disk
+                            // restore cannot accidentally suppress this cold-prefill base save.
+                            const int32_t boundary = slot.task->params.message_spans.first_user_message_pos();
+                            slot.prompt.ctx_boundary = boundary;
+                            const int block = params_base.slot_save_block;
+                            if (boundary > 0 && block > 0) {
+                                const int32_t target = boundary - boundary % block;
+                                const int floor = std::max(block, params_base.slot_save_context_min_tokens);
+                                if (target >= floor && target < slot.task->n_tokens() && n_past < target) {
+                                    slot.ctx_save_pos = target;
+                                }
+                            }
+                        }
+
                         // this is to signal the client that the request has started processing
                         if (slot.task->params.stream) {
                             if (slot.task->params.return_progress) {
@@ -6376,6 +6412,10 @@ private:
                         slot.prompt.tokens.push_back(cur_tok);
 
                         slot.n_prompt_tokens_processed++;
+
+                        if (slot.ctx_save_pos > 0 && slot.prompt.n_tokens() == slot.ctx_save_pos) {
+                            break; // decode exactly through the shared base, never beyond it
+                        }
 
                         // Checkpoints are created only at natural batch boundaries. We do
                         // not split a large prefill batch just to hit a user-message or
