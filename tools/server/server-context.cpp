@@ -6291,6 +6291,29 @@ private:
                                     GGML_ABORT("pos_min == -1, but n_past > 0 - should not happen: https://github.com/ggml-org/llama.cpp/pull/13833#discussion_r2116181237");
                                 }
 
+                                // A cache mismatch must be diagnosable without exposing prompt text.
+                                // Report the rendered-message span that owns the first differing token,
+                                // plus opaque token IDs, so template-driven history rewrites can be
+                                // localized to a role and message range from an ordinary server log.
+                                if (n_past < slot.prompt.tokens.size() && n_past < slot.task->tokens.size()) {
+                                    const auto & spans = slot.task->params.message_spans.spans;
+                                    const auto span_it = std::find_if(spans.begin(), spans.end(), [n_past](const auto & span) {
+                                        return span.pos <= n_past && n_past < span.pos + span.len;
+                                    });
+                                    if (span_it != spans.end()) {
+                                        const size_t span_idx = (size_t) std::distance(spans.begin(), span_it);
+                                        SLT_WRN(slot,
+                                                "prompt cache mismatch: token=%d, old_id=%d, new_id=%d, new_span=%zu role=%s range=[%zu,%zu) offset=%zu\n",
+                                                n_past, slot.prompt.tokens[n_past], slot.task->tokens[n_past],
+                                                span_idx, common_chat_role_to_string(span_it->role),
+                                                span_it->pos, span_it->pos + span_it->len, n_past - span_it->pos);
+                                    } else {
+                                        SLT_WRN(slot,
+                                                "prompt cache mismatch: token=%d, old_id=%d, new_id=%d, new_span=unclassified\n",
+                                                n_past, slot.prompt.tokens[n_past], slot.task->tokens[n_past]);
+                                    }
+                                }
+
                                 // when the prompt prefix does not match, print the tokens around the mismatch
                                 // this is useful for debugging prompt caching
                                 if (slots_debug) {
