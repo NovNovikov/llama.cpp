@@ -10,6 +10,7 @@
 #include "build-info.h"
 #include "common.h"
 #include "fit.h"
+#include "gguf.h"
 #include "llama-cpp.h"
 #include "../../src/llama-ext.h"
 #include "llama.h"
@@ -859,6 +860,89 @@ static inline uint64_t auto_hash_mix64(uint64_t h, uint64_t value) {
 
 static inline uint64_t auto_hash_mix(uint64_t h, int32_t tok) {
     return auto_hash_mix64(h, (uint64_t) (uint32_t) tok);
+}
+
+// Fingerprint the projector's GGUF header, never its tensor payload. Media KV
+// embeddings depend on projector weights and geometry, so a projector swap must
+// invalidate a media disk snapshot even when the text model is unchanged.
+static bool mmproj_header_fingerprint(const std::string & path, uint64_t & out) {
+    out = 0;
+    gguf_init_params params = { true, nullptr };
+    gguf_context * gctx = gguf_init_from_file(path.c_str(), params);
+    if (gctx == nullptr) {
+        return false;
+    }
+
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    auto mix_bytes = [&hash](const void * ptr, size_t size) {
+        const auto * bytes = static_cast<const unsigned char *>(ptr);
+        for (size_t i = 0; i < size; ++i) {
+            hash ^= (uint64_t) bytes[i];
+            hash *= 0x100000001b3ULL;
+        }
+    };
+    auto mix_u64 = [&hash](uint64_t value) {
+        hash = auto_hash_mix64(hash, value);
+    };
+    auto mix_string = [&](const char * value) {
+        const size_t size = strlen(value);
+        mix_u64(size);
+        mix_bytes(value, size);
+    };
+    auto scalar_size = [](gguf_type type) -> size_t {
+        switch (type) {
+            case GGUF_TYPE_UINT8:  case GGUF_TYPE_INT8:  case GGUF_TYPE_BOOL:    return 1;
+            case GGUF_TYPE_UINT16: case GGUF_TYPE_INT16:                         return 2;
+            case GGUF_TYPE_UINT32: case GGUF_TYPE_INT32: case GGUF_TYPE_FLOAT32: return 4;
+            case GGUF_TYPE_UINT64: case GGUF_TYPE_INT64: case GGUF_TYPE_FLOAT64: return 8;
+            default:                                                             return 0;
+        }
+    };
+
+    const int64_t n_kv = gguf_get_n_kv(gctx);
+    mix_u64((uint64_t) n_kv);
+    for (int64_t i = 0; i < n_kv; ++i) {
+        mix_string(gguf_get_key(gctx, i));
+        const gguf_type type = gguf_get_kv_type(gctx, i);
+        mix_u64((uint64_t) type);
+        if (type == GGUF_TYPE_STRING) {
+            mix_string(gguf_get_val_str(gctx, i));
+        } else if (type == GGUF_TYPE_ARRAY) {
+            const gguf_type array_type = gguf_get_arr_type(gctx, i);
+            const size_t array_count = gguf_get_arr_n(gctx, i);
+            mix_u64((uint64_t) array_type);
+            mix_u64(array_count);
+            if (array_type == GGUF_TYPE_STRING) {
+                for (size_t j = 0; j < array_count; ++j) {
+                    mix_string(gguf_get_arr_str(gctx, i, j));
+                }
+            } else if (array_count > 0 && scalar_size(array_type) > 0) {
+                mix_bytes(gguf_get_arr_data(gctx, i), array_count * scalar_size(array_type));
+            }
+        } else if (scalar_size(type) > 0) {
+            mix_bytes(gguf_get_val_data(gctx, i), scalar_size(type));
+        }
+    }
+    const int64_t n_tensors = gguf_get_n_tensors(gctx);
+    mix_u64((uint64_t) n_tensors);
+    for (int64_t i = 0; i < n_tensors; ++i) {
+        mix_string(gguf_get_tensor_name(gctx, i));
+        mix_u64((uint64_t) gguf_get_tensor_type(gctx, i));
+        const int64_t * shape = gguf_get_tensor_ne(gctx, i);
+        for (int dim = 0; dim < GGML_MAX_DIMS; ++dim) {
+            mix_u64((uint64_t) shape[dim]);
+        }
+    }
+    gguf_free(gctx);
+
+    std::error_code ec;
+    const uintmax_t size = std::filesystem::file_size(path, ec);
+    if (ec) {
+        return false;
+    }
+    mix_u64((uint64_t) size);
+    out = hash;
+    return true;
 }
 
 // Returns, for each block boundary b in [1 .. n/B], the cumulative chain hash
@@ -2130,6 +2214,9 @@ public:
     mtmd_context * mctx = nullptr;
     const llama_vocab * vocab = nullptr;
 
+    // Header-only fingerprint of the loaded projector; zero without --mmproj.
+    uint64_t fp_mmproj = 0;
+
     server_queue    queue_tasks;
     server_response queue_results;
 
@@ -2256,6 +2343,7 @@ private:
 
         mtmd_free(mctx);
         mctx = nullptr;
+        fp_mmproj = 0;
     }
 
     // ----- auto disk cache: fingerprint, index, restore, save (all gated by auto_cache_enabled()) -----
@@ -2338,6 +2426,7 @@ private:
         // deployment-shape bit (invariant 3): text-only server vs --mmproj server get
         // disjoint stores (mmproj-aware rope/projector wiring can change the text KV layout).
         fp.fp_mmproj_loaded = (mctx != nullptr) ? 1u : 0u;
+        fp.fp_mmproj        = fp_mmproj;
         return fp;
     }
 
@@ -3635,6 +3724,11 @@ private:
                 return false;
             }
             SRV_INF("loaded multimodal model, '%s'\n", mmproj_path.c_str());
+            if (!mmproj_header_fingerprint(mmproj_path, fp_mmproj)) {
+                SRV_ERR("failed to fingerprint multimodal projector, '%s'\n", mmproj_path.c_str());
+                return false;
+            }
+            SRV_INF("multimodal projector fingerprint: %016" PRIx64 "\n", fp_mmproj);
 
             if (params_base.ctx_shift) {
                 params_base.ctx_shift = false;
