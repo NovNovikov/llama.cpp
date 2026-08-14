@@ -781,6 +781,8 @@ static constexpr uint32_t SLOT_META_VERSION = 1u;
 // v3, which keeps all existing incremental cache sidecars byte-compatible.
 static constexpr uint32_t SLOT_META_VERSION_MEDIA = 2u;
 static constexpr uint32_t SLOT_META_VERSION_NODE = 3u;
+// v4 combines the v2 media tail with the v3 delta-node tail, in that order.
+static constexpr uint32_t SLOT_META_VERSION_MEDIA_NODE = 4u;
 static constexpr uint32_t SLOT_META_MEDIA_MAX = 4096u;
 static constexpr uint32_t SLOT_META_ID_MAX    = 256u;
 
@@ -1103,12 +1105,6 @@ static bool slot_meta_write(const std::string & state_filepath,
                             uint32_t range_lo  = 0,     // this node's .bin holds KV cells [range_lo,
                             uint32_t range_hi  = 0,     // range_hi); ignored for a whole snapshot
                             const std::vector<server_media_record> & media = {}) {
-    // Media deltas need a separate format because v3's parent/range record follows the token list.
-    // Keep this writer conservative until that format is introduced rather than producing an
-    // ambiguous sidecar.
-    if (is_node && !media.empty()) {
-        return false;
-    }
     if (media.size() > SLOT_META_MEDIA_MAX) {
         return false;
     }
@@ -1138,7 +1134,8 @@ static bool slot_meta_write(const std::string & state_filepath,
         put_u32((uint32_t)(v >> 32));
     };
     put_u32(SLOT_META_MAGIC);
-    put_u32(is_node ? SLOT_META_VERSION_NODE : (media.empty() ? SLOT_META_VERSION : SLOT_META_VERSION_MEDIA));
+    put_u32(is_node ? (media.empty() ? SLOT_META_VERSION_NODE : SLOT_META_VERSION_MEDIA_NODE)
+                    : (media.empty() ? SLOT_META_VERSION      : SLOT_META_VERSION_MEDIA));
     put_u64(fp.fp_model);
     put_u32(fp.fp_n_vocab);
     put_u32(fp.fp_n_ctx_train);
@@ -1166,7 +1163,7 @@ static bool slot_meta_write(const std::string & state_filepath,
     // token IDs as raw LE int32 (llama_token == int32_t; llama.cpp's on-disk
     // contract is native-LE, matching slot_logits_write's float payload).
     f.write((const char *) toks.data(), (std::streamsize) toks.size() * sizeof(int32_t));
-    // v2: media identity data needed to verify a future request and to rehydrate tracking after
+    // v2/v4: media identity data needed to verify a future request and to rehydrate tracking after
     // a disk restore. It follows the frozen v1 payload so text-only sidecars stay byte-identical.
     if (!media.empty()) {
         put_u64(fp.fp_mmproj);
@@ -1182,9 +1179,8 @@ static bool slot_meta_write(const std::string & state_filepath,
             f.write(record.id.data(), (std::streamsize) record.id.size());
         }
     }
-    // delta-node section (v3 only): the KV .bin holds only cells [range_lo, range_hi); parent_id
-    // chains this node to the snapshot it extends (0 = root). Absent from a whole-snapshot v1 meta,
-    // so v1 bytes stay byte-identical.
+    // v3/v4 delta-node section: the KV .bin holds only cells [range_lo, range_hi); parent_id
+    // chains this node to the snapshot it extends (0 = root). It follows any v2 media tail.
     if (is_node) {
         put_u64(parent_id);
         put_u32(range_lo);
@@ -1250,7 +1246,8 @@ static bool slot_meta_read(const std::string & state_filepath,
         return false;
     }
     if (magic != SLOT_META_MAGIC ||
-        (version != SLOT_META_VERSION && version != SLOT_META_VERSION_MEDIA && version != SLOT_META_VERSION_NODE)) {
+        (version != SLOT_META_VERSION && version != SLOT_META_VERSION_MEDIA &&
+         version != SLOT_META_VERSION_NODE && version != SLOT_META_VERSION_MEDIA_NODE)) {
         return false;
     }
     model_fp fp;
@@ -1280,8 +1277,18 @@ static bool slot_meta_read(const std::string & state_filepath,
         toks_out.clear();
         return false;
     }
+    // v1/v3 are text-only layouts. Reject NULL cells rather than letting a damaged or relabelled
+    // media sidecar bypass its projector and media-identity checks.
+    if (version == SLOT_META_VERSION || version == SLOT_META_VERSION_NODE) {
+        for (const llama_token tok : toks_out) {
+            if (tok == LLAMA_TOKEN_NULL) {
+                toks_out.clear();
+                return false;
+            }
+        }
+    }
     std::vector<server_media_record> media;
-    if (version == SLOT_META_VERSION_MEDIA) {
+    if (version == SLOT_META_VERSION_MEDIA || version == SLOT_META_VERSION_MEDIA_NODE) {
         uint32_t n_media = 0;
         if (!get_u64(fp.fp_mmproj) || !get_u32(n_media) || n_media == 0 || n_media > SLOT_META_MEDIA_MAX) {
             toks_out.clear();
@@ -1321,7 +1328,7 @@ static bool slot_meta_read(const std::string & state_filepath,
         for (const llama_token token : toks_out) {
             n_null += token == LLAMA_TOKEN_NULL;
         }
-        if (n_covered != n_null || f.peek() != std::char_traits<char>::eof()) {
+        if (n_covered != n_null) {
             toks_out.clear();
             return false;
         }
@@ -1330,11 +1337,15 @@ static bool slot_meta_read(const std::string & state_filepath,
     uint64_t parent_id = 0;
     uint32_t range_lo  = 0;
     uint32_t range_hi  = tok_count;
-    if (version == SLOT_META_VERSION_NODE) {
+    if (version == SLOT_META_VERSION_NODE || version == SLOT_META_VERSION_MEDIA_NODE) {
         if (!get_u64(parent_id) || !get_u32(range_lo) || !get_u32(range_hi)) {
             toks_out.clear();
             return false;
         }
+    }
+    if (f.peek() != std::char_traits<char>::eof()) {
+        toks_out.clear();
+        return false;
     }
     if (parent_out)   { *parent_out   = parent_id; }
     if (range_lo_out) { *range_lo_out = range_lo; }
@@ -2687,9 +2698,6 @@ private:
             if (out_token_count) { *out_token_count = 0; }
             return false;
         }
-        if (restored_media_tokens != nullptr && node_paths.size() != 1) {
-            return false; // media delta snapshots have their own restore format
-        }
         size_t token_count = 0;
         // Load the chain in position order: node [0] clears the destination seq (a whole base/root
         // snapshot), nodes [1..] append their delta cells with NO_CLEAR so base + deltas compose.
@@ -2745,7 +2753,12 @@ private:
             if (out_nread)       { *out_nread = total_nread; }
             if (out_token_count) { *out_token_count = token_count; }
             tokens.resize(token_count);
-            server_tokens restored(tokens, mctx != nullptr);
+            // A v4 media delta's .meta carries the whole token/record tiling, while
+            // its chain composes the KV from a root plus range saves. Reuse the live,
+            // identity-verified prefix to preserve its chunk mapping after the compose.
+            server_tokens restored = restored_media_tokens != nullptr
+                ? restored_media_tokens->clone()
+                : server_tokens(tokens, mctx != nullptr);
             if (restored.size() > (size_t) slot.n_ctx || !restored.validate(ctx_tgt)) {
                 slot.prompt_clear();
                 return false;
@@ -2896,11 +2909,12 @@ private:
                 const std::string parent_path = auto_state_filename(cur_parent_id, cur_range_lo);
                 model_fp     parent_fp;
                 llama_tokens parent_toks;
+                std::vector<server_media_record> parent_media;
                 uint64_t     parent_parent_id = 0;
                 uint32_t     parent_lo        = 0;
                 uint32_t     parent_hi        = 0;
                 if (!slot_meta_read(parent_path, parent_fp, parent_toks,
-                                    &parent_parent_id, &parent_lo, &parent_hi)) {
+                                    &parent_parent_id, &parent_lo, &parent_hi, &parent_media)) {
                     return 0; // parent meta missing/corrupt -> cold prefill
                 }
                 if (!(parent_fp == cur_fp)) {
@@ -2924,6 +2938,20 @@ private:
                     (size_t) parent_hi > disk_toks.size() ||
                     !std::equal(parent_toks.begin(), parent_toks.end(), disk_toks.begin())) {
                     return 0; // parent KV does not correspond to this prefix -> cold prefill
+                }
+                // NULL cell equality cannot identify an image/audio chunk. Every media record
+                // inherited by this parent must be identical to the corresponding tip record.
+                for (const auto & parent_media_record : parent_media) {
+                    const auto it = std::lower_bound(disk_media.begin(), disk_media.end(), parent_media_record.start_idx,
+                        [](const server_media_record & record, uint32_t start_idx) {
+                            return record.start_idx < start_idx;
+                        });
+                    if (it == disk_media.end() || it->start_idx != parent_media_record.start_idx ||
+                        it->n_tokens != parent_media_record.n_tokens || it->n_pos != parent_media_record.n_pos ||
+                        it->nx != parent_media_record.nx || it->ny != parent_media_record.ny ||
+                        it->is_audio != parent_media_record.is_audio || it->id != parent_media_record.id) {
+                        return 0;
+                    }
                 }
                 // the parent .bin must exist (meta is published last, but an orphan-reap can race).
                 { std::ifstream pf(parent_path, std::ios::binary); if (!pf) { return 0; } }
@@ -3038,8 +3066,8 @@ private:
             }
         }
 
-        // INCREMENTAL SAVE (U3): when --slot-save-incremental, write only the KV cells added since the
-        // deepest already-saved snapshot on this branch (a v3 delta node) instead of re-D2H'ing and
+        // INCREMENTAL SAVE: when --slot-save-incremental, write only the KV cells added since the
+        // deepest already-saved snapshot on this branch (a v3 text or v4 media delta node) instead of re-D2H'ing and
         // re-writing the whole prefix. Find the deepest candidate whose persisted tokens are a STRICT
         // prefix of this prompt under the same fingerprint; the delta .bin then holds cells
         // [parent_hi, N). The parent-find scans all candidates rather than the restore cap, so the
@@ -3047,11 +3075,13 @@ private:
         bool     have_parent = false;
         uint64_t parent_id   = 0;
         uint32_t parent_hi   = 0;
-        if (params_base.slot_save_incremental && !has_media) {
-            for (const auto_cache_entry & cand : auto_index_lookup(toks, {}, /*max_attempts=*/SIZE_MAX)) {
+        if (params_base.slot_save_incremental) {
+            for (const auto_cache_entry & cand : auto_index_lookup(toks, media, /*max_attempts=*/SIZE_MAX)) {
                 model_fp     disk_fp;
                 llama_tokens disk_toks;
-                if (!slot_meta_read(cand.state_path, disk_fp, disk_toks)) {
+                std::vector<server_media_record> disk_media;
+                if (!slot_meta_read(cand.state_path, disk_fp, disk_toks,
+                                    nullptr, nullptr, nullptr, &disk_media)) {
                     continue; // unreadable meta -> not a usable parent (invariant 4)
                 }
                 if (!(disk_fp == cur_fp)) {
@@ -3063,17 +3093,47 @@ private:
                     !std::equal(disk_toks.begin(), disk_toks.end(), toks.begin())) {
                     continue;
                 }
+                const size_t parent_size = disk_toks.size();
+                if (!boundary_is_chunk_safe(toks, media, parent_size)) {
+                    continue;
+                }
+                // Equal NULL cells alone do not prove that the candidate's inherited
+                // images/audio are the same. Verify every record in its shared prefix.
+                bool media_match = true;
+                for (const auto & disk_record : disk_media) {
+                    const auto it = std::lower_bound(media.begin(), media.end(), disk_record.start_idx,
+                        [](const server_media_record & record, uint32_t start_idx) {
+                            return record.start_idx < start_idx;
+                        });
+                    if (it == media.end() || it->start_idx != disk_record.start_idx ||
+                        it->n_tokens != disk_record.n_tokens || it->n_pos != disk_record.n_pos ||
+                        it->nx != disk_record.nx || it->ny != disk_record.ny ||
+                        it->is_audio != disk_record.is_audio || it->id != disk_record.id) {
+                        media_match = false;
+                        break;
+                    }
+                }
+                if (!media_match) {
+                    continue;
+                }
                 // parent_id = the parent node's chain_hash = the last whole-block boundary hash of its
                 // token prefix. Since disk_toks == toks[0:parent_hi], this reproduces the parent's own
                 // full_hash, so auto_state_filename(parent_id, parent_hi) is exactly the parent's file
                 // (the deterministic link U4's restore walk resolves). The parent cleared save_floor >=
                 // block, so its prefix has at least one boundary; guard defensively regardless.
-                const llama_tokens prefix(toks.begin(), toks.begin() + disk_toks.size());
-                const auto pbhs = auto_block_hashes(prefix, params_base.slot_save_block, cur_fp.fp_model);
+                const llama_tokens prefix(toks.begin(), toks.begin() + parent_size);
+                std::vector<server_media_record> prefix_media;
+                for (const auto & record : media) {
+                    if ((size_t) record.start_idx + record.n_tokens <= parent_size) {
+                        prefix_media.push_back(record);
+                    }
+                }
+                const auto pbhs = auto_block_hashes(prefix, prefix_media, params_base.slot_save_block,
+                                                     cur_fp.fp_model, cur_fp.fp_mmproj);
                 if (pbhs.empty()) {
                     continue;
                 }
-                parent_hi   = (uint32_t) disk_toks.size();
+                parent_hi   = (uint32_t) parent_size;
                 parent_id   = pbhs.back();
                 have_parent = true;
                 break; // deepest (longest-first) strict-prefix parent
@@ -3101,7 +3161,7 @@ private:
         //    via the range save; otherwise the exact whole-snapshot save (byte-identical v1 path).
         const size_t nwrite = have_parent
             ? llama_state_seq_save_file_range(ctx_tgt, tmp.c_str(), slot.id,
-                                              (llama_pos) parent_hi, -1, toks.data(), toks.size())
+                                              slot.prompt.tokens.pos_next(parent_hi), -1, toks.data(), toks.size())
             : llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id, toks.data(), toks.size());
         if (nwrite == 0) {
             std::error_code ec; std::filesystem::remove(tmp, ec);
@@ -3115,11 +3175,11 @@ private:
             slot_logits_write(tmp, slot.logits_last, nv, (uint32_t) toks.size());
         }
         // 3) meta sidecar on the temp path (tokens + fingerprint). Written but renamed LAST. In
-        //    incremental mode this is a v3 delta-node meta carrying parent_id + [parent_hi, N); a whole
-        //    save writes the v1 meta byte-identically.
+        //    incremental mode this is a v3 text or v4 media delta-node meta carrying parent_id +
+        //    [parent_hi, N); a whole save retains the v1/v2 formats.
         const bool meta_ok = have_parent
             ? slot_meta_write(tmp, cur_fp, toks, full_hash, /*is_node=*/true, parent_id, parent_hi,
-                              (uint32_t) toks.size())
+                              (uint32_t) toks.size(), media)
             : slot_meta_write(tmp, cur_fp, toks, full_hash, false, 0, 0, 0, media);
         if (!meta_ok) {
             std::error_code ec;
