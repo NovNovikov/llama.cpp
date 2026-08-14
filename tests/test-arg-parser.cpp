@@ -1,4 +1,5 @@
 #include "arg.h"
+#include "chat.h"
 #include "common.h"
 #include "download.h"
 #include "llama.h"
@@ -115,6 +116,19 @@ static void test(void) {
 
     std::vector<std::string> argv;
 
+    {
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_SYSTEM,    0, 12);
+        spans.add(COMMON_CHAT_ROLE_TOOL,      12, 8);
+        spans.add(COMMON_CHAT_ROLE_USER,      20, 16);
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT, 36, 4);
+        assert(spans.first_user_message_pos() == 20);
+
+        common_chat_msg_spans no_user;
+        no_user.add(COMMON_CHAT_ROLE_SYSTEM, 0, 12);
+        assert(no_user.first_user_message_pos() == -1);
+    }
+
     printf("test-arg-parser: test invalid usage\n\n");
 
     // missing value
@@ -173,6 +187,16 @@ static void test(void) {
     assert(false == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));
 
     printf("test-arg-parser: test valid usage\n\n");
+
+    {
+        common_params cache_params;
+        argv = {"binary_name", "--slot-save-path", ".", "--slot-save-auto",
+                "--slot-save-context-min-tokens", "8192", "--slot-restore-min-tokens", "512"};
+        assert(common_params_parse(argv.size(), list_str_to_char(argv).data(), cache_params, LLAMA_EXAMPLE_SERVER));
+        assert(cache_params.slot_save_auto);
+        assert(cache_params.slot_save_context_min_tokens == 8192);
+        assert(cache_params.slot_restore_min_tokens == 512);
+    }
 
     argv = {"binary_name", "-m", "model_file.gguf"};
     assert(true == common_params_parse(argv.size(), list_str_to_char(argv).data(), params, LLAMA_EXAMPLE_COMMON));

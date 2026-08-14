@@ -7095,20 +7095,6 @@ static void test_msg_diffs_compute() {
     }
 }
 
-static void test_first_user_message_span() {
-    common_chat_msg_spans spans;
-    spans.add(COMMON_CHAT_ROLE_SYSTEM,    0, 12);
-    spans.add(COMMON_CHAT_ROLE_DEVELOPER, 12, 8);
-    spans.add(COMMON_CHAT_ROLE_USER,      20, 16);
-    spans.add(COMMON_CHAT_ROLE_ASSISTANT, 36, 4);
-
-    assert_equals(20, spans.first_user_message_pos());
-
-    common_chat_msg_spans no_user;
-    no_user.add(COMMON_CHAT_ROLE_SYSTEM, 0, 12);
-    assert_equals(-1, no_user.first_user_message_pos());
-}
-
 int main(int argc, char ** argv) {
     bool detailed_debug    = false;
     bool only_run_filtered = false;
@@ -7182,7 +7168,6 @@ int main(int argc, char ** argv) {
 #endif
     {
         test_msg_diffs_compute();
-        test_first_user_message_span();
         test_msgs_oaicompat_json_conversion();
         test_msg_token_delimiters_split();
         test_tools_oaicompat_json_conversion();
