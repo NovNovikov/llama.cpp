@@ -616,6 +616,7 @@ static void slot_save_enforce_limits(const std::string & dir,
             const auto it = node_by_key.find(parent_key(units[i]));
             if (it == node_by_key.end() || !alive[it->second]) {
                 remove_unit_files(units[i]);
+                SRV_INF("auto-cache: removed orphan delta snapshot %s\n", units[i].state_path.c_str());
                 alive[i] = 0;
                 if (units[i].node_id != 0) {
                     const auto self = node_by_key.find(self_key(units[i]));
@@ -717,6 +718,8 @@ static void slot_save_enforce_limits(const std::string & dir,
             return false;
         }
         remove_unit_files(units[i]);
+        SRV_INF("auto-cache: evicted %s snapshot %s\n",
+                units[i].is_node ? "leaf delta" : "whole", units[i].state_path.c_str());
         alive[i] = 0;
         total -= std::min(total, (uintmax_t) units[i].bytes);
         count = (count > 0) ? count - 1 : 0;
@@ -2814,11 +2817,21 @@ private:
         uint32_t disk_range_hi  = 0;
         if (!slot_meta_read(cand.state_path, disk_fp, disk_toks,
                             &disk_parent_id, &disk_range_lo, &disk_range_hi, &disk_media)) {
+            SLT_INF(slot, "auto-restore: disk candidate rejected (invalid metadata), file=%s\n",
+                    cand.state_path.c_str());
             return 0; // invariant 4
         }
         if (!(disk_fp == cur_fp)) {
+            SLT_INF(slot, "auto-restore: disk candidate rejected (fingerprint mismatch), file=%s\n",
+                    cand.state_path.c_str());
             return 0; // invariant 3
         }
+        const bool disk_is_delta = disk_parent_id != 0 || disk_range_lo != 0;
+        const char * disk_kind = disk_is_delta
+            ? (disk_media.empty() ? "delta" : "media-delta")
+            : (disk_media.empty() ? "whole" : "media-whole");
+        SLT_INF(slot, "auto-restore: disk candidate kind=%s, tokens=%zu, file=%s\n",
+                disk_kind, disk_toks.size(), cand.state_path.c_str());
         const llama_tokens & req_cells = req.get_cell_tokens();
         std::vector<server_media_record> req_media;
         try {
@@ -2828,6 +2841,8 @@ private:
             return 0;
         }
         if (disk_media.size() > req_media.size()) {
+            SLT_INF(slot, "auto-restore: disk candidate rejected (media record count), file=%s\n",
+                    cand.state_path.c_str());
             return 0;
         }
         for (size_t i = 0; i < disk_media.size(); ++i) {
@@ -2836,7 +2851,8 @@ private:
             if (disk.start_idx != live.start_idx || disk.n_tokens != live.n_tokens ||
                 disk.n_pos != live.n_pos || disk.nx != live.nx || disk.ny != live.ny ||
                 disk.is_audio != live.is_audio || disk.id != live.id) {
-                SLT_DBG(slot, "auto-restore: media identity mismatch, skipping %s\n", cand.state_path.c_str());
+                SLT_INF(slot, "auto-restore: disk candidate rejected (media identity mismatch), file=%s\n",
+                        cand.state_path.c_str());
                 return 0;
             }
         }
@@ -2861,7 +2877,7 @@ private:
             // would have to partially unwind. (No block-boundary clamp for FULL: only the exact whole
             // snapshot is a legal restore length here.)
             if (v != disk_toks.size()) {
-                SLT_DBG(slot, "auto-restore: FULL snapshot is not a whole prefix of the request "
+                SLT_INF(slot, "auto-restore: disk candidate rejected (token mismatch; FULL needs whole prefix) "
                               "(verified %zu of %zu snapshot tokens; request %zu) — skipping %s\n",
                         v, disk_toks.size(), req_cells.size(), cand.state_path.c_str());
                 return 0;
@@ -2878,16 +2894,20 @@ private:
             }
         }
         if (n_keep_disk <= 0) {
+            SLT_INF(slot, "auto-restore: disk candidate rejected (no whole-block token prefix), file=%s\n",
+                    cand.state_path.c_str());
             return 0;
         }
         if (n_keep_disk < params_base.slot_restore_min_tokens) {
-            SLT_DBG(slot, "auto-restore: verified prefix %d below --slot-restore-min-tokens=%d, recomputing\n",
+            SLT_INF(slot, "auto-restore: disk candidate rejected (verified prefix %d below restore floor %d), recomputing\n",
                     n_keep_disk, params_base.slot_restore_min_tokens);
             return 0;
         }
         // MARGIN gate (invariant 5): only pay a multi-GB load if disk strictly beats the
         // in-memory match by at least one block — never thrash a reload to save a few tokens.
         if (n_keep_disk < n_keep_mem + B) {
+            SLT_INF(slot, "auto-restore: disk candidate rejected (RAM prefix %d is within one block of disk %d)\n",
+                    n_keep_mem, n_keep_disk);
             return 0;
         }
         // Build the root->tip chain of node .bin paths (the tree is DERIVED FROM DISK — no in-RAM
@@ -2994,8 +3014,8 @@ private:
         for (const std::string & node_path : chain) {
             auto_touch_unit(node_path);
         }
-        SLT_INF(slot, "auto-restore: reused %d tokens from disk (in-memory match was %d), file=%s\n",
-                n_keep_disk, n_keep_mem, cand.state_path.c_str());
+        SLT_INF(slot, "auto-restore: accepted %s snapshot, reused %d tokens from disk (RAM prefix match was %d), chain=%zu, file=%s\n",
+                disk_kind, n_keep_disk, n_keep_mem, chain.size(), cand.state_path.c_str());
         return n_keep_disk;
     }
 
@@ -3214,7 +3234,9 @@ private:
             return; // invariant 4: don't index a unit whose .meta (the scan key) never published
         }
 
-        SLT_INF(slot, "auto-save: persisted %zu tokens to %s\n", toks.size(), fname.c_str());
+        SLT_INF(slot, "auto-save: snapshot saved (%s, tokens=%zu, range=[%u,%zu)) to %s\n",
+                have_parent ? (has_media ? "media-delta" : "delta") : (has_media ? "media-whole" : "whole"),
+                toks.size(), have_parent ? parent_hi : 0, toks.size(), fname.c_str());
 
         // index insert (every boundary -> this snapshot), then bounded-LRU + reconcile.
         {
@@ -5947,7 +5969,10 @@ private:
                                     // fall-through is what stops a longer superset snapshot (unusable by a
                                     // FULL model, which needs a whole-prefix match) from shadowing a shorter
                                     // usable one at the same boundary.
-                                    for (const auto & cand : auto_index_lookup(input_tokens.get_cell_tokens(), req_media)) {
+                                    const auto disk_candidates = auto_index_lookup(input_tokens.get_cell_tokens(), req_media);
+                                    SLT_INF(slot, "auto-restore: RAM prefix match=%d, disk candidates=%zu\n",
+                                            n_past, disk_candidates.size());
+                                    for (const auto & cand : disk_candidates) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
                                         // (corrupt/short .bin, KV-capacity exceeded, racing LRU eviction
@@ -6318,6 +6343,19 @@ private:
                         slot.n_prompt_tokens_cache = n_past;
                         slot.n_prompt_tokens_processed = 0;
 
+                        const int n_resident = slot.prompt.n_tokens();
+                        if (n_past == n_resident && n_past < slot.task->n_tokens()) {
+                            SLT_INF(slot, "prompt reuse: strict extension from %d cached tokens; no rollback required\n",
+                                    n_past);
+                        } else if (n_past < n_resident) {
+                            SLT_INF(slot, "prompt reuse: divergence at %d of %d cached tokens; selecting RAM/disk checkpoint or recomputing\n",
+                                    n_past, n_resident);
+                        }
+                        if (n_past < slot.task->n_tokens()) {
+                            SLT_INF(slot, "prompt reuse: recomputing suffix from token %d to %d\n",
+                                    n_past, slot.task->n_tokens());
+                        }
+
                         slot.prompt.tokens.keep_first(n_past);
 
                         // Arm a one-shot whole-state base save at the first user-message boundary.
@@ -6339,6 +6377,9 @@ private:
                                 const int floor = std::max(block, params_base.slot_save_context_min_tokens);
                                 if (target >= floor && target < slot.task->n_tokens() && n_past < target) {
                                     slot.ctx_save_pos = target;
+                                    SLT_INF(slot,
+                                            "auto-save: shared-context checkpoint boundary armed at %d (first user message=%d)\n",
+                                            target, boundary);
                                 }
                             }
                         }
