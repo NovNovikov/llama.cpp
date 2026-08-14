@@ -982,6 +982,16 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (params.slot_save_min_tokens < 0) {
         throw std::invalid_argument("--slot-save-min-tokens must be >= 0");
     }
+    if (params.slot_save_context_min_tokens < 0) {
+        throw std::invalid_argument("--slot-save-context-min-tokens must be >= 0");
+    }
+    if (params.slot_restore_min_tokens < 0) {
+        throw std::invalid_argument("--slot-restore-min-tokens must be >= 0");
+    }
+    if (params.slot_restore_min_tokens > params.slot_save_min_tokens ||
+        params.slot_restore_min_tokens > params.slot_save_context_min_tokens) {
+        throw std::invalid_argument("--slot-restore-min-tokens must not exceed either snapshot save floor");
+    }
     // idle-delay flush is inert without the master switch (auto_idle_flush_enabled() gates on
     // auto_cache_enabled()); reject an explicit --slot-save-idle-seconds without --slot-save-auto
     // rather than silently ignoring it. The default (unset) is left alone so plain servers still run.
@@ -3656,6 +3666,23 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.slot_save_min_tokens = value;
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-save-context-min-tokens"}, "N",
+        string_format("minimum shared-context base size worth persisting to the auto disk cache; "
+                      "the effective floor is max(--slot-save-block, this) (default: %d)",
+                      params.slot_save_context_min_tokens),
+        [](common_params & params, int value) {
+            params.slot_save_context_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_SAVE_CONTEXT_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
+    add_opt(common_arg(
+        {"--slot-restore-min-tokens"}, "N",
+        string_format("skip auto disk cache restore when the verified prefix is shorter than N tokens "
+                      "(default: %d)", params.slot_restore_min_tokens),
+        [](common_params & params, int value) {
+            params.slot_restore_min_tokens = value;
+        }
+    ).set_env("LLAMA_ARG_SLOT_RESTORE_MIN_TOKENS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
         {"--slot-save-idle-seconds"}, "N",
         string_format("flush a slot's warm KV to the auto disk cache after N seconds of idleness, "

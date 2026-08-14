@@ -2857,6 +2857,11 @@ private:
         if (n_keep_disk <= 0) {
             return 0;
         }
+        if (n_keep_disk < params_base.slot_restore_min_tokens) {
+            SLT_DBG(slot, "auto-restore: verified prefix %d below --slot-restore-min-tokens=%d, recomputing\n",
+                    n_keep_disk, params_base.slot_restore_min_tokens);
+            return 0;
+        }
         // MARGIN gate (invariant 5): only pay a multi-GB load if disk strictly beats the
         // in-memory match by at least one block — never thrash a reload to save a few tokens.
         if (n_keep_disk < n_keep_mem + B) {

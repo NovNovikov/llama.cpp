@@ -690,6 +690,11 @@ struct common_params {
     // little prefill against the state-file write + later restore, so it is skipped. The effective
     // floor is max(slot_save_block, slot_save_min_tokens) — a snapshot must always cover >= 1 block.
     int32_t slot_save_min_tokens = 1024;
+    // floor for a separately persisted leading shared-context base. It is larger
+    // than the regular snapshot floor because a distinct base should amortize its I/O.
+    int32_t slot_save_context_min_tokens = 4096;
+    // skip disk restore below this verified prefix length when re-prefill is cheaper.
+    int32_t slot_restore_min_tokens = 0;
     // idle-delay flush: persist a slot's warm KV after this many seconds of idleness, so a lone
     // request's state survives a crash and becomes visible to peer instances without waiting for
     // the next task to arrive. -1 disables it (legacy write-on-reuse/shutdown only).
