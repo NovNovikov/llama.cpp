@@ -1414,6 +1414,10 @@ struct server_slot {
     // flush at most once per idle period (auto_save_slot_if_useful's dedup covers any re-attempt).
     bool auto_idle_flushed = false;
 
+    // A completed prompt with disk snapshots at its RAM-checkpoint boundaries does not need an
+    // additional tail-only automatic snapshot when the slot later becomes idle or is reclaimed.
+    bool auto_disk_checkpoint_published = false;
+
     // Cold-prefill shared-context base target. The prefill loop stops exactly at
     // this block-aligned position, saves the whole resident state, then disarms.
     int32_t ctx_save_pos = -1;
@@ -3033,10 +3037,14 @@ private:
     // Skips redundant writes (an equal-or-longer snapshot already covers this prefix), writes the
     // state + .logits + .meta as a 3-file unit (atomically, .meta LAST so a torn write is never
     // indexed), enforces the bounded LRU, then reconciles the index. Invariant 1: first statement
-    // is the gate; invariant 5: only called on slot release/reassign, never during generation.
-    void auto_save_slot_if_useful(server_slot & slot) {
+    // is the gate. `prefix_tokens` is normally SIZE_MAX (the whole live prompt); a RAM checkpoint
+    // passes its own prefix length while the context still holds that exact checkpoint state.
+    bool auto_save_slot_if_useful(server_slot & slot, size_t prefix_tokens = SIZE_MAX) {
         if (!auto_cache_enabled()) {
-            return; // off by default
+            return false; // off by default
+        }
+        if (prefix_tokens == SIZE_MAX && slot.auto_disk_checkpoint_published) {
+            return false; // checkpoint snapshots are the retained disk cache for this completed prompt
         }
         // exclusions reuse the existing guards. NOTE: an idle slot has already been reset(), so
         // `slot.task` is null here — the just-finished task survives as `slot.task_prev`. Use it for
@@ -3044,13 +3052,13 @@ private:
         // an identity-less placeholder can never be verified later and is therefore not persisted.
         const auto & wtask = slot.task ? slot.task : slot.task_prev;
         if (!wtask || !wtask->need_sampling()) {
-            return;
+            return false;
         }
         // The fingerprint captures the GLOBAL LoRA set; refuse to persist a snapshot taken under a
         // per-request adapter override that differs from it (invariant 3). (Conservative: a future version
         // could fold the slot's adapters into the snapshot fingerprint instead.)
         if (!are_lora_equal(slot.lora, params_base.lora_adapters)) {
-            return;
+            return false;
         }
         const bool has_media = slot.prompt.tokens.has_media();
         std::vector<server_media_record> media;
@@ -3060,23 +3068,32 @@ private:
             }
         } catch (const std::exception & e) {
             SLT_WRN(slot, "auto-save: skipped media snapshot, %s\n", e.what());
-            return;
+            return false;
         }
         // The KV state is cell-aligned. For text this preserves the frozen v1 token stream;
         // media snapshots retain their NULL cells and carry the accompanying records in v2.
-        const llama_tokens toks = has_media ? slot.prompt.tokens.get_cell_tokens()
-                                            : slot.prompt.tokens.get_text_tokens();
+        llama_tokens toks = has_media ? slot.prompt.tokens.get_cell_tokens()
+                                      : slot.prompt.tokens.get_text_tokens();
+        if (prefix_tokens != SIZE_MAX) {
+            if (prefix_tokens > toks.size() || !boundary_is_chunk_safe(toks, media, prefix_tokens)) {
+                return false; // never publish a state with a token list that ends inside a media chunk
+            }
+            toks.resize(prefix_tokens);
+            media.erase(std::remove_if(media.begin(), media.end(), [prefix_tokens](const server_media_record & record) {
+                return (size_t) record.start_idx + record.n_tokens > prefix_tokens;
+            }), media.end());
+        }
         // effective floor = max(block, min-tokens): a snapshot must cover >= 1 block AND clear the
         // configured minimum-size threshold. A trivially small prefix saves little prefill against
         // the state-file write + later restore, so it is skipped.
         const int save_floor = std::max(params_base.slot_save_block, params_base.slot_save_min_tokens);
         if ((int) toks.size() < save_floor) {
-            return; // below the floor: not worth a multi-GB write
+            return false; // below the floor: not worth a multi-GB write
         }
         const auto bhs = auto_block_hashes(toks, media, params_base.slot_save_block,
                                            cur_fp.fp_model, cur_fp.fp_mmproj);
         if (bhs.empty()) {
-            return;
+            return false;
         }
         const uint64_t full_hash = bhs.back(); // commits the whole whole-block prefix
         {
@@ -3090,7 +3107,7 @@ private:
                     // be suppressed by a longer snapshot the model can never restore. PART: an
                     // equal-or-longer snapshot already covers this prefix (it can rewind to it).
                     if (full ? (c.n_tokens == toks.size()) : (c.n_tokens >= toks.size())) {
-                        return; // a usable snapshot for this exact prefix already exists
+                        return true; // a usable snapshot for this exact prefix already exists
                     }
                 }
             }
@@ -3195,7 +3212,7 @@ private:
             : llama_state_seq_save_file(ctx_tgt, tmp.c_str(), slot.id, toks.data(), toks.size());
         if (nwrite == 0) {
             std::error_code ec; std::filesystem::remove(tmp, ec);
-            return; // invariant 4: disk full / IO error -> generation unaffected
+            return false; // invariant 4: disk full / IO error -> generation unaffected
         }
         // 2) regenerate logits sidecar on the temp path (FULL only, and only when the captured
         //    distribution provably belongs to this exact state — the same stamp check SLOT_SAVE uses).
@@ -3216,7 +3233,7 @@ private:
             std::filesystem::remove(tmp, ec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
             std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
-            return; // invariant 4
+            return false; // invariant 4
         }
         // 4) atomic publish: rename state first, then sidecars to their final names. .meta is the
         //    last to appear, so the startup scan (which keys on .meta) never sees a half-written unit.
@@ -3226,7 +3243,7 @@ private:
             std::filesystem::remove(tmp, ec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
             std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
-            return; // invariant 4
+            return false; // invariant 4
         }
         std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(fname), ec);
         ec.clear();
@@ -3241,7 +3258,7 @@ private:
             std::filesystem::remove(slot_logits_sidecar_path(fname), rec);
             std::filesystem::remove(slot_logits_sidecar_path(tmp), rec);
             std::filesystem::remove(slot_meta_sidecar_path(tmp), rec);
-            return; // invariant 4: don't index a unit whose .meta (the scan key) never published
+            return false; // invariant 4: don't index a unit whose .meta (the scan key) never published
         }
 
         SLT_INF(slot, "auto-save: snapshot saved (%s, tokens=%zu, range=[%u,%zu)) to %s\n",
@@ -3283,6 +3300,7 @@ private:
                 auto_idx.dir_mtime = dmt;
             }
         }
+        return true;
     }
 
     // AUTO-SAVE (shutdown): persist every slot's warm KV on graceful terminate — the third
@@ -4509,6 +4527,7 @@ private:
             slot.smpl.reset();
         }
 
+        slot.auto_disk_checkpoint_published = false;
         slot.task = std::make_unique<const server_task>(std::move(task));
 
         slot.state = slot.task->is_child()
@@ -6621,6 +6640,12 @@ private:
                                     n_tokens_start, fifth_last_assistant_pos);
                         }
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        // The RAM checkpoint captures the KV before this batch is decoded. Publish
+                        // that same prefix now, while ctx_tgt still contains its exact state, rather
+                        // than waiting for the final prompt token and saving only the tail state.
+                        slot.auto_disk_checkpoint_published =
+                            auto_save_slot_if_useful(slot, n_tokens_start) ||
+                            slot.auto_disk_checkpoint_published;
                     }
 
                 }
