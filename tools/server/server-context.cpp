@@ -3424,7 +3424,7 @@ private:
                 ? llama_state_seq_get_size_range(ctx_tgt, slot.id, range_lo, -1)
                 : llama_state_seq_get_size_ext(ctx_tgt, slot.id, 0);
             if (state_size == 0) {
-                SLT_WRN(slot, "auto-save: failed to capture background snapshot size\n");
+                SLT_WRN(slot, "%s", "auto-save: failed to capture background snapshot size\n");
                 return false;
             }
 
@@ -3444,7 +3444,7 @@ private:
                                                  slot.id, range_lo, -1)
                 : llama_state_seq_get_data_ext(ctx_tgt, job.state_data.data(), job.state_data.size(), slot.id, 0);
             if (ncopy != job.state_data.size()) {
-                SLT_WRN(slot, "auto-save: failed to capture background snapshot data\n");
+                SLT_WRN(slot, "%s", "auto-save: failed to capture background snapshot data\n");
                 return false;
             }
             if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
@@ -3455,7 +3455,7 @@ private:
             if (!auto_enqueue_snapshot(std::move(job))) {
                 // A single active blob is deliberate: keep the prompt path moving and
                 // never accumulate three additional full-state copies in host RAM.
-                SLT_INF(slot, "auto-save: background writer busy; skipping checkpoint snapshot\n");
+                SLT_INF(slot, "%s", "auto-save: background writer busy; skipping checkpoint snapshot\n");
                 return true;
             }
             SLT_INF(slot, "auto-save: checkpoint snapshot handed to background writer (tokens=%zu)\n",
