@@ -2471,9 +2471,13 @@ private:
     // Auto-snapshot filename: model-fp prefix lets the startup scan reject foreign-model files by
     // name before opening anything; chain-hash + token-count make it deterministic across processes
     // (a same-prefix save from another process yields the same name -> atomic-rename-idempotent).
-    std::string auto_state_filename(uint64_t chain_hash, size_t n_tokens) const {
-        char buf[96]; // "auto-" + 16 hex fp + "-" + 16 hex hash + "-" + up to 20-digit count + ".bin" < 96
-        snprintf(buf, sizeof(buf), "auto-%016" PRIx64 "-%016" PRIx64 "-%zu.bin",
+    // Standalone snapshots use a distinct suffix so they can replace legacy delta snapshots at the
+    // same logical prefix without renaming over a file that may still be open on Windows.
+    std::string auto_state_filename(uint64_t chain_hash, size_t n_tokens, bool standalone = false) const {
+        char buf[112]; // "auto-" + 16 hex fp + "-" + 16 hex hash + "-" + count + "-whole.bin" < 112
+        snprintf(buf, sizeof(buf), standalone
+                 ? "auto-%016" PRIx64 "-%016" PRIx64 "-%zu-whole.bin"
+                 : "auto-%016" PRIx64 "-%016" PRIx64 "-%zu.bin",
                  cur_fp.fp_model, chain_hash, n_tokens);
         return params_base.slot_save_path + std::string(buf);
     }
@@ -2554,11 +2558,16 @@ private:
             model_fp fp;
             llama_tokens toks;
             std::vector<server_media_record> media;
-            if (!slot_meta_read(p, fp, toks, nullptr, nullptr, nullptr, &media)) {
+            uint64_t parent_id = 0;
+            uint32_t range_lo = 0;
+            if (!slot_meta_read(p, fp, toks, &parent_id, &range_lo, nullptr, &media)) {
                 continue; // no/short/corrupt meta -> not indexable (invariant 4)
             }
             if (!(fp == cur_fp)) {
                 continue; // foreign model / requant / different ctx geometry (invariant 3)
+            }
+            if (parent_id != 0 || range_lo != 0) {
+                continue; // legacy delta snapshots are unsafe to compose-load
             }
             const auto bhs = auto_block_hashes(toks, media, params_base.slot_save_block,
                                                cur_fp.fp_model, cur_fp.fp_mmproj);
@@ -3112,11 +3121,22 @@ private:
             if (it != auto_idx.by_boundary.end()) {
                 const bool full = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
                 for (const auto_cache_entry & c : it->second) {
+                    model_fp disk_fp;
+                    llama_tokens disk_toks;
+                    uint64_t parent_id = 0;
+                    uint32_t range_lo = 0;
+                    if (!slot_meta_read(c.state_path, disk_fp, disk_toks,
+                                        &parent_id, &range_lo)) {
+                        continue;
+                    }
+                    if (!(disk_fp == cur_fp) || parent_id != 0 || range_lo != 0) {
+                        continue; // an old delta must never suppress a whole replacement snapshot
+                    }
                     // FULL: only an EXACT-length snapshot substitutes (a longer one is unusable, a
                     // shorter one is a different resume point) — otherwise this incremental save would
                     // be suppressed by a longer snapshot the model can never restore. PART: an
                     // equal-or-longer snapshot already covers this prefix (it can rewind to it).
-                    if (full ? (c.n_tokens == toks.size()) : (c.n_tokens >= toks.size())) {
+                    if (full ? (disk_toks.size() == toks.size()) : (disk_toks.size() >= toks.size())) {
                         return true; // a usable snapshot for this exact prefix already exists
                     }
                 }
@@ -3201,7 +3221,7 @@ private:
             }
         }
 
-        const std::string fname = auto_state_filename(full_hash, toks.size());
+        const std::string fname = auto_state_filename(full_hash, toks.size(), !have_parent);
         // cross-process atomicity: the temp path MUST be unique per writer. The final
         // name (fname) is deterministic (fp + chain hash + tok count), so two processes sharing one
         // --slot-save-path would otherwise both stream a multi-GB state into the SAME "<fname>.tmp"
@@ -3292,9 +3312,9 @@ private:
         // auto_cache_enabled(), but the gate is stated at the call site too so the invariant
         // (a bounded, self-reaping store belongs to --slot-save-auto, never plain --slot-save-path)
         // is local to every enforce_limits caller.
+        bool oversized = false;
         if (auto_cache_enabled() &&
             (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0)) {
-            bool oversized = false;
             slot_save_enforce_limits(params_base.slot_save_path,
                                      params_base.slot_save_max_count,
                                      params_base.slot_save_max_bytes,
@@ -3314,7 +3334,7 @@ private:
                 auto_idx.dir_mtime = dmt;
             }
         }
-        return true;
+        return !oversized;
     }
 
     // AUTO-SAVE (shutdown): persist every slot's warm KV on graceful terminate — the third
