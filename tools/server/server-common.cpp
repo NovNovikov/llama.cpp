@@ -506,6 +506,58 @@ const llama_tokens & server_tokens::get_tokens() const {
     return tokens;
 }
 
+const llama_tokens & server_tokens::get_cell_tokens() const {
+    return tokens;
+}
+
+std::vector<server_media_record> server_tokens::extract_media_records() const {
+    std::vector<server_media_record> records;
+    records.reserve(map_idx_to_media.size());
+    for (const auto & item : map_idx_to_media) {
+        const auto * chunk = item.second.get();
+        const auto type = mtmd_input_chunk_get_type(chunk);
+        GGML_ASSERT(type == MTMD_INPUT_CHUNK_TYPE_IMAGE || type == MTMD_INPUT_CHUNK_TYPE_AUDIO);
+
+        const char * id = mtmd_input_chunk_get_id(chunk);
+        if (id == nullptr || id[0] == '\0') {
+            throw std::runtime_error("media chunk has an empty id");
+        }
+
+        server_media_record record;
+        record.start_idx = (uint32_t) item.first;
+        record.n_tokens  = (uint32_t) mtmd_input_chunk_get_n_tokens(chunk);
+        record.n_pos     = (uint32_t) mtmd_input_chunk_get_n_pos(chunk);
+        record.id        = id;
+        if (type == MTMD_INPUT_CHUNK_TYPE_IMAGE) {
+            mtmd_image_tokens_get_grid(mtmd_input_chunk_get_tokens_image(chunk), &record.nx, &record.ny);
+        } else {
+            record.nx       = record.n_tokens;
+            record.ny       = 1;
+            record.is_audio = 1;
+        }
+        records.push_back(std::move(record));
+    }
+    return records;
+}
+
+bool server_tokens::boundary_is_chunk_safe(size_t idx) const {
+    GGML_ASSERT(idx <= tokens.size());
+    if (idx == tokens.size() || tokens[idx] != LLAMA_TOKEN_NULL) {
+        return true;
+    }
+    return map_idx_to_media.find(idx) != map_idx_to_media.end();
+}
+
+bool boundary_is_chunk_safe(const llama_tokens & cells, const std::vector<server_media_record> & records, size_t idx) {
+    GGML_ASSERT(idx <= cells.size());
+    if (idx == cells.size() || cells[idx] != LLAMA_TOKEN_NULL) {
+        return true;
+    }
+    const auto it = std::lower_bound(records.begin(), records.end(), idx,
+        [](const server_media_record & record, size_t value) { return record.start_idx < value; });
+    return it != records.end() && it->start_idx == idx;
+}
+
 std::vector<char> server_tokens::serialize() const {
     static_assert(sizeof(llama_token) == sizeof(uint32_t), "unexpected llama_token size");
 

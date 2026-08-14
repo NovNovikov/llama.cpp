@@ -129,6 +129,18 @@ std::vector<size_t> lora_get_enabled_ids(const std::vector<common_adapter_lora_i
 // server_tokens
 //
 
+// Identity metadata for one media chunk. It deliberately holds only stable
+// request identity and geometry; the disk cache never persists pixel or sample data.
+struct server_media_record {
+    uint32_t    start_idx = 0;
+    uint32_t    n_tokens  = 0;
+    uint32_t    n_pos     = 0;
+    uint32_t    nx        = 0;
+    uint32_t    ny        = 0;
+    uint32_t    is_audio  = 0;
+    std::string id;
+};
+
 /**
  * server_tokens is a helper to manage the input tokens and image for the server.
  * it is made this way to simplify the logic of KV cache management.
@@ -204,6 +216,17 @@ public:
     // for compatibility with speculative decoding, ctx shift
     const llama_tokens & get_tokens() const;
 
+    // Cell-aligned list. Unlike get_tokens(), this is valid for prompts containing
+    // media and uses LLAMA_TOKEN_NULL for every occupied media cell.
+    const llama_tokens & get_cell_tokens() const;
+
+    // Returns ordered identity records for all media chunks. Empty IDs are not
+    // reusable across requests and therefore reject persistence/lookup.
+    std::vector<server_media_record> extract_media_records() const;
+
+    // A resumable boundary may not split the interior of a media chunk.
+    bool boundary_is_chunk_safe(size_t idx) const;
+
     llama_tokens get_text_tokens() const;
 
     std::vector<char> serialize() const;
@@ -238,6 +261,10 @@ public:
 
     server_tokens clone() const;
 };
+
+// Scan-time equivalent of server_tokens::boundary_is_chunk_safe for records read
+// from a disk sidecar rather than live media chunks.
+bool boundary_is_chunk_safe(const llama_tokens & cells, const std::vector<server_media_record> & records, size_t idx);
 
 
 //
