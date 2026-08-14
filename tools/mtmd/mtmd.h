@@ -242,6 +242,22 @@ MTMD_API int32_t            mtmd_input_chunk_save(const mtmd_input_chunk * chunk
 // returns nullptr on failure
 MTMD_API mtmd_input_chunk * mtmd_input_chunk_load(const char * buf, size_t len);
 
+// true if the chunk carries no encodable media payload (its image/audio data is a
+// placeholder); such a chunk can be counted and tracked, but encoding it fails.
+MTMD_API bool mtmd_input_chunk_is_placeholder(const mtmd_input_chunk * chunk);
+
+// construct a media chunk carrying only identity metadata (id + token/position
+// geometry) with placeholder pixel/sample data. It is suitable for rebuilding
+// tracking state for already-computed KV, but cannot be encoded.
+// returns nullptr when the requested geometry cannot be reproduced faithfully.
+MTMD_API mtmd_input_chunk * mtmd_input_chunk_init_stub(mtmd_context * ctx,
+                                                       bool          is_audio,
+                                                       const char *  id,
+                                                       uint32_t      n_tokens,
+                                                       llama_pos     n_pos,
+                                                       uint32_t      nx,
+                                                       uint32_t      ny);
+
 
 // mtmd_image_tokens
 //
@@ -256,6 +272,10 @@ DEPRECATED(MTMD_API size_t mtmd_image_tokens_get_nx(const mtmd_image_tokens * im
            "use mtmd_image_tokens_get_decoder_pos() instead");
 DEPRECATED(MTMD_API size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens),
            "use mtmd_image_tokens_get_decoder_pos() instead");
+
+// Raw token-grid dimensions. Unlike decoder positions, these are stable geometry
+// metadata and can be persisted to reconstruct a media chunk stub.
+MTMD_API void mtmd_image_tokens_get_grid(const mtmd_image_tokens * image_tokens, uint32_t * nx, uint32_t * ny);
 
 struct mtmd_decoder_pos {
     uint32_t t;

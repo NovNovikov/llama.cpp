@@ -1061,6 +1061,19 @@ private:
     }
 };
 
+// Select the position type (and, for XD-RoPE, image-index slot) from the vision
+// projector. Both live encoding and reconstructed stubs use this helper so their
+// token and position geometry cannot silently diverge.
+static void mtmd_image_tokens_assign_pos_type(const mtmd_context * ctx,
+                                              mtmd_image_tokens *  image_tokens,
+                                              uint32_t             image_idx) {
+    image_tokens->pos = ctx->pos_type;
+    if (ctx->proj_type_v() == PROJECTOR_TYPE_HUNYUANVL) {
+        image_tokens->pos       = MTMD_POS_TYPE_HUNYUANVL;
+        image_tokens->image_idx = image_idx;
+    }
+}
+
 mtmd_context * mtmd_init_from_file(const char * mmproj_fname,
         const struct llama_model * text_model,
         const struct mtmd_context_params ctx_params) {
@@ -1471,13 +1484,8 @@ struct mtmd_tokenizer {
                     image_tokens->nx = n_tokens;
                     image_tokens->ny = 1;
                 }
-                image_tokens->pos = ctx->pos_type;
-                // HunyuanVL wraps the image grid with BOI/EOI and adds one newline per row,
-                // and uses XD-RoPE (dim-3 = image index). Override the position type so that
-                // n_tokens() and mtmd_image_tokens_get_decoder_pos pick the HunyuanVL layout.
-                if (ctx->proj_type_v() == PROJECTOR_TYPE_HUNYUANVL) {
-                    image_tokens->pos       = MTMD_POS_TYPE_HUNYUANVL;
-                    image_tokens->image_idx = n_images_added;
+                mtmd_image_tokens_assign_pos_type(ctx, image_tokens.get(), n_images_added);
+                if (image_tokens->pos == MTMD_POS_TYPE_HUNYUANVL) {
                     GGML_ASSERT(n_tokens == (size_t)image_tokens->n_tokens());
                 }
 
@@ -2322,6 +2330,53 @@ void mtmd_input_chunk_free(mtmd_input_chunk * chunk) {
     }
 }
 
+bool mtmd_input_chunk_is_placeholder(const mtmd_input_chunk * chunk) {
+    return chunk != nullptr && chunk->is_placeholder();
+}
+
+mtmd_input_chunk * mtmd_input_chunk_init_stub(mtmd_context * ctx,
+                                              bool          is_audio,
+                                              const char *  id,
+                                              uint32_t      n_tokens,
+                                              llama_pos     n_pos,
+                                              uint32_t      nx,
+                                              uint32_t      ny) {
+    if (ctx == nullptr || id == nullptr || id[0] == '\0' || n_tokens == 0) {
+        return nullptr;
+    }
+
+    mtmd_input_chunk * chunk = nullptr;
+    if (is_audio) {
+        if (!ctx->ctx_a) {
+            return nullptr;
+        }
+        mtmd_audio_tokens_ptr audio_tokens(new mtmd_audio_tokens);
+        audio_tokens->n_tokens = n_tokens;
+        audio_tokens->id       = id;
+        audio_tokens->batch_f32.is_audio = true;
+        audio_tokens->batch_f32.entries.emplace_back();
+        chunk = new mtmd_input_chunk{ MTMD_INPUT_CHUNK_TYPE_AUDIO, {}, nullptr, std::move(audio_tokens) };
+    } else {
+        if (!ctx->ctx_v) {
+            return nullptr;
+        }
+        mtmd_image_tokens_ptr image_tokens(new mtmd_image_tokens);
+        image_tokens->nx = nx;
+        image_tokens->ny = ny;
+        mtmd_image_tokens_assign_pos_type(ctx, image_tokens.get(), 0);
+        image_tokens->id = id;
+        image_tokens->batch_f32.entries.emplace_back();
+        chunk = new mtmd_input_chunk{ MTMD_INPUT_CHUNK_TYPE_IMAGE, {}, std::move(image_tokens), nullptr };
+    }
+
+    if (mtmd_input_chunk_get_n_tokens(chunk) != (size_t) n_tokens ||
+        mtmd_input_chunk_get_n_pos(chunk) != n_pos) {
+        mtmd_input_chunk_free(chunk);
+        return nullptr;
+    }
+    return chunk;
+}
+
 int32_t mtmd_input_chunk_save(const mtmd_input_chunk * chunk, char * out_buf, size_t out_len, size_t * expected_out_len) {
     try {
         mtmd_serialization ser(MTMD_SERIALIZATION_VERSION);
@@ -2370,6 +2425,11 @@ size_t mtmd_image_tokens_get_nx(const mtmd_image_tokens * image_tokens) {
 
 size_t mtmd_image_tokens_get_ny(const mtmd_image_tokens * image_tokens) {
     return image_tokens->ny;
+}
+
+void mtmd_image_tokens_get_grid(const mtmd_image_tokens * image_tokens, uint32_t * nx, uint32_t * ny) {
+    *nx = image_tokens->nx;
+    *ny = image_tokens->ny;
 }
 
 mtmd_decoder_pos mtmd_image_tokens_get_decoder_pos(const mtmd_image_tokens * image_tokens, llama_pos pos_0, size_t i) {
