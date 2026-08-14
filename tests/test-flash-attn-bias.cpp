@@ -312,17 +312,26 @@ static void error_stats(const std::vector<float> & got, const std::vector<float>
 }
 
 static void overflow_arithmetic_self_test() {
-    // mirrors the scalar-path offset math; exact offset checked at 128 bits, lands past 2^31
+    // Mirrors the scalar-path offset math and verifies every multiply/add in uint64_t before
+    // executing it. This keeps the test portable to MSVC, which has no __int128 extension.
     const uint64_t nb0 = sizeof(float);
     const uint64_t nb1 = 1024*nb0;
     const uint64_t nb2 = 64*nb1;
     const uint64_t nb3 = 131072*nb2;
     const uint64_t dist = 1023, head = 63, query = 131071, batch = 3;
+    uint64_t exact = 0;
+    const auto add_product = [&exact](uint64_t lhs, uint64_t rhs) {
+        GGML_ASSERT(lhs == 0 || rhs <= UINT64_MAX/lhs);
+        const uint64_t product = lhs*rhs;
+        GGML_ASSERT(exact <= UINT64_MAX - product);
+        exact += product;
+    };
+    add_product(dist,  nb0);
+    add_product(head,  nb1);
+    add_product(query, nb2);
+    add_product(batch, nb3);
     const uint64_t offset = dist*nb0 + head*nb1 + query*nb2 + batch*nb3;
-    __extension__ typedef unsigned __int128 uint128_t;
-    const uint128_t exact = uint128_t(dist)*nb0 + uint128_t(head)*nb1 +
-        uint128_t(query)*nb2 + uint128_t(batch)*nb3;
-    GGML_ASSERT(exact <= UINT64_MAX && offset == (uint64_t) exact && offset > INT32_MAX);
+    GGML_ASSERT(offset == exact && offset > INT32_MAX);
 
     const int64_t nq = int64_t(1) << 40;
     const int64_t nkv = nq + 8192;
