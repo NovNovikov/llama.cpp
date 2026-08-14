@@ -1707,6 +1707,21 @@ static void test_msg_token_delimiters_split() {
         assert_equals<int32_t>(-1, spans.nth_last_assistant_message_pos(5));
     }
 
+    // A final assistant marker can be only a generation prompt that closes the preceding user
+    // turn and contains post-history instructions. It must not be used as a historical-assistant
+    // checkpoint boundary.
+    {
+        common_chat_msg_spans spans;
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT, 0, 4);
+        spans.add(COMMON_CHAT_ROLE_USER,      4, 3);
+        spans.add(COMMON_CHAT_ROLE_ASSISTANT, 7, 5);
+
+        assert_equals<int32_t>(0, spans.first_historical_assistant_message_pos());
+        assert_equals<int32_t>(4, spans.last_historical_assistant_message_end());
+        assert_equals<int32_t>(0, spans.nth_last_historical_assistant_message_pos(1));
+        assert_equals<int32_t>(-1, spans.nth_last_historical_assistant_message_pos(2));
+    }
+
     {
         common_chat_msg_spans spans;
         spans.add(COMMON_CHAT_ROLE_ASSISTANT,  0, 4);

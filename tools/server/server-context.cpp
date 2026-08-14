@@ -6506,9 +6506,16 @@ private:
                     }
 
                     const auto & spans = slot.task->params.message_spans;
-                    const auto first_assistant_pos = spans.first_assistant_message_pos();
-                    const auto last_assistant_end  = spans.last_assistant_message_end();
-                    const auto fifth_last_assistant_pos = spans.nth_last_assistant_message_pos(5);
+                    const auto first_assistant_pos = spans.first_historical_assistant_message_pos();
+                    const auto last_assistant_end  = spans.last_historical_assistant_message_end();
+                    const auto fifth_last_assistant_pos = spans.nth_last_historical_assistant_message_pos(5);
+                    const auto terminal_assistant_end = spans.last_assistant_message_end();
+                    if (terminal_assistant_end >= 0 && terminal_assistant_end != last_assistant_end) {
+                        SLT_INF(slot,
+                                "checkpointing: ignoring terminal assistant span after the final user message "
+                                "(end = %d, last historical assistant end = %d)\n",
+                                terminal_assistant_end, last_assistant_end);
+                    }
                     const char * chunk_stop_reason = "prompt_exhausted";
                     int64_t chunk_stop_target = -1;
                     int32_t batch_fill_limit = n_batch;

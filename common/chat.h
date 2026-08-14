@@ -198,9 +198,33 @@ struct common_chat_msg_spans {
         return -1;
     }
 
+    // A rendered prompt may finish with an assistant marker that closes the final user turn and
+    // starts generation instructions. That span is not a historical assistant reply.
+    int32_t first_historical_assistant_message_pos() const {
+        const int32_t last_user_pos = last_user_message_pos();
+        for (const auto & span : spans) {
+            if (span.role == COMMON_CHAT_ROLE_ASSISTANT &&
+                (last_user_pos < 0 || (int32_t) span.pos < last_user_pos)) {
+                return (int32_t) span.pos;
+            }
+        }
+        return -1;
+    }
+
     int32_t last_assistant_message_end() const {
         for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
             if (it->role == COMMON_CHAT_ROLE_ASSISTANT) {
+                return (int32_t) (it->pos + it->len);
+            }
+        }
+        return -1;
+    }
+
+    int32_t last_historical_assistant_message_end() const {
+        const int32_t last_user_pos = last_user_message_pos();
+        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_ASSISTANT &&
+                (last_user_pos < 0 || (int32_t) it->pos < last_user_pos)) {
                 return (int32_t) (it->pos + it->len);
             }
         }
@@ -225,6 +249,20 @@ struct common_chat_msg_spans {
         for (const auto & span : spans) {
             if (span.role == COMMON_CHAT_ROLE_USER) {
                 return (int32_t) span.pos;
+            }
+        }
+        return -1;
+    }
+
+    int32_t nth_last_historical_assistant_message_pos(size_t n) const {
+        if (n == 0) {
+            return -1;
+        }
+        const int32_t last_user_pos = last_user_message_pos();
+        for (auto it = spans.rbegin(); it != spans.rend(); ++it) {
+            if (it->role == COMMON_CHAT_ROLE_ASSISTANT &&
+                (last_user_pos < 0 || (int32_t) it->pos < last_user_pos) && --n == 0) {
+                return (int32_t) it->pos;
             }
         }
         return -1;
