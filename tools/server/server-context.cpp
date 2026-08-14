@@ -5025,6 +5025,20 @@ private:
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
+        const int64_t n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
+
+        // A disk restore already reconstructs a RAM checkpoint at its exact resume position. If
+        // the next scheduled boundary falls in the first resumed batch, do not serialize that
+        // identical KV state a second time: it is redundant and can disturb the resumed batch.
+        for (const auto & checkpoint : slot.prompt.checkpoints) {
+            if (checkpoint.n_tokens == n_tokens &&
+                checkpoint.pos_min == pos_min && checkpoint.pos_max == pos_max) {
+                SLT_TRC(slot,
+                        "skipping duplicate context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ")\n",
+                        pos_min, pos_max, n_tokens);
+                return;
+            }
+        }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
@@ -5068,7 +5082,7 @@ private:
         // [TAG_CHECKPOINTS_FIX_POS_MIN]
         // TODO: here we incorrectly deterimne that the saved checkpoint data covers the [pos_min, pos_max] range
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
-        cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
+        cur.update_pos(n_tokens, pos_min, pos_max);
 
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
