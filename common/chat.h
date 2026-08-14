@@ -218,6 +218,17 @@ struct common_chat_msg_spans {
         }
         return -1;
     }
+
+    // Token offset of the first user message: the end of the leading shared
+    // system/developer/tool/RAG context. -1 when no user span was detected.
+    int32_t first_user_message_pos() const {
+        for (const auto & span : spans) {
+            if (span.role == COMMON_CHAT_ROLE_USER) {
+                return (int32_t) span.pos;
+            }
+        }
+        return -1;
+    }
 };
 
 struct common_chat_msg_delimiter {

@@ -601,9 +601,14 @@ struct server_prompt {
 
     std::list<common_prompt_checkpoint> checkpoints;
 
+    // First user-message offset captured when the task starts. It is persistent
+    // slot state, unlike server_task which may have finished by a later disk save.
+    int32_t ctx_boundary = -1;
+
     void clear() {
         tokens.clear();
         checkpoints.clear();
+        ctx_boundary = -1;
     }
 
     int n_tokens() const {
@@ -611,10 +616,12 @@ struct server_prompt {
     }
 
     server_prompt clone() const {
-        return server_prompt {
+        server_prompt result {
             tokens.clone(),
             checkpoints,
         };
+        result.ctx_boundary = ctx_boundary;
+        return result;
     }
 };
 

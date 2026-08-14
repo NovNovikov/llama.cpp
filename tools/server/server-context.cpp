@@ -5757,6 +5757,10 @@ private:
                         slot.t_start_process_prompt = ggml_time_us();
                         slot.t_start_generation = 0;
 
+                        // Persist the shared-context boundary on the slot. Later checkpoint work must
+                        // not depend on server_task still being alive after a request has completed.
+                        slot.prompt.ctx_boundary = slot.task->params.message_spans.first_user_message_pos();
+
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
 
                         SLT_TRC(slot, "new prompt, n_ctx_slot = %d, n_keep = %d, task.n_tokens = %d\n",
