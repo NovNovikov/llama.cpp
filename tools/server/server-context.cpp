@@ -776,10 +776,12 @@ static void slot_save_enforce_limits(const std::string & dir,
 
 static constexpr uint32_t SLOT_META_MAGIC   = 0x544D4B4Cu; // "LKMT" (llama kv meta), LE
 static constexpr uint32_t SLOT_META_VERSION = 1u;
-// Delta-node meta: the v1 layout followed by parent_id + [range_lo, range_hi). Version 2 is reserved
-// for the -mm branch's media meta so the eventual main-patched merge stays collision-free
-// (v1 = whole snapshot, v2 = media, v3 = delta node).
+// Media whole snapshots use v2 (v1 layout + projector/media identity records). Delta nodes retain
+// v3, which keeps all existing incremental cache sidecars byte-compatible.
+static constexpr uint32_t SLOT_META_VERSION_MEDIA = 2u;
 static constexpr uint32_t SLOT_META_VERSION_NODE = 3u;
+static constexpr uint32_t SLOT_META_MEDIA_MAX = 4096u;
+static constexpr uint32_t SLOT_META_ID_MAX    = 256u;
 
 // Model/quant/context fingerprint that MUST match for a restore to be sound. All
 // fields are stable inference-affecting identity captured once at model load and
@@ -820,6 +822,9 @@ struct model_fp {
     // Removing this bit later would require proving the text KV layout is identical across the two
     // deployment shapes.
     uint32_t fp_mmproj_loaded   = 0;
+    // Projector identity is persisted only by v2 media sidecars. Text-only v1/v3 units remain
+    // projector-independent and therefore keep their frozen layout.
+    uint64_t fp_mmproj          = 0;
 
     // exact field-by-field equality (C++17: no defaulted operator==). Any difference REFUSES the
     // restore (invariant 3). Note: fp_block is intentionally part of identity — a snapshot hashed
@@ -834,7 +839,8 @@ struct model_fp {
                fp_rope_base == o.fp_rope_base && fp_yarn_ext == o.fp_yarn_ext &&
                fp_yarn_attn == o.fp_yarn_attn && fp_yarn_beta_fast == o.fp_yarn_beta_fast &&
                fp_yarn_beta_slow == o.fp_yarn_beta_slow && fp_yarn_orig_ctx == o.fp_yarn_orig_ctx &&
-               fp_lora == o.fp_lora && fp_mmproj_loaded == o.fp_mmproj_loaded;
+               fp_lora == o.fp_lora && fp_mmproj_loaded == o.fp_mmproj_loaded &&
+               fp_mmproj == o.fp_mmproj;
     }
 };
 
@@ -942,7 +948,22 @@ static bool slot_meta_write(const std::string & state_filepath,
                             bool     is_node   = false, // true => delta-node meta (v3) with parent+range
                             uint64_t parent_id = 0,     // parent node's chain_hash (0 = root)
                             uint32_t range_lo  = 0,     // this node's .bin holds KV cells [range_lo,
-                            uint32_t range_hi  = 0) {   // range_hi); ignored for a whole snapshot
+                            uint32_t range_hi  = 0,     // range_hi); ignored for a whole snapshot
+                            const std::vector<server_media_record> & media = {}) {
+    // Media deltas need a separate format because v3's parent/range record follows the token list.
+    // Keep this writer conservative until that format is introduced rather than producing an
+    // ambiguous sidecar.
+    if (is_node && !media.empty()) {
+        return false;
+    }
+    if (media.size() > SLOT_META_MEDIA_MAX) {
+        return false;
+    }
+    for (const auto & record : media) {
+        if (record.id.empty() || record.id.size() > SLOT_META_ID_MAX) {
+            return false;
+        }
+    }
     const std::string sidecar = slot_meta_sidecar_path(state_filepath);
     const std::string tmp     = sidecar + ".tmp";
 
@@ -964,7 +985,7 @@ static bool slot_meta_write(const std::string & state_filepath,
         put_u32((uint32_t)(v >> 32));
     };
     put_u32(SLOT_META_MAGIC);
-    put_u32(is_node ? SLOT_META_VERSION_NODE : SLOT_META_VERSION);
+    put_u32(is_node ? SLOT_META_VERSION_NODE : (media.empty() ? SLOT_META_VERSION : SLOT_META_VERSION_MEDIA));
     put_u64(fp.fp_model);
     put_u32(fp.fp_n_vocab);
     put_u32(fp.fp_n_ctx_train);
@@ -992,6 +1013,22 @@ static bool slot_meta_write(const std::string & state_filepath,
     // token IDs as raw LE int32 (llama_token == int32_t; llama.cpp's on-disk
     // contract is native-LE, matching slot_logits_write's float payload).
     f.write((const char *) toks.data(), (std::streamsize) toks.size() * sizeof(int32_t));
+    // v2: media identity data needed to verify a future request and to rehydrate tracking after
+    // a disk restore. It follows the frozen v1 payload so text-only sidecars stay byte-identical.
+    if (!media.empty()) {
+        put_u64(fp.fp_mmproj);
+        put_u32((uint32_t) media.size());
+        for (const auto & record : media) {
+            put_u32(record.start_idx);
+            put_u32(record.n_tokens);
+            put_u32(record.n_pos);
+            put_u32(record.nx);
+            put_u32(record.ny);
+            put_u32(record.is_audio);
+            put_u32((uint32_t) record.id.size());
+            f.write(record.id.data(), (std::streamsize) record.id.size());
+        }
+    }
     // delta-node section (v3 only): the KV .bin holds only cells [range_lo, range_hi); parent_id
     // chains this node to the snapshot it extends (0 = root). Absent from a whole-snapshot v1 meta,
     // so v1 bytes stay byte-identical.
@@ -1026,9 +1063,13 @@ static bool slot_meta_read(const std::string & state_filepath,
                            llama_tokens & toks_out,
                            uint64_t * parent_out   = nullptr,  // delta-node fields (v3); for a v1
                            uint32_t * range_lo_out = nullptr,  // whole snapshot they default to a
-                           uint32_t * range_hi_out = nullptr) {// root covering [0, tok_count)
+                           uint32_t * range_hi_out = nullptr,  // root covering [0, tok_count)
+                           std::vector<server_media_record> * media_out = nullptr) {
     fp_out = model_fp{};
     toks_out.clear();
+    if (media_out) {
+        media_out->clear();
+    }
     const std::string sidecar = slot_meta_sidecar_path(state_filepath);
     std::ifstream f(sidecar, std::ios::binary);
     if (!f) {
@@ -1056,7 +1097,7 @@ static bool slot_meta_read(const std::string & state_filepath,
         return false;
     }
     if (magic != SLOT_META_MAGIC ||
-        (version != SLOT_META_VERSION && version != SLOT_META_VERSION_NODE)) {
+        (version != SLOT_META_VERSION && version != SLOT_META_VERSION_MEDIA && version != SLOT_META_VERSION_NODE)) {
         return false;
     }
     model_fp fp;
@@ -1086,6 +1127,52 @@ static bool slot_meta_read(const std::string & state_filepath,
         toks_out.clear();
         return false;
     }
+    std::vector<server_media_record> media;
+    if (version == SLOT_META_VERSION_MEDIA) {
+        uint32_t n_media = 0;
+        if (!get_u64(fp.fp_mmproj) || !get_u32(n_media) || n_media == 0 || n_media > SLOT_META_MEDIA_MAX) {
+            toks_out.clear();
+            return false;
+        }
+        uint64_t next_free = 0;
+        uint64_t n_covered = 0;
+        media.reserve(n_media);
+        for (uint32_t i = 0; i < n_media; ++i) {
+            server_media_record record;
+            uint32_t id_len = 0;
+            if (!get_u32(record.start_idx) || !get_u32(record.n_tokens) || !get_u32(record.n_pos) ||
+                !get_u32(record.nx) || !get_u32(record.ny) || !get_u32(record.is_audio) ||
+                !get_u32(id_len) || id_len == 0 || id_len > SLOT_META_ID_MAX ||
+                record.n_tokens == 0 || (uint64_t) record.start_idx < next_free ||
+                (uint64_t) record.start_idx + record.n_tokens > tok_count) {
+                toks_out.clear();
+                return false;
+            }
+            record.id.resize(id_len);
+            f.read(&record.id[0], (std::streamsize) id_len);
+            if (f.gcount() != (std::streamsize) id_len) {
+                toks_out.clear();
+                return false;
+            }
+            for (uint32_t pos = record.start_idx; pos < record.start_idx + record.n_tokens; ++pos) {
+                if (toks_out[pos] != LLAMA_TOKEN_NULL) {
+                    toks_out.clear();
+                    return false;
+                }
+            }
+            next_free = (uint64_t) record.start_idx + record.n_tokens;
+            n_covered += record.n_tokens;
+            media.push_back(std::move(record));
+        }
+        uint64_t n_null = 0;
+        for (const llama_token token : toks_out) {
+            n_null += token == LLAMA_TOKEN_NULL;
+        }
+        if (n_covered != n_null || f.peek() != std::char_traits<char>::eof()) {
+            toks_out.clear();
+            return false;
+        }
+    }
     // defaults for a whole-snapshot (v1) meta: it is its own root covering [0, tok_count).
     uint64_t parent_id = 0;
     uint32_t range_lo  = 0;
@@ -1099,6 +1186,7 @@ static bool slot_meta_read(const std::string & state_filepath,
     if (parent_out)   { *parent_out   = parent_id; }
     if (range_lo_out) { *range_lo_out = range_lo; }
     if (range_hi_out) { *range_hi_out = range_hi; }
+    if (media_out)    { *media_out    = std::move(media); }
     fp_out = fp;
     return true;
 }
