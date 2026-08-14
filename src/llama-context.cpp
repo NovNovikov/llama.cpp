@@ -3070,6 +3070,37 @@ size_t llama_context::state_seq_get_data(llama_seq_id seq_id, uint8_t * dst, siz
     }
 }
 
+size_t llama_context::state_seq_get_size_range(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    llama_io_write_dummy io(false);
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+        if (memory) {
+            memory->state_write_range(io, seq_id, p0, p1, 0);
+        }
+        return io.n_bytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error getting range state size: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
+size_t llama_context::state_seq_get_data_range(
+        llama_seq_id seq_id, llama_pos p0, llama_pos p1, uint8_t * dst, size_t size) {
+    llama_io_write_host io(dst, size);
+    try {
+        io.write(&io_magic, sizeof(io_magic));
+        io.write(&seq_id, sizeof(seq_id));
+        if (memory) {
+            memory->state_write_range(io, seq_id, p0, p1, 0);
+        }
+        return io.n_bytes();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving range state: %s\n", __func__, err.what());
+        return 0;
+    }
+}
+
 size_t llama_context::state_seq_set_data(llama_seq_id seq_id, const uint8_t * src, size_t size, llama_state_seq_flags flags) {
     std::unique_ptr<llama_io_read_i> io;
     if (flags & LLAMA_STATE_SEQ_FLAGS_ON_DEVICE) {
@@ -4199,10 +4230,51 @@ size_t llama_state_seq_get_data_ext(llama_context * ctx, uint8_t * dst, size_t s
 
     return ctx->state_seq_get_data(seq_id, dst, size, flags);
 }
+size_t llama_state_seq_get_size_range(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    ctx->synchronize();
+
+    return ctx->state_seq_get_size_range(seq_id, p0, p1);
+}
+size_t llama_state_seq_get_data_range(
+        llama_context * ctx, uint8_t * dst, size_t size, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    ctx->synchronize();
+
+    return ctx->state_seq_get_data_range(seq_id, p0, p1, dst, size);
+}
 size_t llama_state_seq_set_data_ext(llama_context * ctx, const uint8_t * src, size_t size, llama_seq_id seq_id, llama_state_seq_flags flags) {
     ctx->synchronize();
 
     return ctx->state_seq_set_data(seq_id, src, size, flags);
+}
+size_t llama_state_seq_save_file_data(
+        const char * filepath, const uint8_t * state_data, size_t state_size,
+        const llama_token * tokens, size_t n_token_count) {
+    constexpr size_t state_header_size = sizeof(uint32_t) + sizeof(llama_seq_id);
+    if (state_data == nullptr || state_size < state_header_size ||
+        (tokens == nullptr && n_token_count != 0) ||
+        n_token_count > std::numeric_limits<uint32_t>::max()) {
+        return 0;
+    }
+
+    uint32_t magic = 0;
+    std::memcpy(&magic, state_data, sizeof(magic));
+    if (magic != io_magic) {
+        LLAMA_LOG_ERROR("%s: invalid sequence state data\n", __func__);
+        return 0;
+    }
+
+    try {
+        llama_file file(filepath, "wb");
+        file.write_u32(LLAMA_STATE_SEQ_MAGIC);
+        file.write_u32(LLAMA_STATE_SEQ_VERSION);
+        file.write_u32((uint32_t) n_token_count);
+        file.write_raw(tokens, sizeof(llama_token)*n_token_count);
+        file.write_raw(state_data + state_header_size, state_size - state_header_size);
+        return file.tell();
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: error saving sequence state file: %s\n", __func__, err.what());
+        return 0;
+    }
 }
 
 size_t llama_state_seq_save_file(llama_context * ctx, const char * filepath, llama_seq_id seq_id, const llama_token * tokens, size_t n_token_count) {

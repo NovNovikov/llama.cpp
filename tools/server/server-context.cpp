@@ -23,6 +23,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <ctime>
 #include <cstddef>
 #include <cstdint>
@@ -45,6 +46,7 @@
 #include <unordered_set>
 #include <utility>
 #include <unordered_map>
+#include <thread>
 
 #ifndef _WIN32
 #include <unistd.h> // getpid() for per-writer-unique temp filenames (cross-process atomicity)
@@ -2279,6 +2281,7 @@ public:
     }
 
     ~server_context_impl() {
+        auto_writer_stop_and_join();
         if (!sleeping) {
             // destroy() is already called when entering sleeping state
             // we don't call it again here to avoid double free
@@ -2371,11 +2374,167 @@ private:
     auto_cache_index auto_idx;
     model_fp         cur_fp;
 
+    // The worker owns at most one captured host-state blob. A second checkpoint
+    // while it is writing is intentionally skipped rather than queuing another
+    // multi-hundred-MiB copy or delaying prompt processing.
+    struct auto_snapshot_job {
+        int slot_id = -1;
+        std::string fname;
+        model_fp fp;
+        llama_tokens toks;
+        std::vector<server_media_record> media;
+        std::vector<uint64_t> block_hashes;
+        std::vector<uint8_t> state_data;
+        std::vector<float> logits;
+        int n_vocab = 0;
+        bool have_parent = false;
+        uint64_t parent_id = 0;
+        uint32_t parent_hi = 0;
+    };
+
+    std::mutex auto_writer_mtx;
+    std::condition_variable auto_writer_cv;
+    std::optional<auto_snapshot_job> auto_writer_job;
+    std::thread auto_writer_thread;
+    bool auto_writer_busy = false;
+    bool auto_writer_stop = false;
+
     // The ONE gate for the entire auto disk cache. When false, NO hook below does
     // any work (no scan, no hash, no alloc). This is invariant 1 — the first
     // statement of every auto_* hook is `if (!auto_cache_enabled()) return;`.
     bool auto_cache_enabled() const {
         return params_base.slot_save_auto && !params_base.slot_save_path.empty();
+    }
+
+    bool auto_publish_snapshot(auto_snapshot_job && job) {
+        static std::atomic<uint64_t> s_tmp_nonce{0};
+        const uint64_t nonce = s_tmp_nonce.fetch_add(1, std::memory_order_relaxed);
+        const std::string tmp = job.fname + "." + std::to_string((long) getpid()) + "." +
+                                std::to_string(nonce) + ".tmp";
+
+        const size_t nwrite = llama_state_seq_save_file_data(
+            tmp.c_str(), job.state_data.data(), job.state_data.size(), job.toks.data(), job.toks.size());
+        if (nwrite == 0) {
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            SRV_WRN("auto-save: background snapshot write failed for slot %d\n", job.slot_id);
+            return false;
+        }
+        if (!job.logits.empty()) {
+            slot_logits_write(tmp, job.logits, job.n_vocab, (uint32_t) job.toks.size());
+        }
+        const bool meta_ok = job.have_parent
+            ? slot_meta_write(tmp, job.fp, job.toks, job.block_hashes.back(), /*is_node=*/true,
+                              job.parent_id, job.parent_hi, (uint32_t) job.toks.size(), job.media)
+            : slot_meta_write(tmp, job.fp, job.toks, job.block_hashes.back(), false, 0, 0, 0, job.media);
+        if (!meta_ok) {
+            std::error_code ec;
+            std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
+            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+            return false;
+        }
+
+        std::error_code ec;
+        std::filesystem::rename(tmp, job.fname, ec);
+        if (ec) {
+            std::filesystem::remove(tmp, ec);
+            std::filesystem::remove(slot_logits_sidecar_path(tmp), ec);
+            std::filesystem::remove(slot_meta_sidecar_path(tmp), ec);
+            return false;
+        }
+        std::filesystem::rename(slot_logits_sidecar_path(tmp), slot_logits_sidecar_path(job.fname), ec);
+        ec.clear();
+        std::filesystem::rename(slot_meta_sidecar_path(tmp), slot_meta_sidecar_path(job.fname), ec);
+        if (ec) {
+            std::error_code rec;
+            std::filesystem::remove(job.fname, rec);
+            std::filesystem::remove(slot_logits_sidecar_path(job.fname), rec);
+            std::filesystem::remove(slot_logits_sidecar_path(tmp), rec);
+            std::filesystem::remove(slot_meta_sidecar_path(tmp), rec);
+            return false;
+        }
+
+        SRV_INF("auto-save: background snapshot saved (%s, tokens=%zu, range=[%u,%zu)) to %s\n",
+                job.have_parent ? (job.media.empty() ? "delta" : "media-delta") :
+                                  (job.media.empty() ? "whole" : "media-whole"),
+                job.toks.size(), job.have_parent ? job.parent_hi : 0, job.toks.size(), job.fname.c_str());
+
+        {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto_cache_entry e{ job.fname, (uint32_t) job.toks.size(), job.fp };
+            for (uint64_t bh : job.block_hashes) {
+                auto_index_insert_locked(bh, e);
+            }
+            auto_idx.indexed_files.insert(job.fname);
+        }
+        bool oversized = false;
+        if (auto_cache_enabled() &&
+            (params_base.slot_save_max_count > 0 || params_base.slot_save_max_bytes > 0)) {
+            slot_save_enforce_limits(params_base.slot_save_path,
+                                     params_base.slot_save_max_count,
+                                     params_base.slot_save_max_bytes,
+                                     job.fname, oversized);
+        }
+        {
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto_index_drop_missing_locked();
+            std::error_code mec;
+            const auto dmt = std::filesystem::last_write_time(params_base.slot_save_path, mec);
+            if (!mec) {
+                auto_idx.dir_mtime = dmt;
+            }
+        }
+        return !oversized;
+    }
+
+    void auto_writer_start() {
+        if (auto_writer_thread.joinable()) {
+            return;
+        }
+        auto_writer_thread = std::thread([this] {
+            while (true) {
+                auto_snapshot_job job;
+                {
+                    std::unique_lock<std::mutex> lk(auto_writer_mtx);
+                    auto_writer_cv.wait(lk, [this] { return auto_writer_stop || auto_writer_job.has_value(); });
+                    if (!auto_writer_job.has_value()) {
+                        return;
+                    }
+                    job = std::move(*auto_writer_job);
+                    auto_writer_job.reset();
+                }
+                auto_publish_snapshot(std::move(job));
+                {
+                    std::lock_guard<std::mutex> lk(auto_writer_mtx);
+                    auto_writer_busy = false;
+                }
+                auto_writer_cv.notify_all();
+            }
+        });
+    }
+
+    bool auto_enqueue_snapshot(auto_snapshot_job && job) {
+        std::lock_guard<std::mutex> lk(auto_writer_mtx);
+        if (auto_writer_busy) {
+            return false;
+        }
+        auto_writer_start();
+        auto_writer_busy = true;
+        auto_writer_job.emplace(std::move(job));
+        auto_writer_cv.notify_one();
+        return true;
+    }
+
+    void auto_writer_stop_and_join() {
+        {
+            std::lock_guard<std::mutex> lk(auto_writer_mtx);
+            auto_writer_stop = true;
+        }
+        auto_writer_cv.notify_all();
+        if (auto_writer_thread.joinable()) {
+            auto_writer_thread.join();
+        }
     }
 
     void destroy() {
@@ -3092,7 +3251,8 @@ private:
     // indexed), enforces the bounded LRU, then reconciles the index. Invariant 1: first statement
     // is the gate. `prefix_tokens` is normally SIZE_MAX (the whole live prompt); a RAM checkpoint
     // passes its own prefix length while the context still holds that exact checkpoint state.
-    bool auto_save_slot_if_useful(server_slot & slot, size_t prefix_tokens = SIZE_MAX) {
+    bool auto_save_slot_if_useful(
+            server_slot & slot, size_t prefix_tokens = SIZE_MAX, bool queue_background = false) {
         if (!auto_cache_enabled()) {
             return false; // off by default
         }
@@ -3258,6 +3418,50 @@ private:
         const std::string fname = have_parent
             ? auto_delta_state_filename(full_hash, toks.size())
             : auto_state_filename(full_hash, toks.size());
+        if (queue_background) {
+            const llama_pos range_lo = have_parent ? slot.prompt.tokens.pos_next(parent_hi) : -1;
+            const size_t state_size = have_parent
+                ? llama_state_seq_get_size_range(ctx_tgt, slot.id, range_lo, -1)
+                : llama_state_seq_get_size_ext(ctx_tgt, slot.id, 0);
+            if (state_size == 0) {
+                SLT_WRN(slot, "auto-save: failed to capture background snapshot size\n");
+                return false;
+            }
+
+            auto_snapshot_job job;
+            job.slot_id = slot.id;
+            job.fname = fname;
+            job.fp = cur_fp;
+            job.toks = std::move(toks);
+            job.media = std::move(media);
+            job.block_hashes = bhs;
+            job.have_parent = have_parent;
+            job.parent_id = parent_id;
+            job.parent_hi = parent_hi;
+            job.state_data.resize(state_size);
+            const size_t ncopy = have_parent
+                ? llama_state_seq_get_data_range(ctx_tgt, job.state_data.data(), job.state_data.size(),
+                                                 slot.id, range_lo, -1)
+                : llama_state_seq_get_data_ext(ctx_tgt, job.state_data.data(), job.state_data.size(), slot.id, 0);
+            if (ncopy != job.state_data.size()) {
+                SLT_WRN(slot, "auto-save: failed to capture background snapshot data\n");
+                return false;
+            }
+            if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL &&
+                slot.logits_last_n_tokens == (int32_t) job.toks.size() && !slot.logits_last.empty()) {
+                job.logits = slot.logits_last;
+                job.n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
+            }
+            if (!auto_enqueue_snapshot(std::move(job))) {
+                // A single active blob is deliberate: keep the prompt path moving and
+                // never accumulate three additional full-state copies in host RAM.
+                SLT_INF(slot, "auto-save: background writer busy; skipping checkpoint snapshot\n");
+                return true;
+            }
+            SLT_INF(slot, "auto-save: checkpoint snapshot handed to background writer (tokens=%zu)\n",
+                    prefix_tokens);
+            return true;
+        }
         // cross-process atomicity: the temp path MUST be unique per writer. The final
         // name (fname) is deterministic (fp + chain hash + tok count), so two processes sharing one
         // --slot-save-path would otherwise both stream a multi-GB state into the SAME "<fname>.tmp"
@@ -6757,7 +6961,7 @@ private:
                         // that same prefix now, while ctx_tgt still contains its exact state, rather
                         // than waiting for the final prompt token and saving only the tail state.
                         slot.auto_disk_checkpoint_published =
-                            auto_save_slot_if_useful(slot, n_tokens_start) ||
+                            auto_save_slot_if_useful(slot, n_tokens_start, /*queue_background=*/true) ||
                             slot.auto_disk_checkpoint_published;
                     }
 
