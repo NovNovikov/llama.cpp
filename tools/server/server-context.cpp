@@ -841,7 +841,12 @@ struct model_fp {
                fp_yarn_attn == o.fp_yarn_attn && fp_yarn_beta_fast == o.fp_yarn_beta_fast &&
                fp_yarn_beta_slow == o.fp_yarn_beta_slow && fp_yarn_orig_ctx == o.fp_yarn_orig_ctx &&
                fp_lora == o.fp_lora && fp_mmproj_loaded == o.fp_mmproj_loaded &&
-               fp_mmproj == o.fp_mmproj;
+               // v1 text and v3 text-delta sidecars deliberately do not carry a
+               // projector hash. Zero is therefore an "identity not applicable"
+               // sentinel for those formats, not a hash mismatch. v2 media
+               // sidecars always carry a nonzero projector fingerprint, and so
+               // still require an exact match.
+               (fp_mmproj == 0 || o.fp_mmproj == 0 || fp_mmproj == o.fp_mmproj);
     }
 };
 
