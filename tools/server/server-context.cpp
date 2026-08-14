@@ -1029,9 +1029,19 @@ static std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
         } else {
             h = auto_hash_mix(h, cells[i]);
         }
-        if ((i + 1) % (size_t) B == 0 && boundary_is_chunk_safe(cells, media, i + 1)) {
+        // A media chunk can cover every block-aligned position in a short prompt.
+        // Its end is also a safe deterministic resume point, so index it as well.
+        const bool at_chunk_end = cells[i] == LLAMA_TOKEN_NULL && record_index < media.size() &&
+                                  i + 1 == (size_t) media[record_index].start_idx + media[record_index].n_tokens;
+        if (((i + 1) % (size_t) B == 0 || at_chunk_end) &&
+            boundary_is_chunk_safe(cells, media, i + 1)) {
             out.push_back(h);
         }
+    }
+    // A complete prompt never ends inside a chunk. Keep even a tiny media-only
+    // prompt indexable when it did not cross either a block or a chunk boundary.
+    if (out.empty() && !cells.empty() && boundary_is_chunk_safe(cells, media, cells.size())) {
+        out.push_back(h);
     }
     return out;
 }
