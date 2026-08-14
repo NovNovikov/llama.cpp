@@ -977,6 +977,12 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     if (params.slot_save_block <= 0) {
         throw std::invalid_argument("--slot-save-block must be > 0");
     }
+    // idle-delay flush is inert without the master switch (auto_idle_flush_enabled() gates on
+    // auto_cache_enabled()); reject an explicit --slot-save-idle-seconds without --slot-save-auto
+    // rather than silently ignoring it. The default (unset) is left alone so plain servers still run.
+    if (params.slot_save_idle_seconds_set && !params.slot_save_auto) {
+        throw std::invalid_argument("--slot-save-idle-seconds requires --slot-save-auto");
+    }
 
     return true;
 }
@@ -3643,6 +3649,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
                       "further traffic; requires --slot-save-auto (default: %d, -1 = disabled)", params.slot_save_idle_seconds),
         [](common_params & params, int value) {
             params.slot_save_idle_seconds = value;
+            params.slot_save_idle_seconds_set = true;
         }
     ).set_env("LLAMA_ARG_SLOT_SAVE_IDLE_SECONDS").set_examples({LLAMA_EXAMPLE_SERVER}));
     add_opt(common_arg(
