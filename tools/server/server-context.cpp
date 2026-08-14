@@ -2846,6 +2846,16 @@ private:
             : (disk_media.empty() ? "whole" : "media-whole");
         SLT_INF(slot, "auto-restore: disk candidate kind=%s, tokens=%zu, file=%s\n",
                 disk_kind, disk_toks.size(), cand.state_path.c_str());
+        // Loading a base followed by a range-state delta with NO_CLEAR can leave the
+        // physical KV allocator full even though the restored sequence has only the
+        // advertised number of tokens. A subsequent prefill then fails at a seemingly
+        // arbitrary position. Never restore that unsafe format: it is a cache miss, not
+        // a request failure. New automatic snapshots are written as standalone states.
+        if (disk_is_delta) {
+            SLT_WRN(slot, "auto-restore: disk delta snapshot disabled after unsafe KV allocation restore; recomputing, file=%s\n",
+                    cand.state_path.c_str());
+            return 0;
+        }
         const llama_tokens & req_cells = req.get_cell_tokens();
         std::vector<server_media_record> req_media;
         try {
@@ -3122,7 +3132,11 @@ private:
         bool     have_parent = false;
         uint64_t parent_id   = 0;
         uint32_t parent_hi   = 0;
-        if (params_base.slot_save_incremental) {
+        // The range-state compose loader is disabled above until it can restore a
+        // chain without corrupting the allocator's free-cell accounting. Retain the
+        // implementation for that future fix, but publish only whole snapshots now.
+        const bool incremental_state_restore_safe = false;
+        if (incremental_state_restore_safe && params_base.slot_save_incremental) {
             for (const auto_cache_entry & cand : auto_index_lookup(toks, media, /*max_attempts=*/SIZE_MAX)) {
                 model_fp     disk_fp;
                 llama_tokens disk_toks;
