@@ -967,9 +967,13 @@ static bool mmproj_header_fingerprint(const std::string & path, uint64_t & out) 
 // chain is salted with `salt` (the model fingerprint hash) so two different models
 // can never produce the same boundary hash for identical tokens. A trailing
 // partial block is NOT a boundary (only whole-block prefixes are index keys).
-static std::vector<uint64_t> auto_block_hashes(const llama_tokens & toks, int B, uint64_t salt) {
+static std::vector<uint64_t> auto_block_hashes(
+        const llama_tokens & toks, int B, uint64_t salt, uint64_t * full_hash_out = nullptr) {
     std::vector<uint64_t> out;
     if (B <= 0) {
+        if (full_hash_out) {
+            *full_hash_out = 0;
+        }
         return out;
     }
     out.reserve(toks.size() / (size_t) B);
@@ -979,6 +983,9 @@ static std::vector<uint64_t> auto_block_hashes(const llama_tokens & toks, int B,
         if ((i + 1) % (size_t) B == 0) {
             out.push_back(h);
         }
+    }
+    if (full_hash_out) {
+        *full_hash_out = h;
     }
     return out;
 }
@@ -996,12 +1003,16 @@ static inline uint64_t auto_hash_splitmix64(uint64_t x) {
 // embedding sequence. Empty media is intentionally bit-identical to v1 hashing.
 static std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
                                                const std::vector<server_media_record> & media,
-                                               int B, uint64_t salt, uint64_t fp_mmproj) {
+                                               int B, uint64_t salt, uint64_t fp_mmproj,
+                                               uint64_t * full_hash_out = nullptr) {
     if (media.empty()) {
-        return auto_block_hashes(cells, B, salt);
+        return auto_block_hashes(cells, B, salt, full_hash_out);
     }
     std::vector<uint64_t> out;
     if (B <= 0) {
+        if (full_hash_out) {
+            *full_hash_out = 0;
+        }
         return out;
     }
     out.reserve(cells.size() / (size_t) B);
@@ -1016,6 +1027,9 @@ static std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
                 seeded = false;
             }
             if (record_index >= media.size() || i < media[record_index].start_idx) {
+                if (full_hash_out) {
+                    *full_hash_out = 0;
+                }
                 return {}; // corrupt/incomplete media layout; never index it
             }
             const auto & record = media[record_index];
@@ -1050,6 +1064,75 @@ static std::vector<uint64_t> auto_block_hashes(const llama_tokens & cells,
     if (out.empty() && !cells.empty() && boundary_is_chunk_safe(cells, media, cells.size())) {
         out.push_back(h);
     }
+    if (full_hash_out) {
+        *full_hash_out = h;
+    }
+    return out;
+}
+
+struct auto_prefix_hash {
+    uint32_t n_tokens;
+    uint64_t hash;
+};
+
+// Exact, resumable prefix hashes for lookup. Unlike block hashes, each entry commits to the
+// entire snapshot prefix, including a trailing partial block. Media-chunk interiors are omitted.
+static std::vector<auto_prefix_hash> auto_prefix_hashes(const llama_tokens & toks, uint64_t salt) {
+    std::vector<auto_prefix_hash> out;
+    out.reserve(toks.size());
+    uint64_t h = 0xcbf29ce484222325ULL ^ salt;
+    for (size_t i = 0; i < toks.size(); ++i) {
+        h = auto_hash_mix(h, toks[i]);
+        out.push_back({ (uint32_t) (i + 1), h });
+    }
+    return out;
+}
+
+static std::vector<auto_prefix_hash> auto_prefix_hashes(
+        const llama_tokens & cells, const std::vector<server_media_record> & media,
+        uint64_t salt, uint64_t fp_mmproj) {
+    if (media.empty()) {
+        return auto_prefix_hashes(cells, salt);
+    }
+    std::vector<auto_prefix_hash> out;
+    out.reserve(cells.size());
+    size_t record_index = 0;
+    bool seeded = false;
+    uint64_t record_seed = 0;
+    uint64_t h = 0xcbf29ce484222325ULL ^ salt;
+    for (size_t i = 0; i < cells.size(); ++i) {
+        bool at_chunk_end = false;
+        if (cells[i] == LLAMA_TOKEN_NULL) {
+            while (record_index < media.size() && i >= (size_t) media[record_index].start_idx + media[record_index].n_tokens) {
+                ++record_index;
+                seeded = false;
+            }
+            if (record_index >= media.size() || i < media[record_index].start_idx) {
+                return {}; // corrupt/incomplete media layout; never restore from it
+            }
+            const auto & record = media[record_index];
+            if (!seeded) {
+                uint64_t id_hash = 0xcbf29ce484222325ULL;
+                for (unsigned char c : record.id) {
+                    id_hash ^= (uint64_t) c;
+                    id_hash *= 0x100000001b3ULL;
+                }
+                uint64_t shape = 0;
+                shape = auto_hash_mix(shape, (int32_t) record.n_tokens);
+                shape = auto_hash_mix(shape, (int32_t) record.n_pos);
+                shape = auto_hash_mix(shape, (int32_t) record.is_audio);
+                record_seed = id_hash ^ shape ^ fp_mmproj;
+                seeded = true;
+            }
+            h = auto_hash_mix64(h, auto_hash_splitmix64(record_seed ^ (uint64_t) (i - record.start_idx)));
+            at_chunk_end = i + 1 == (size_t) record.start_idx + record.n_tokens;
+        } else {
+            h = auto_hash_mix(h, cells[i]);
+        }
+        if (cells[i] != LLAMA_TOKEN_NULL || at_chunk_end) {
+            out.push_back({ (uint32_t) (i + 1), h });
+        }
+    }
     return out;
 }
 
@@ -1068,8 +1151,8 @@ struct auto_cache_entry {
     bool        pinned = false;
 };
 
-// boundary-hash -> best (longest) entry covering that prefix length. Touched only
-// from the single server-loop thread in v1 (mtx documented above). `scanned`
+// boundary-hash -> entries covering that prefix length, used by PART restore and
+// incremental-parent selection. Touched only from the single server-loop thread in v1 (mtx documented above). `scanned`
 // guards the one-time startup scan; `dir_mtime`/`last_refresh` drive the cheap
 // cross-process refresh (see auto_index_refresh): a peer process that writes a new
 // snapshot bumps the slot-save directory's mtime, which the next lookup notices and
@@ -1083,6 +1166,9 @@ struct auto_cache_index {
     // before the longer snapshot the shorter one is the ONLY usable candidate (auto_index_lookup picks
     // model-appropriately). Incremental saving makes overlapping supersets the common case.
     std::unordered_map<uint64_t, std::vector<auto_cache_entry>> by_boundary;
+    // exact full-prefix hash -> snapshots ending at that exact prefix. This is the restore index:
+    // it rejects divergent tails before any .meta file needs to be opened.
+    std::unordered_map<uint64_t, std::vector<auto_cache_entry>> by_prefix;
     std::unordered_set<std::string> indexed_files;    // state paths already scanned (incremental refresh)
     bool scanned = false;
     std::filesystem::file_time_type dir_mtime{};      // dir mtime as of the last scan
@@ -2384,6 +2470,7 @@ private:
         llama_tokens toks;
         std::vector<server_media_record> media;
         std::vector<uint64_t> block_hashes;
+        uint64_t prefix_hash = 0;
         std::vector<uint8_t> state_data;
         std::vector<float> logits;
         int n_vocab = 0;
@@ -2466,6 +2553,7 @@ private:
             for (uint64_t bh : job.block_hashes) {
                 auto_index_insert_locked(bh, e);
             }
+            auto_index_insert_prefix_locked(job.prefix_hash, e);
             auto_idx.indexed_files.insert(job.fname);
         }
         bool oversized = false;
@@ -2709,6 +2797,27 @@ private:
         }
     }
 
+    // Keep one newest snapshot per exact (hash, length) pair. The full prefix hash filters divergent
+    // tails before restore; the token count remains part of the key because a hash alone is not an
+    // identity proof. The caller byte-verifies the selected entry before loading its state.
+    void auto_index_insert_prefix_locked(uint64_t prefix_hash, const auto_cache_entry & e) {
+        auto & v = auto_idx.by_prefix[prefix_hash];
+        for (auto & c : v) {
+            if (c.n_tokens == e.n_tokens) {
+                c.state_path = e.state_path;
+                c.fp         = e.fp;
+                c.pinned     = e.pinned;
+                return;
+            }
+        }
+        const auto pos = std::lower_bound(v.begin(), v.end(), e,
+            [](const auto_cache_entry & a, const auto_cache_entry & b) { return a.n_tokens > b.n_tokens; });
+        v.insert(pos, e);
+        if (v.size() > AUTO_MAX_CANDIDATES_PER_BOUNDARY) {
+            v.pop_back();
+        }
+    }
+
     // Scan the slot-save dir and (re)build index entries from .meta sidecars: header-only reads
     // (never the multi-GB state). Each bad/foreign file is skipped individually (invariant 4);
     // foreign-model files are left on disk (a sibling model may own them). Idempotent: re-running it
@@ -2758,14 +2867,19 @@ private:
             if ((parent_id != 0 || range_lo != 0) && !slot_meta_is_safe_delta(meta_version)) {
                 continue; // legacy delta snapshots are unsafe to compose-load
             }
+            uint64_t prefix_hash = 0;
             const auto bhs = auto_block_hashes(toks, media, params_base.slot_save_block,
-                                               cur_fp.fp_model, cur_fp.fp_mmproj);
+                                               cur_fp.fp_model, cur_fp.fp_mmproj, &prefix_hash);
+            if (bhs.empty() || prefix_hash == 0) {
+                continue;
+            }
             std::error_code pec;
             const bool pinned = std::filesystem::exists(p + ".pin", pec) && !pec;
             auto_cache_entry e{ p, (uint32_t) toks.size(), fp, pinned };
             for (uint64_t bh : bhs) {
                 auto_index_insert_locked(bh, e);
             }
+            auto_index_insert_prefix_locked(prefix_hash, e);
             auto_idx.indexed_files.insert(p);
         }
     }
@@ -2805,16 +2919,10 @@ private:
         auto_index_drop_missing_locked();
     }
 
-    // Longest-prefix lookup over the request tokens. Returns the candidate whose boundary hash is
-    // the DEEPEST match with a fingerprint equal to the live one. Verification (byte-compare of the
-    // candidate's persisted tokens) is mandatory and done by the caller (invariant 2). O(#blocks).
-    // Returns candidate snapshots to try, BEST FIRST (deepest boundary first; within a boundary,
-    // longest first). For a FULL/recurrent/hybrid/SWA model, snapshots longer than the request are
-    // filtered out here — the whole snapshot must be a prefix of the request, so a longer one can never
-    // restore; PART models can rewind so all lengths are kept. The caller tries each in order until one
-    // restores (each rejected candidate costs only a small .meta read + byte-compare; the multi-GB
-    // state loads only once a candidate passes its gates). Byte-verification is mandatory and done by
-    // the caller (invariant 2). O(#blocks).
+    // Longest-prefix lookup over the request tokens. FULL/recurrent/hybrid/SWA models use exact
+    // full-prefix hashes, so divergent snapshots sharing only a block boundary never reach the
+    // expensive .meta byte-compare. PART models retain the block-boundary lookup because they can
+    // validly restore a longer snapshot and rewind inside it.
     std::vector<auto_cache_entry> auto_index_lookup(const llama_tokens & req,
                                                     const std::vector<server_media_record> & media = {},
                                                     size_t max_attempts = AUTO_MAX_RESTORE_ATTEMPTS) {
@@ -2823,6 +2931,37 @@ private:
             return out; // off by default
         }
         const bool full = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+        if (full) {
+            const auto prefix_hashes = auto_prefix_hashes(req, media, cur_fp.fp_model, cur_fp.fp_mmproj);
+            std::lock_guard<std::mutex> lk(auto_idx.mtx);
+            auto_index_refresh_locked(/*force=*/false);
+            for (int attempt = 0; attempt < 2; ++attempt) {
+                out.clear();
+                for (auto it_hash = prefix_hashes.rbegin(); it_hash != prefix_hashes.rend(); ++it_hash) {
+                    const auto it = auto_idx.by_prefix.find(it_hash->hash);
+                    if (it == auto_idx.by_prefix.end()) {
+                        continue;
+                    }
+                    for (const auto & c : it->second) {
+                        if (c.n_tokens != it_hash->n_tokens || !(c.fp == cur_fp)) {
+                            continue;
+                        }
+                        out.push_back(c);
+                        if (out.size() >= max_attempts) {
+                            return out;
+                        }
+                    }
+                }
+                if (!out.empty()) {
+                    return out;
+                }
+                if (attempt == 0) {
+                    auto_index_refresh_locked(/*force=*/true);
+                }
+            }
+            return out;
+        }
+
         const auto bhs = auto_block_hashes(req, media, params_base.slot_save_block,
                                            cur_fp.fp_model, cur_fp.fp_mmproj);
         std::lock_guard<std::mutex> lk(auto_idx.mtx);
@@ -2866,14 +3005,10 @@ private:
         return out;
     }
 
-    // After an LRU eviction (which deletes files silently — ours OR a peer process's), drop index
-    // boundaries pointing at files that no longer exist, and forget them in indexed_files so a future
-    // re-create can be re-indexed. Cheap stat per unique path; keeps index <-> disk consistent (invariant 4).
-    // A lookup that races an eviction and finds a now-deleted file simply fails the load -> prefill.
-    // CALLER MUST HOLD auto_idx.mtx.
-    void auto_index_drop_missing_locked() {
-        std::unordered_set<std::string> gone;
-        for (auto it = auto_idx.by_boundary.begin(); it != auto_idx.by_boundary.end(); ) {
+    void auto_index_drop_missing_from_locked(
+            std::unordered_map<uint64_t, std::vector<auto_cache_entry>> & index,
+            std::unordered_set<std::string> & gone) {
+        for (auto it = index.begin(); it != index.end(); ) {
             auto & vec = it->second;
             for (auto vit = vec.begin(); vit != vec.end(); ) {
                 std::error_code ec;
@@ -2885,11 +3020,22 @@ private:
                 }
             }
             if (vec.empty()) {
-                it = auto_idx.by_boundary.erase(it);
+                it = index.erase(it);
             } else {
                 ++it;
             }
         }
+    }
+
+    // After an LRU eviction (which deletes files silently — ours OR a peer process's), drop index
+    // boundaries pointing at files that no longer exist, and forget them in indexed_files so a future
+    // re-create can be re-indexed. Cheap stat per unique path; keeps index <-> disk consistent (invariant 4).
+    // A lookup that races an eviction and finds a now-deleted file simply fails the load -> prefill.
+    // CALLER MUST HOLD auto_idx.mtx.
+    void auto_index_drop_missing_locked() {
+        std::unordered_set<std::string> gone;
+        auto_index_drop_missing_from_locked(auto_idx.by_boundary, gone);
+        auto_index_drop_missing_from_locked(auto_idx.by_prefix, gone);
         for (const auto & p : gone) {
             auto_idx.indexed_files.erase(p);
         }
@@ -3421,17 +3567,19 @@ private:
         if ((int) toks.size() < save_floor) {
             return false; // below the floor: not worth a multi-GB write
         }
+        uint64_t prefix_hash = 0;
         const auto bhs = auto_block_hashes(toks, media, params_base.slot_save_block,
-                                           cur_fp.fp_model, cur_fp.fp_mmproj);
+                                           cur_fp.fp_model, cur_fp.fp_mmproj, &prefix_hash);
         if (bhs.empty()) {
             return false;
         }
         const uint64_t full_hash = bhs.back(); // commits the whole whole-block prefix
         {
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
-            auto it = auto_idx.by_boundary.find(full_hash);
-            if (it != auto_idx.by_boundary.end()) {
-                const bool full = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+            const bool full = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL);
+            const auto & index = full ? auto_idx.by_prefix : auto_idx.by_boundary;
+            const auto it = index.find(full ? prefix_hash : full_hash);
+            if (it != index.end()) {
                 for (const auto_cache_entry & c : it->second) {
                     model_fp disk_fp;
                     llama_tokens disk_toks;
@@ -3448,6 +3596,9 @@ private:
                     // shorter one is a different resume point) — otherwise this incremental save would
                     // be suppressed by a longer snapshot the model can never restore. PART: an
                     // equal-or-longer snapshot already covers this prefix (it can rewind to it).
+                    if (full && (c.n_tokens != toks.size() || disk_toks != toks)) {
+                        continue;
+                    }
                     if (full ? (disk_toks.size() == toks.size()) : (disk_toks.size() >= toks.size())) {
                         return true; // a usable snapshot for this exact prefix already exists
                     }
@@ -3553,6 +3704,7 @@ private:
             job.toks = std::move(toks);
             job.media = std::move(media);
             job.block_hashes = bhs;
+            job.prefix_hash = prefix_hash;
             job.have_parent = have_parent;
             job.parent_id = parent_id;
             job.parent_hi = parent_hi;
@@ -3664,6 +3816,7 @@ private:
             for (uint64_t bh : bhs) {
                 auto_index_insert_locked(bh, e);
             }
+            auto_index_insert_prefix_locked(prefix_hash, e);
             auto_idx.indexed_files.insert(fname); // remember our own write so a refresh won't re-open it
         }
         // Eviction is opt-in and scoped to the auto cache. This hook already runs only under
@@ -4424,8 +4577,9 @@ private:
         if (auto_cache_enabled()) {
             cur_fp = auto_compute_fingerprint();
             auto_index_scan();
-            SRV_INF("auto disk prompt cache enabled: indexed %zu prefix boundaries from %s (block=%d)\n",
-                    auto_idx.by_boundary.size(), params_base.slot_save_path.c_str(), params_base.slot_save_block);
+            SRV_INF("auto disk prompt cache enabled: indexed %zu exact prefixes and %zu block boundaries from %s (block=%d)\n",
+                    auto_idx.by_prefix.size(), auto_idx.by_boundary.size(),
+                    params_base.slot_save_path.c_str(), params_base.slot_save_block);
         }
 
         if (!is_resume) {
@@ -6404,9 +6558,8 @@ private:
                                     // Try candidates best-first (longest usable snapshot first). Each
                                     // rejected candidate costs only a small .meta read + byte-compare; the
                                     // multi-GB state loads only once a candidate passes its gates. This
-                                    // fall-through is what stops a longer superset snapshot (unusable by a
-                                    // FULL model, which needs a whole-prefix match) from shadowing a shorter
-                                    // usable one at the same boundary.
+                                    // fall-through lets a corrupt or colliding longer snapshot yield to the
+                                    // next shorter exact prefix without opening unrelated cache files.
                                     const int n_keep_ram = usable_ram_prefix_for_disk(slot, (int) n_past);
                                     const auto disk_candidates = auto_index_lookup(input_tokens.get_cell_tokens(), req_media);
                                     SLT_INF(slot, "auto-restore: RAM raw prefix=%d, usable prefix=%d, disk candidates=%zu\n",
