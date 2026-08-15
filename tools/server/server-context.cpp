@@ -6915,7 +6915,7 @@ private:
                     const auto last_assistant_end  = spans.last_historical_assistant_message_end();
                     const auto fifth_last_assistant_pos = spans.nth_last_historical_assistant_message_pos(5);
                     const auto terminal_assistant_end = spans.last_assistant_message_end();
-                    if (do_checkpoint && slot.prompt.n_tokens() == (size_t) n_past) {
+                    if (do_checkpoint && slot.prompt.n_tokens() == (size_t) slot.n_prompt_tokens_cache) {
                         const std::string first_text = first_assistant_pos >= 0
                             ? checkpoint_text_preview(input_tokens, first_assistant_pos) : "<none>";
                         const std::string last_text = last_assistant_end >= 0
@@ -6931,7 +6931,7 @@ private:
                                 fifth_last_assistant_pos, fifth_text.c_str(), terminal_assistant_end,
                                 terminal_text.c_str());
                     }
-                    if (do_checkpoint && slot.prompt.n_tokens() == (size_t) n_past &&
+                    if (do_checkpoint && slot.prompt.n_tokens() == (size_t) slot.n_prompt_tokens_cache &&
                         terminal_assistant_end >= 0 && terminal_assistant_end != last_assistant_end) {
                         SLT_INF(slot,
                                 "checkpointing: ignoring terminal assistant span after the final user message "
