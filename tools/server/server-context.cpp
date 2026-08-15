@@ -3012,11 +3012,97 @@ private:
         return true;
     }
 
+    std::string checkpoint_text_preview(const server_tokens & tokens, size_t token_pos) const {
+        constexpr size_t N_TOKENS_EACH_SIDE = 10;
+        constexpr size_t N_CHARS_MAX = 320;
+
+        const size_t center = std::min(token_pos, tokens.size());
+        const size_t begin = center > N_TOKENS_EACH_SIDE ? center - N_TOKENS_EACH_SIDE : 0;
+        const size_t end = std::min(tokens.size(), center + N_TOKENS_EACH_SIDE);
+
+        std::string out;
+        for (size_t i = begin; i < end && out.size() < N_CHARS_MAX; ++i) {
+            if (i == center) {
+                out += " | ";
+            }
+            const llama_token token = tokens[i];
+            const std::string piece = token == LLAMA_TOKEN_NULL
+                ? "[mtmd]"
+                : common_token_to_piece(ctx_tgt, token);
+            for (const char c : piece) {
+                if (out.size() >= N_CHARS_MAX) {
+                    break;
+                }
+                switch (c) {
+                    case '\\': out += "\\\\"; break;
+                    case '\n': out += "\\n";  break;
+                    case '\r': out += "\\r";  break;
+                    case '\t': out += "\\t";  break;
+                    case '\"': out += "\\\""; break;
+                    default:   out += c;      break;
+                }
+            }
+        }
+        if (end < tokens.size() || out.size() >= N_CHARS_MAX) {
+            out += "…";
+        }
+        return out;
+    }
+
+    // FULL/recurrent memory cannot discard a divergent suffix in place. Its raw LCP is
+    // therefore NOT a usable RAM resume point: only a checkpoint at or before the
+    // divergence is. This is computed before inspecting disk candidates so the disk
+    // margin is measured against a real alternative rather than an impossible rewind.
+    int usable_ram_prefix_for_disk(server_slot & slot, int raw_lcp) const {
+        if (raw_lcp <= 0 || ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+            raw_lcp == (int) slot.prompt.tokens.size()) {
+            SLT_INF(slot, "auto-restore: RAM raw prefix=%d, usable prefix=%d (direct reuse)\n",
+                    raw_lcp, raw_lcp);
+            return raw_lcp;
+        }
+
+        const llama_pos pos_diverge = slot.prompt.tokens.pos_next(raw_lcp);
+        const llama_pos pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
+        const bool has_new_tokens = raw_lcp < slot.task->n_tokens();
+        const llama_pos pos_min_thold = std::max(0, pos_diverge - (has_new_tokens ? 0 : 1));
+        const common_prompt_checkpoint * selected = nullptr;
+
+        for (auto it = slot.prompt.checkpoints.rbegin(); it != slot.prompt.checkpoints.rend(); ++it) {
+            const auto & checkpoint = *it;
+            const bool after_divergence = checkpoint.pos_max > pos_diverge;
+            const bool tail_safe = checkpoint.pos_min == 0 || checkpoint.pos_min < pos_min_thold;
+            const bool usable = pos_min >= pos_min_thold && !after_divergence && tail_safe;
+            SLT_INF(slot,
+                    "RAM checkpoint candidate: n_tokens=%" PRId64 " pos=[%d,%d] usable=%s reason=%s text=\"%s\"\n",
+                    checkpoint.n_tokens, checkpoint.pos_min, checkpoint.pos_max,
+                    usable ? "yes" : "no",
+                    after_divergence ? "after-divergence" :
+                    !tail_safe ? "tail-boundary" :
+                    pos_min < pos_min_thold ? "memory-position" : "eligible",
+                    checkpoint_text_preview(slot.prompt.tokens, checkpoint.n_tokens).c_str());
+            if (usable && selected == nullptr) {
+                selected = &checkpoint;
+            }
+        }
+
+        int usable_prefix = 0;
+        if (selected != nullptr) {
+            const llama_pos pos_restore = std::min(
+                pos_diverge, std::max(selected->pos_min + 1, selected->pos_max));
+            usable_prefix = (int) std::min(
+                slot.prompt.tokens.size_up_to_pos(pos_restore), (size_t) selected->n_tokens);
+        }
+        SLT_INF(slot,
+                "auto-restore: RAM raw prefix=%d, usable checkpoint prefix=%d, divergence_pos=%d, checkpoints=%zu\n",
+                raw_lcp, usable_prefix, pos_diverge, slot.prompt.checkpoints.size());
+        return usable_prefix;
+    }
+
     // AUTO-RESTORE wrapper: byte-verify the candidate's persisted tokens against the request prefix
     // (invariant 2), confirm the fingerprint (invariant 3), then restore. Returns the verified prefix length
     // actually restored, or 0 if nothing was restored (caller keeps the in-memory prefill path).
-    // `req` is the full request including its live media chunks; `n_keep_mem` is the in-memory
-    // match to beat.
+    // `req` is the full request including its live media chunks; `n_keep_mem` is the best
+    // actually-restorable RAM prefix, not merely the raw token LCP.
     int auto_restore_into_slot(server_slot & slot, const auto_cache_entry & cand,
                                const server_tokens & req, int n_keep_mem) {
         // Read the small .meta sidecar (cells + fp + optional media records) — never opens the
@@ -3125,9 +3211,10 @@ private:
             return 0;
         }
         // MARGIN gate (invariant 5): only pay a multi-GB load if disk strictly beats the
-        // in-memory match by at least one block — never thrash a reload to save a few tokens.
+        // usable in-memory resume point by at least one block — never compare against
+        // a FULL-model raw LCP that cannot be rewound to the divergence.
         if (n_keep_disk < n_keep_mem + B) {
-            SLT_INF(slot, "auto-restore: disk candidate rejected (RAM prefix %d is within one block of disk %d)\n",
+            SLT_INF(slot, "auto-restore: disk candidate rejected (usable RAM prefix %d is within one block of disk %d)\n",
                     n_keep_mem, n_keep_disk);
             return 0;
         }
@@ -5362,10 +5449,14 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
 
-        SLT_TRC(slot,
-                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+        const std::string text = slot.task
+            ? checkpoint_text_preview(slot.task->tokens, (size_t) n_tokens)
+            : "<no active task>";
+        SLT_INF(slot,
+                "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64
+                ", size = %.3f MiB, text=\"%s\")\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
-                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024);
+                cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, text.c_str());
     }
 
     void process_single_task(server_task && task) {
@@ -6285,9 +6376,10 @@ private:
                                     // fall-through is what stops a longer superset snapshot (unusable by a
                                     // FULL model, which needs a whole-prefix match) from shadowing a shorter
                                     // usable one at the same boundary.
+                                    const int n_keep_ram = usable_ram_prefix_for_disk(slot, (int) n_past);
                                     const auto disk_candidates = auto_index_lookup(input_tokens.get_cell_tokens(), req_media);
-                                    SLT_INF(slot, "auto-restore: RAM prefix match=%d, disk candidates=%zu\n",
-                                            n_past, disk_candidates.size());
+                                    SLT_INF(slot, "auto-restore: RAM raw prefix=%d, usable prefix=%d, disk candidates=%zu\n",
+                                            n_past, n_keep_ram, disk_candidates.size());
                                     for (const auto & cand : disk_candidates) {
                                         // auto_restore_into_slot may CLEAR the slot
                                         // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
@@ -6300,7 +6392,7 @@ private:
                                         // (which would GGML_ASSERT/abort). The recompute is harmless on the
                                         // early-return-before-clear paths (margin/fp/verify rejects): those
                                         // leave prompt.tokens untouched, so the LCP is identical to before.
-                                        const int restored = auto_restore_into_slot(slot, cand, input_tokens, (int) n_past);
+                                        const int restored = auto_restore_into_slot(slot, cand, input_tokens, n_keep_ram);
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                         if (restored > 0) {
                                             break; // restored; stop trying shorter candidates
@@ -6611,7 +6703,10 @@ private:
                                         slot.prompt.checkpoints.rend(),
                                         [&](const auto & cur) {
                                             // guarantee that a checkpoint will result in at least one token being processed [TAG_PROMPT_LOGITS]
-                                            SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
+                                            SLT_INF(slot,
+                                                    "checking RAM checkpoint: n_tokens=%" PRId64 " pos=[%d,%d] against divergence=%d text=\"%s\"\n",
+                                                    cur.n_tokens, cur.pos_min, cur.pos_max, pos_min_thold,
+                                                    checkpoint_text_preview(slot.prompt.tokens, cur.n_tokens).c_str());
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
                                             if (cur.pos_max > pos_diverge) {
                                                 return false;
@@ -6820,7 +6915,24 @@ private:
                     const auto last_assistant_end  = spans.last_historical_assistant_message_end();
                     const auto fifth_last_assistant_pos = spans.nth_last_historical_assistant_message_pos(5);
                     const auto terminal_assistant_end = spans.last_assistant_message_end();
-                    if (terminal_assistant_end >= 0 && terminal_assistant_end != last_assistant_end) {
+                    if (do_checkpoint && slot.prompt.n_tokens() == (size_t) n_past) {
+                        const std::string first_text = first_assistant_pos >= 0
+                            ? checkpoint_text_preview(input_tokens, first_assistant_pos) : "<none>";
+                        const std::string last_text = last_assistant_end >= 0
+                            ? checkpoint_text_preview(input_tokens, last_assistant_end) : "<none>";
+                        const std::string fifth_text = fifth_last_assistant_pos >= 0
+                            ? checkpoint_text_preview(input_tokens, fifth_last_assistant_pos) : "<none>";
+                        const std::string terminal_text = terminal_assistant_end >= 0
+                            ? checkpoint_text_preview(input_tokens, terminal_assistant_end) : "<none>";
+                        SLT_INF(slot,
+                                "checkpoint schedule: first=%d text=\"%s\"; last-historical-end=%d text=\"%s\"; "
+                                "fifth-last=%d text=\"%s\"; terminal-assistant-end=%d text=\"%s\"\n",
+                                first_assistant_pos, first_text.c_str(), last_assistant_end, last_text.c_str(),
+                                fifth_last_assistant_pos, fifth_text.c_str(), terminal_assistant_end,
+                                terminal_text.c_str());
+                    }
+                    if (do_checkpoint && slot.prompt.n_tokens() == (size_t) n_past &&
+                        terminal_assistant_end >= 0 && terminal_assistant_end != last_assistant_end) {
                         SLT_INF(slot,
                                 "checkpointing: ignoring terminal assistant span after the final user message "
                                 "(end = %d, last historical assistant end = %d)\n",
@@ -6941,6 +7053,15 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
+                        SLT_INF(slot,
+                                "checkpoint plan: batch=[%d,%d) first=%d last=%d fifth=%d selected=[first:%s last:%s fifth:%s] checkpoint_at=%d text=\"%s\"\n",
+                                n_tokens_start, n_tokens_end, first_assistant_pos, last_assistant_end,
+                                fifth_last_assistant_pos,
+                                is_first_assistant_checkpoint ? "yes" : "no",
+                                is_last_assistant_checkpoint ? "yes" : "no",
+                                is_fifth_last_assistant_checkpoint ? "yes" : "no",
+                                n_tokens_start,
+                                checkpoint_text_preview(input_tokens, n_tokens_start).c_str());
                         if (is_first_assistant_checkpoint) {
                             SLT_INF(slot,
                                     "creating first-assistant context checkpoint at n_tokens = %d (target = %d)\n",
