@@ -7126,23 +7126,6 @@ private:
                     int64_t chunk_stop_target = -1;
                     int32_t batch_fill_limit = n_batch;
 
-                    // A checkpoint captures state BEFORE its batch is decoded. Stop the preceding
-                    // batch exactly at each target so the next batch starts at that target and the
-                    // captured state neither omits assistant tokens nor includes template text
-                    // after an assistant terminator.
-                    const int32_t n_tokens_before_batch = slot.prompt.n_tokens();
-                    int32_t checkpoint_batch_end = slot.task->n_tokens();
-                    bool has_checkpoint_batch_end = false;
-                    const auto consider_checkpoint_batch_end = [&](int32_t target) {
-                        if (target > n_tokens_before_batch && target < checkpoint_batch_end) {
-                            checkpoint_batch_end = target;
-                            has_checkpoint_batch_end = true;
-                        }
-                    };
-                    consider_checkpoint_batch_end(first_assistant_pos);
-                    consider_checkpoint_batch_end(last_assistant_end);
-                    consider_checkpoint_batch_end(fifth_last_assistant_pos);
-
                     if (batch.size() == n_tokens_prev) {
                         const int32_t remaining_tokens = slot.task->n_tokens() - slot.prompt.n_tokens();
                         batch_fill_limit = server_prompt_tail_batch_limit(remaining_tokens, n_batch);
@@ -7182,10 +7165,6 @@ private:
                             break; // decode exactly through the shared base, never beyond it
                         }
 
-                        if (has_checkpoint_batch_end && slot.prompt.n_tokens() == checkpoint_batch_end) {
-                            break; // start the following batch at the exact checkpoint boundary
-                        }
-
                     }
 
                     if (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() >= batch_fill_limit) {
@@ -7221,16 +7200,21 @@ private:
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
-                    // Create at most three checkpoints at their exact token boundaries:
-                    // - the first assistant-message start;
-                    // - the terminator immediately ending the last historical assistant reply;
-                    // - the fifth assistant-message start from the end.
+                    // Create at most three checkpoints at existing batch boundaries before their
+                    // selected message targets:
+                    // - the batch containing the first assistant-message start;
+                    // - the batch containing the terminator ending the last historical assistant reply;
+                    // - the batch containing the fifth assistant-message start from the end.
                     const bool is_first_assistant_checkpoint =
-                        first_assistant_pos == n_tokens_start;
+                        first_assistant_pos >= n_tokens_start &&
+                        first_assistant_pos <  n_tokens_end;
                     const bool is_last_assistant_checkpoint =
-                        last_assistant_end == n_tokens_start;
+                        last_assistant_end >= n_tokens_start &&
+                        (last_assistant_end < n_tokens_end ||
+                         (is_last_prompt_batch && last_assistant_end == n_tokens_end));
                     const bool is_fifth_last_assistant_checkpoint =
-                        fifth_last_assistant_pos == n_tokens_start;
+                        fifth_last_assistant_pos >= n_tokens_start &&
+                        fifth_last_assistant_pos <  n_tokens_end;
 
                     do_checkpoint = do_checkpoint && (
                         is_first_assistant_checkpoint ||
