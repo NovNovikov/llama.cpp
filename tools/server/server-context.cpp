@@ -3049,6 +3049,38 @@ private:
         return out;
     }
 
+    // Message-start delimiters alone cannot locate the end of a DeepSeek assistant reply:
+    // template-owned text may be emitted between that reply and the next user marker. The DeepSeek
+    // template closes every assistant reply with this exact token sequence, so use it rather than
+    // treating the next user marker as an implicit assistant end.
+    int32_t last_historical_assistant_end(
+            const server_tokens & tokens,
+            const common_chat_msg_spans & spans) const {
+        static const std::string assistant_end = "<｜end▁of▁sentence｜>";
+        const llama_tokens assistant_end_tokens = common_tokenize(vocab, assistant_end, false, true);
+        if (assistant_end_tokens.empty()) {
+            return -1;
+        }
+
+        const auto & cell_tokens = tokens.get_cell_tokens();
+        const int32_t last_user_pos = spans.last_user_message_pos();
+        for (auto it = spans.spans.rbegin(); it != spans.spans.rend(); ++it) {
+            if (it->role != COMMON_CHAT_ROLE_ASSISTANT ||
+                (last_user_pos >= 0 && (int32_t) it->pos >= last_user_pos)) {
+                continue;
+            }
+
+            const size_t end = std::min(tokens.size(), it->pos + it->len);
+            for (size_t pos = it->pos; pos + assistant_end_tokens.size() <= end; ++pos) {
+                if (std::equal(assistant_end_tokens.begin(), assistant_end_tokens.end(), cell_tokens.begin() + pos)) {
+                    return (int32_t) (pos + assistant_end_tokens.size());
+                }
+            }
+            return -1;
+        }
+        return -1;
+    }
+
     // FULL/recurrent memory cannot discard a divergent suffix in place. Its raw LCP is
     // therefore NOT a usable RAM resume point: only a checkpoint at or before the
     // divergence is. This is computed before inspecting disk candidates so the disk
@@ -6912,7 +6944,7 @@ private:
 
                     const auto & spans = slot.task->params.message_spans;
                     const auto first_assistant_pos = spans.first_historical_assistant_message_pos();
-                    const auto last_assistant_end  = spans.last_historical_assistant_message_end();
+                    const auto last_assistant_end  = last_historical_assistant_end(input_tokens, spans);
                     const auto fifth_last_assistant_pos = spans.nth_last_historical_assistant_message_pos(5);
                     const auto terminal_assistant_end = spans.last_assistant_message_end();
                     if (do_checkpoint && slot.prompt.n_tokens() == (size_t) slot.n_prompt_tokens_cache) {
@@ -6941,6 +6973,23 @@ private:
                     const char * chunk_stop_reason = "prompt_exhausted";
                     int64_t chunk_stop_target = -1;
                     int32_t batch_fill_limit = n_batch;
+
+                    // A checkpoint captures state BEFORE its batch is decoded. Stop the preceding
+                    // batch exactly at each target so the next batch starts at that target and the
+                    // captured state neither omits assistant tokens nor includes template text
+                    // after an assistant EOG.
+                    const int32_t n_tokens_before_batch = slot.prompt.n_tokens();
+                    int32_t checkpoint_batch_end = slot.task->n_tokens();
+                    bool has_checkpoint_batch_end = false;
+                    const auto consider_checkpoint_batch_end = [&](int32_t target) {
+                        if (target > n_tokens_before_batch && target < checkpoint_batch_end) {
+                            checkpoint_batch_end = target;
+                            has_checkpoint_batch_end = true;
+                        }
+                    };
+                    consider_checkpoint_batch_end(first_assistant_pos);
+                    consider_checkpoint_batch_end(last_assistant_end);
+                    consider_checkpoint_batch_end(fifth_last_assistant_pos);
 
                     if (batch.size() == n_tokens_prev) {
                         const int32_t remaining_tokens = slot.task->n_tokens() - slot.prompt.n_tokens();
@@ -6981,10 +7030,10 @@ private:
                             break; // decode exactly through the shared base, never beyond it
                         }
 
-                        // Checkpoints are created only at natural batch boundaries. We do
-                        // not split a large prefill batch just to hit a user-message or
-                        // checkpoint target exactly, because that fragments long-context
-                        // prompt processing into many small decode calls.
+                        if (has_checkpoint_batch_end && slot.prompt.n_tokens() == checkpoint_batch_end) {
+                            break; // start the following batch at the exact checkpoint boundary
+                        }
+
                     }
 
                     if (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() >= batch_fill_limit) {
@@ -7020,20 +7069,16 @@ private:
                     const auto pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
                     const auto pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
 
-                    // Create at most three checkpoints, always at a natural batch boundary:
-                    // - the batch containing the first assistant-message start;
-                    // - the batch containing the last assistant-message end;
-                    // - the batch containing the fifth assistant-message start from the end.
+                    // Create at most three checkpoints at their exact token boundaries:
+                    // - the first assistant-message start;
+                    // - the EOG immediately ending the last historical assistant reply;
+                    // - the fifth assistant-message start from the end.
                     const bool is_first_assistant_checkpoint =
-                        first_assistant_pos >= n_tokens_start &&
-                        first_assistant_pos <  n_tokens_end;
+                        first_assistant_pos == n_tokens_start;
                     const bool is_last_assistant_checkpoint =
-                        last_assistant_end >= n_tokens_start &&
-                        (last_assistant_end < n_tokens_end ||
-                         (is_last_prompt_batch && last_assistant_end == n_tokens_end));
+                        last_assistant_end == n_tokens_start;
                     const bool is_fifth_last_assistant_checkpoint =
-                        fifth_last_assistant_pos >= n_tokens_start &&
-                        fifth_last_assistant_pos <  n_tokens_end;
+                        fifth_last_assistant_pos == n_tokens_start;
 
                     do_checkpoint = do_checkpoint && (
                         is_first_assistant_checkpoint ||
