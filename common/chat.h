@@ -166,6 +166,7 @@ struct common_chat_msg_span {
 
 struct common_chat_msg_spans {
     std::vector<common_chat_msg_span> spans;
+    llama_tokens assistant_end_tokens;
 
     void add(common_chat_role role, size_t pos, size_t len) {
         spans.push_back({ role, pos, len });
@@ -272,7 +273,9 @@ struct common_chat_msg_spans {
 struct common_chat_msg_delimiter {
     common_chat_role role = COMMON_CHAT_ROLE_UNKNOWN;
     std::string      delimiter;
+    std::string      end_delimiter;
     llama_tokens     tokens = {};
+    llama_tokens     end_tokens = {};
 };
 
 struct common_chat_msg_delimiters {

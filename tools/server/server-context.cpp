@@ -3049,17 +3049,16 @@ private:
         return out;
     }
 
-    // Message-start delimiters alone cannot locate the end of a DeepSeek assistant reply:
-    // template-owned text may be emitted between that reply and the next user marker. The DeepSeek
-    // template closes every assistant reply with this exact token sequence, so use it rather than
-    // treating the next user marker as an implicit assistant end.
+    // Message-start delimiters alone cannot locate the end of an assistant reply when a template
+    // emits text between that reply and the next user marker. A template may supply an explicit
+    // assistant terminator; use it where available instead of treating the next user marker as an
+    // implicit assistant end.
     int32_t last_historical_assistant_end(
             const server_tokens & tokens,
             const common_chat_msg_spans & spans) const {
-        static const std::string assistant_end = "<｜end▁of▁sentence｜>";
-        const llama_tokens assistant_end_tokens = common_tokenize(vocab, assistant_end, false, true);
+        const auto & assistant_end_tokens = spans.assistant_end_tokens;
         if (assistant_end_tokens.empty()) {
-            return -1;
+            return spans.last_historical_assistant_message_end();
         }
 
         const auto & cell_tokens = tokens.get_cell_tokens();
@@ -6977,7 +6976,7 @@ private:
                     // A checkpoint captures state BEFORE its batch is decoded. Stop the preceding
                     // batch exactly at each target so the next batch starts at that target and the
                     // captured state neither omits assistant tokens nor includes template text
-                    // after an assistant EOG.
+                    // after an assistant terminator.
                     const int32_t n_tokens_before_batch = slot.prompt.n_tokens();
                     int32_t checkpoint_batch_end = slot.task->n_tokens();
                     bool has_checkpoint_batch_end = false;
@@ -7071,7 +7070,7 @@ private:
 
                     // Create at most three checkpoints at their exact token boundaries:
                     // - the first assistant-message start;
-                    // - the EOG immediately ending the last historical assistant reply;
+                    // - the terminator immediately ending the last historical assistant reply;
                     // - the fifth assistant-message start from the end.
                     const bool is_first_assistant_checkpoint =
                         first_assistant_pos == n_tokens_start;

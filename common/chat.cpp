@@ -114,10 +114,14 @@ const char * common_chat_role_to_string(common_chat_role role) {
 json common_chat_msg_delimiters::to_json() const {
     json result = json::array();
     for (const auto & d : delimiters) {
-        result.push_back({
+        json item = {
             { "role",      common_chat_role_to_string(d.role) },
             { "delimiter", d.delimiter                        },
-        });
+        };
+        if (!d.end_delimiter.empty()) {
+            item["end_delimiter"] = d.end_delimiter;
+        }
+        result.push_back(std::move(item));
     }
     return result;
 }
@@ -137,6 +141,7 @@ common_chat_msg_delimiters common_chat_msg_delimiters_parse(const json & delimit
         result.delimiters.push_back({
             common_chat_role_from_string(d.value("role", std::string())),
             d.value("delimiter", std::string()),
+            d.value("end_delimiter", std::string()),
         });
     }
 
@@ -146,6 +151,7 @@ common_chat_msg_delimiters common_chat_msg_delimiters_parse(const json & delimit
 void common_chat_msg_delimiters::tokenize(const llama_vocab * vocab) {
     for (auto & d : delimiters) {
         d.tokens = common_tokenize(vocab, d.delimiter, false, true);
+        d.end_tokens = common_tokenize(vocab, d.end_delimiter, false, true);
     }
 }
 
@@ -174,6 +180,12 @@ common_chat_msg_spans common_chat_msg_delimiters::split(const llama_tokens & tok
     matches.emplace_back(COMMON_CHAT_ROLE_UNKNOWN, tokens.size());
 
     common_chat_msg_spans spans;
+    for (const auto & d : delimiters) {
+        if (d.role == COMMON_CHAT_ROLE_ASSISTANT && !d.end_tokens.empty()) {
+            spans.assistant_end_tokens = d.end_tokens;
+            break;
+        }
+    }
     for (size_t i = 0; i + 1 < matches.size(); i++) {
         const auto & curr = matches[i];
         const auto & next = matches[i + 1];
@@ -2137,6 +2149,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     const std::string PARAM_START  = "<" + DSML + "parameter";
     const std::string PARAM_END    = "</" + DSML + "parameter>";
     const std::string GEN_PROMPT   = "<｜Assistant｜>";
+    const std::string ASSISTANT_END = "<｜end▁of▁sentence｜>";
     const std::string TC_SEPARATOR = "\n\n";
 
     data.prompt = common_chat_template_direct_apply_impl(
@@ -2156,7 +2169,7 @@ static common_chat_params common_chat_params_init_deepseek_v3_2(const common_cha
     // The server tokenizes the already-rendered prompt and uses these markers
     // to place DSV4 context checkpoints without splitting decode batches.
     data.message_delimiters = {
-        { COMMON_CHAT_ROLE_ASSISTANT, GEN_PROMPT       },
+        { COMMON_CHAT_ROLE_ASSISTANT, GEN_PROMPT, ASSISTANT_END },
         { COMMON_CHAT_ROLE_USER,      "<｜User｜>" },
     };
 
