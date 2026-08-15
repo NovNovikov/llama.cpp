@@ -5569,7 +5569,7 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    bool create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
         const int64_t n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
 
@@ -5581,7 +5581,7 @@ private:
                 SLT_TRC(slot,
                         "skipping duplicate context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ")\n",
                         pos_min, pos_max, n_tokens);
-                return;
+                return false;
             }
         }
 
@@ -5642,6 +5642,7 @@ private:
                 ", size = %.3f MiB, text=\"%s\")\n",
                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
                 cur.pos_max, cur.n_tokens, (float) cur.size() / 1024 / 1024, text.c_str());
+        return true;
     }
 
     void process_single_task(server_task && task) {
@@ -7258,13 +7259,14 @@ private:
                                     "creating fifth-last-assistant context checkpoint at n_tokens = %d (target = %d)\n",
                                     n_tokens_start, fifth_last_assistant_pos);
                         }
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
-                        // The RAM checkpoint captures the KV before this batch is decoded. Publish
-                        // that same prefix now, while ctx_tgt still contains its exact state, rather
-                        // than waiting for the final prompt token and saving only the tail state.
-                        slot.auto_disk_checkpoint_published =
-                            auto_save_slot_if_useful(slot, n_tokens_start, /*queue_background=*/true) ||
-                            slot.auto_disk_checkpoint_published;
+                        if (create_checkpoint(slot, n_tokens_cur, pos_min, pos_max)) {
+                            // The RAM checkpoint captures the KV before this batch is decoded. Publish
+                            // that same prefix now, while ctx_tgt still contains its exact state, rather
+                            // than waiting for the final prompt token and saving only the tail state.
+                            slot.auto_disk_checkpoint_published =
+                                auto_save_slot_if_useful(slot, n_tokens_start, /*queue_background=*/true) ||
+                                slot.auto_disk_checkpoint_published;
+                        }
                     }
 
                 }
