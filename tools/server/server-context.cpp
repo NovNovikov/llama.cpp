@@ -122,31 +122,41 @@ struct server_batch {
     };
     std::vector<token> tokens;
     int32_t n_tokens_alloc = 0;
+    int32_t n_embd = 0;
 
     // track if given slot can be batched with slots already in the batch
     server_slot * slot_batched = nullptr;
+
+    // in embd mode, we temporarily swap out the tokens arr and restore it on clear()
+    bool has_embd = false;
+    llama_token * tokens_ptr = nullptr;
+    std::vector<float> embd;
 
     float  alora_scale       = -1.0f;
     size_t alora_disabled_id = 0;
 
     server_batch() {
-        batch.token = nullptr; // sentinel: uninitialized batch
+        batch.pos = nullptr; // sentinel: uninitialized batch
     }
 
     ~server_batch() {
-        if (batch.token != nullptr) {
+        if (batch.pos != nullptr) {
+            clear();
             llama_batch_free(batch);
         }
     }
 
-    void init(int32_t n_tokens_alloc) {
+    void init(int32_t n_tokens_alloc, int32_t n_embd) {
         this->n_tokens_alloc = n_tokens_alloc;
+        this->n_embd = n_embd;
         batch = llama_batch_init(n_tokens_alloc, 0, 1);
+        tokens_ptr = batch.token;
         tokens.reserve(n_tokens_alloc);
     }
 
-    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output) {
-        GGML_ASSERT(batch.token != nullptr);
+    bool add(int32_t id_slot, llama_token token, llama_pos pos, bool output, bool is_prompt) {
+        GGML_ASSERT(!has_embd); // cannot mix tokens + embd in same batch
+        GGML_ASSERT(batch.pos != nullptr);
         if ((int32_t)tokens.size() >= n_tokens_alloc) {
             return false;
         }
@@ -154,13 +164,30 @@ struct server_batch {
         return true;
     }
 
+    bool add(int32_t id_slot, const std::vector<float> & embd_in, llama_pos pos, bool output, bool is_prompt) {
+        GGML_ASSERT(batch.pos != nullptr);
+        if ((int32_t)tokens.size() >= n_tokens_alloc) {
+            return false;
+        }
+        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output, is_prompt });
+        has_embd = true;
+        embd.insert(embd.end(), embd_in.begin(), embd_in.end());
+        return true;
+    }
+
     void clear() {
         tokens.clear();
+        embd.clear();
         common_batch_clear(batch);
         slot_batched      = nullptr;
         alora_scale       = -1.0f;
         alora_disabled_id = 0;
         batch_rendered    = false;
+        has_embd          = false;
+        if (batch.token == nullptr) {
+            batch.token = tokens_ptr;
+            batch.embd  = nullptr;
+        }
     }
 
     int32_t size() const {
@@ -173,25 +200,33 @@ struct server_batch {
     }
 
     void render() {
-        GGML_ASSERT(batch.token != nullptr);
+        GGML_ASSERT(!batch_rendered);
+        GGML_ASSERT(batch.pos != nullptr);
         common_batch_clear(batch);
         for (int32_t i = 0; i < size(); i++) {
             const auto & t = tokens[i];
             common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
         }
+        if (has_embd) {
+            batch.token = nullptr; // will be restored on clear()
+            batch.embd  = embd.data();
+        }
         batch_rendered = true;
     }
 
     llama_batch get_view(int32_t off, int32_t n_tokens) const {
-        GGML_ASSERT(batch.token != nullptr);
+        GGML_ASSERT(batch.pos != nullptr);
         GGML_ASSERT(batch_rendered);
         GGML_ASSERT(off >= 0 && off < size());
         GGML_ASSERT(n_tokens > 0 && off + n_tokens <= size());
 
+        auto * token = batch.token ? batch.token + off          : nullptr;
+        auto * embd  = batch.embd  ? batch.embd  + off * n_embd : nullptr;
+
         llama_batch view = {
             n_tokens,
-            batch.token    + off,
-            nullptr,
+            token,
+            embd,
             batch.pos      + off,
             batch.n_seq_id + off,
             batch.seq_id   + off,
@@ -1521,14 +1556,24 @@ struct server_slot {
     int32_t ctx_save_pos = -1;
 
     // generation props
-    int32_t n_ctx   = 0;  // context size per slot
-    int32_t n_keep  = 0;
-    int32_t i_batch = -1;
+    int32_t n_ctx       = 0;  // context size per slot
+    int32_t n_keep      = 0;
+    int32_t n_decoded   = 0;
+    int32_t n_remaining = -1;
+    int32_t i_batch     = -1;
+
+    int32_t n_prompt_tokens_cache     = 0;
+    int32_t n_prompt_tokens_processed = 0;
 
     // effective generation limit for the current task, -1 means unlimited
     int32_t n_predict_max = -1;
 
     size_t last_nl_pos = 0;
+
+    int64_t t_start_generation = 0;
+    int32_t n_decoded_last = 0;
+    double t_prompt_processing = 0.0;
+    double t_token_generation  = 0.0;
 
     std::string  generated_text;
     std::string  debug_generated_text;
@@ -1609,7 +1654,10 @@ struct server_slot {
     llama_token sampled; // in speculative mode, this is the last accepted token
 
     // stats
-    size_t n_sent_text = 0; // number of sent text character
+    server_slot_stats stats;
+    int32_t n_draft_total       = 0;
+    int32_t n_draft_accepted    = 0;
+    int32_t n_draft_verif_steps = 0;
 
     // accepted tokens per draft position
     // not in server_slot_stats to avoid copying to every task result
@@ -1765,7 +1813,7 @@ struct server_slot {
             // no speculative decoding
             i_batch = batch.size();
 
-            add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true);
+            add_ok &= batch.add(id, sampled, prompt.tokens.pos_next(), true, false);
 
             SLT_DBG(*this, "slot decode token, id=%d, n_ctx = %d, n_tokens = %d, truncated = %d\n",
                     sampled, n_ctx, prompt.n_tokens(), truncated);
@@ -4516,7 +4564,7 @@ private:
         // note that n_batch can be > n_ctx (e.g. for non-causal attention models such as BERT where the KV cache is not used)
         {
             const int32_t n_batch = llama_n_batch(ctx_tgt);
-            batch.init(std::max(n_batch, params_base.n_parallel));
+            batch.init(std::max(n_batch, params_base.n_parallel), llama_model_n_embd_inp(model_tgt));
         }
 
         if (params_base.cache_ram_mib != 0) {
@@ -5791,22 +5839,7 @@ private:
                     res->id                  = task.id;
                     res->n_processing_slots  = n_processing_slots;
                     res->n_tasks_deferred    = queue_tasks.queue_tasks_deferred_size();
-                    res->t_start             = metrics.t_start;
-
-                    res->n_prompt_tokens_processed_total = metrics.n_prompt_tokens_processed_total;
-                    res->t_prompt_processing_total       = metrics.t_prompt_processing_total;
-                    res->n_tokens_predicted_total        = metrics.n_tokens_predicted_total;
-                    res->t_tokens_generation_total       = metrics.t_tokens_generation_total;
-
-                    res->n_tokens_max = metrics.n_tokens_max;
-
-                    res->n_prompt_tokens_processed = metrics.n_prompt_tokens_processed;
-                    res->t_prompt_processing       = metrics.t_prompt_processing;
-                    res->n_tokens_predicted        = metrics.n_tokens_predicted;
-                    res->t_tokens_generation       = metrics.t_tokens_generation;
-
-                    res->n_decode_total          = metrics.n_decode_total;
-                    res->n_busy_slots_total      = metrics.n_busy_slots_total;
+                    res->metrics = metrics;
 
                     if (task.metrics_reset_bucket) {
                         metrics.reset_bucket();
@@ -8384,36 +8417,36 @@ void server_routes::init_routes() {
             {"counter", {{
                     {"name",  "prompt_tokens_total"},
                     {"help",  "Number of prompt tokens processed."},
-                    {"value",  (uint64_t) res_task->n_prompt_tokens_processed_total}
+                    {"value",  (uint64_t) res_task->metrics.n_prompt_tokens_processed_total}
             }, {
                     {"name",  "prompt_seconds_total"},
                     {"help",  "Prompt process time"},
-                    {"value",  (uint64_t) res_task->t_prompt_processing_total / 1.e3}
+                    {"value",  (uint64_t) res_task->metrics.t_prompt_processing_total / 1.e3}
             }, {
                     {"name",  "tokens_predicted_total"},
                     {"help",  "Number of generation tokens processed."},
-                    {"value",  (uint64_t) res_task->n_tokens_predicted_total}
+                    {"value",  (uint64_t) res_task->metrics.n_tokens_predicted_total}
             }, {
                     {"name",  "tokens_predicted_seconds_total"},
                     {"help",  "Predict process time"},
-                    {"value",  (uint64_t) res_task->t_tokens_generation_total / 1.e3}
+                    {"value",  (uint64_t) res_task->metrics.t_tokens_generation_total / 1.e3}
             }, {
                     {"name",  "n_decode_total"},
                     {"help",  "Total number of llama_decode() calls"},
-                    {"value",  res_task->n_decode_total}
+                    {"value",  res_task->metrics.n_decode_total}
             }, {
                     {"name",  "n_tokens_max"},
                     {"help",  "Largest observed n_tokens."},
-                    {"value",  res_task->n_tokens_max}
+                    {"value",  res_task->metrics.n_tokens_max}
             }}},
             {"gauge", {{
                     {"name",  "prompt_tokens_seconds"},
                     {"help",  "Average prompt throughput in tokens/s."},
-                    {"value",  res_task->n_prompt_tokens_processed ? 1.e3 / res_task->t_prompt_processing * res_task->n_prompt_tokens_processed : 0.}
+                    {"value",  res_task->metrics.n_prompt_tokens_processed ? 1.e3 / res_task->metrics.t_prompt_processing * res_task->metrics.n_prompt_tokens_processed : 0.}
             },{
                     {"name",  "predicted_tokens_seconds"},
                     {"help",  "Average generation throughput in tokens/s."},
-                    {"value",  res_task->n_tokens_predicted ? 1.e3 / res_task->t_tokens_generation * res_task->n_tokens_predicted : 0.}
+                    {"value",  res_task->metrics.n_tokens_predicted ? 1.e3 / res_task->metrics.t_tokens_generation * res_task->metrics.n_tokens_predicted : 0.}
             },{
                     {"name",  "requests_processing"},
                     {"help",  "Number of requests processing."},
@@ -8425,7 +8458,7 @@ void server_routes::init_routes() {
             },{
                     {"name",  "n_busy_slots_per_decode"},
                     {"help",  "Average number of busy slots per llama_decode() call"},
-                    {"value",  (float) res_task->n_busy_slots_total / std::max((float) res_task->n_decode_total, 1.f)}
+                    {"value",  (float) res_task->metrics.n_busy_slots_total / std::max((float) res_task->metrics.n_decode_total, 1.f)}
             }}}
         };
 
@@ -8467,7 +8500,7 @@ void server_routes::init_routes() {
             res->data = res_task->to_metrics();
         }
 
-        res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->t_start);
+        res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->metrics.t_start);
         res->content_type = "text/plain; version=0.0.4";
         res->status = 200;
         res->data = prometheus.str();
