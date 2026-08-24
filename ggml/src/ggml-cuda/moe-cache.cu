@@ -1737,7 +1737,7 @@ static void * moe_cache_begin(
         }
 
         auto route_weight = [&](moe_cache_device & candidate) -> size_t {
-            if (candidate.dead.load() || !moe_cache_prepare_budget(session, candidate)) {
+            if (candidate.dead.load() || !moe_cache_prepare_budget(*session, candidate)) {
                 return 0;
             }
             const size_t reserved = moe_cache_scratch_total(
