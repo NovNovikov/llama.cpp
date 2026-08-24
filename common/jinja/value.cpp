@@ -1404,9 +1404,9 @@ static value fromjson(const func_args & args) {
     const auto & input = args.get_pos(0)->as_string();
 
     try {
-        const auto parsed = nlohmann::ordered_json::parse(input.str());
+        const auto parsed = common_json::parse(input.str());
         return from_json(parsed, input.all_parts_are_input());
-    } catch (const nlohmann::json::exception & e) {
+    } catch (const common_json_error & e) {
         throw raised_exception("fromjson: failed to parse JSON: " + std::string(e.what()));
     }
 }
