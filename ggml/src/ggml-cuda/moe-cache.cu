@@ -1365,6 +1365,7 @@ static void * moe_cache_session_create(
             }
         }
         if (!config.enabled) {
+            MOE_CACHE_LOG("[moe-cache] disabled by GGML_CUDA_MOE_CACHE or GGML_CUDA_MOE_CACHE_MODE\n");
             return nullptr;
         }
 
@@ -1414,11 +1415,16 @@ static void * moe_cache_session_create(
         }
 
         if (session->devices.empty()) {
+            MOE_CACHE_LOG("[moe-cache] session creation failed: no selected CUDA device meets the compute capability floor\n");
             return nullptr;
         }
         if (!moe_cache_budget_register(*session)) {
+            MOE_CACHE_LOG("[moe-cache] session creation failed: unable to register the shared VRAM budget\n");
             return nullptr;
         }
+
+        MOE_CACHE_LOG("[moe-cache] session ready: mode=%s selected-devices=%zu; pools allocate lazily after stable routed-expert demand\n",
+                session->config.automatic ? "auto" : "on", session->devices.size());
 
         moe_cache_session * result = session.get();
         try {
