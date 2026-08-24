@@ -1326,6 +1326,7 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         common_fit_params(params.model.path.c_str(), &mparams, &cparams,
             params.tensor_split,
             params.tensor_buft_overrides.data(),
+            &params.moe_cache,
             params.fit_params_target.data(),
             params.fit_params_min_ctx,
             has_draft || spec_mtp ? &extra : nullptr,
