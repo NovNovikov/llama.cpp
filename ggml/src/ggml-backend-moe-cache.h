@@ -10,6 +10,7 @@ extern "C" {
 #endif
 
 struct ggml_moe_cache_config {
+    int32_t automatic;
     size_t budget_bytes;
     size_t reserve_bytes;
     size_t min_expert_bytes;
