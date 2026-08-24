@@ -11,7 +11,11 @@ extern "C" {
 
 void ggml_moe_cache_register(const void * owner);
 
-// Surrender the device's cache VRAM under allocator pressure; returns bytes freed.
+// Surrender enough reconstructible cache VRAM for a mandatory CUDA allocation.
+// Returns bytes physically released through the cache allocator.
+size_t ggml_moe_cache_reclaim(int device, size_t allocation_bytes, const char * reason);
+
+// Compatibility entry point for callers that explicitly want to discard all cache VRAM.
 size_t ggml_moe_cache_trim(int device);
 
 #ifdef __cplusplus

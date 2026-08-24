@@ -495,6 +495,8 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
+        (void) ggml_moe_cache_reclaim(
+                device, look_ahead_size, "CUDA temporary allocation");
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
@@ -508,8 +510,12 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 // Last resort: surrender cache storage before aborting on allocation failure.
 
                 (void)cudaGetLastError();
-                if (ggml_moe_cache_trim(device) > 0) {
+                if (ggml_moe_cache_reclaim(
+                            device, look_ahead_size,
+                            "CUDA temporary allocation retry") > 0) {
                     err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
+                    GGML_LOG_INFO(GGML_CUDA_NAME " pool[%d]: cache reclaim retry %s\n",
+                            device, err == cudaSuccess ? "succeeded" : "failed");
                 }
             }
             if (err == cudaSuccess) {
@@ -600,10 +606,16 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
 #else
+            (void) ggml_moe_cache_reclaim(
+                    device, reserve_size, "CUDA VMM temporary allocation");
             CUresult create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
             if (create_result == CUDA_ERROR_OUT_OF_MEMORY &&
-                ggml_moe_cache_trim(device) > 0) {
+                ggml_moe_cache_reclaim(
+                        device, reserve_size,
+                        "CUDA VMM temporary allocation retry") > 0) {
                 create_result = cuMemCreate(&handle, reserve_size, &prop, 0);
+                GGML_LOG_INFO(GGML_CUDA_NAME " VMM pool[%d]: cache reclaim retry %s\n",
+                        device, create_result == CUDA_SUCCESS ? "succeeded" : "failed");
             }
             CU_CHECK(create_result);
 #endif
@@ -907,7 +919,19 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_cuda_set_device(buft_ctx->device);
 
     void * dev_ptr;
+    (void) ggml_moe_cache_reclaim(
+            buft_ctx->device, size, "CUDA backend buffer allocation");
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+    if (err == cudaErrorMemoryAllocation) {
+        (void) cudaGetLastError();
+        if (ggml_moe_cache_reclaim(
+                    buft_ctx->device, size,
+                    "CUDA backend buffer allocation retry") > 0) {
+            err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
+            GGML_LOG_INFO(GGML_CUDA_NAME " buffer[%d]: cache reclaim retry %s\n",
+                    buft_ctx->device, err == cudaSuccess ? "succeeded" : "failed");
+        }
+    }
     if (err != cudaSuccess) {
         // clear the error
         (void)cudaGetLastError();

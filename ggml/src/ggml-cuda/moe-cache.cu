@@ -2,6 +2,14 @@
 
 #if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
 
+extern "C" size_t ggml_moe_cache_reclaim(
+        int device, size_t allocation_bytes, const char * reason) {
+    (void) device;
+    (void) allocation_bytes;
+    (void) reason;
+    return 0;
+}
+
 extern "C" size_t ggml_moe_cache_trim(int device) {
     (void) device;
     return 0;
@@ -22,6 +30,7 @@ void ggml_moe_cache_register(const void * owner) {
 
 #include <algorithm>
 #include <atomic>
+#include <chrono>
 #include <cerrno>
 #include <climits>
 #include <condition_variable>
@@ -42,6 +51,10 @@ void ggml_moe_cache_register(const void * owner) {
 #include <vector>
 
 #define MOE_CACHE_LOG(...) GGML_LOG_INFO(__VA_ARGS__)
+
+// This was the old minimum viable pool size. Keeping it as one physical slab
+// makes each reclaim meaningful while avoiding a new arbitrary allocator unit.
+static constexpr size_t moe_cache_slab_slots = 64;
 
 enum class moe_cache_slot_state : uint8_t {
     free,
@@ -97,7 +110,7 @@ struct moe_cache_shape {
     int wtype = -1;
     int64_t n_expert = 0;
     int64_t n_tensors = 0;
-    int pool = -1;
+    std::vector<int> pools;
     bool finished = false;
 };
 
@@ -125,7 +138,7 @@ struct moe_cache_config {
     bool enabled = true;
     bool automatic = true;
     size_t budget_mb = 0;
-    size_t reserve_mb = 3072;
+    size_t reserve_mb = 0;
     size_t min_expert_bytes = 1u << 20;
     bool min_expert_explicit = false;
     int max_batch = 1;
@@ -169,13 +182,12 @@ struct moe_cache_device {
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
     int stable_visits = 0;
     bool saw_repeat = false;
-    bool budget_ready = false;
     bool budget_registered = false;
-    bool budget_claimed = false;
     size_t budget_limit = 0;
-    size_t coordinator_allocated_bytes = 0;
     size_t allocated_bytes = 0;
     moe_cache_scratch scratch_reserve;
+    std::chrono::steady_clock::time_point regrow_after;
+    bool reclaiming = false;
 
     std::deque<moe_cache_job> queue;
     size_t queued_bytes = 0;
@@ -268,9 +280,7 @@ static std::unordered_set<moe_cache_session *> g_sessions;
 static std::atomic<int> g_session_count{0};
 struct moe_cache_physical_budget {
     int participants = 0;
-    int prepared = 0;
     size_t reserve_bytes = 0;
-    size_t outstanding_bytes = 0;
 };
 static std::mutex g_budget_mu;
 static std::unordered_map<int, moe_cache_physical_budget> g_physical_budgets;
@@ -281,8 +291,9 @@ struct moe_cache_scope_frame {
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
 static thread_local int g_session_suppressed = 0;
 
-static size_t moe_cache_trim_session(
-        moe_cache_session & session, int physical_device);
+static size_t moe_cache_reclaim_session(
+        moe_cache_session & session, int physical_device,
+        size_t requested, const char * reason);
 
 static bool moe_cache_budget_register(moe_cache_session & session) {
     std::lock_guard<std::mutex> lock(g_budget_mu);
@@ -313,33 +324,29 @@ static bool moe_cache_budget_register(moe_cache_session & session) {
     }
 }
 
+static size_t moe_cache_device_bytes(const moe_cache_device & device) {
+    size_t result = device.allocated_bytes;
+    const size_t scratch[] = {
+        device.d_ids_cap,
+        device.d_act_cap,
+        device.act_q8_cap,
+        device.d_out_cap,
+    };
+    for (size_t bytes : scratch) {
+        if (bytes > SIZE_MAX - result) {
+            return SIZE_MAX;
+        }
+        result += bytes;
+    }
+    return result;
+}
+
 static void moe_cache_budget_allocation(
         moe_cache_device & device, size_t bytes, bool allocated) {
-    if (!device.budget_registered || !device.budget_claimed || bytes == 0) {
-        return;
-    }
-    std::lock_guard<std::mutex> lock(g_budget_mu);
-    auto found = g_physical_budgets.find(device.physical);
-    if (found == g_physical_budgets.end()) {
-        return;
-    }
-    moe_cache_physical_budget & state = found->second;
-    if (allocated) {
-        const size_t remaining = device.budget_limit > device.coordinator_allocated_bytes
-            ? device.budget_limit - device.coordinator_allocated_bytes : 0;
-        const size_t tracked = std::min(bytes, remaining);
-        device.coordinator_allocated_bytes += tracked;
-        state.outstanding_bytes = tracked <= state.outstanding_bytes
-            ? state.outstanding_bytes - tracked : 0;
-    } else {
-        const size_t tracked = std::min(bytes, device.coordinator_allocated_bytes);
-        device.coordinator_allocated_bytes -= tracked;
-        if (tracked <= SIZE_MAX - state.outstanding_bytes) {
-            state.outstanding_bytes += tracked;
-        } else {
-            state.outstanding_bytes = SIZE_MAX;
-        }
-    }
+    (void) device;
+    (void) bytes;
+    (void) allocated;
+    // Capacity is refreshed from cudaMemGetInfo() at every cache growth decision.
 }
 
 static void moe_cache_budget_unregister(moe_cache_device & device) {
@@ -350,26 +357,16 @@ static void moe_cache_budget_unregister(moe_cache_device & device) {
     auto found = g_physical_budgets.find(device.physical);
     if (found != g_physical_budgets.end()) {
         moe_cache_physical_budget & state = found->second;
-        if (device.budget_claimed) {
-            const size_t unallocated = device.budget_limit > device.coordinator_allocated_bytes
-                ? device.budget_limit - device.coordinator_allocated_bytes : 0;
-            state.outstanding_bytes = unallocated <= state.outstanding_bytes
-                ? state.outstanding_bytes - unallocated : 0;
-            state.prepared = std::max(state.prepared - 1, 0);
-        }
         state.participants = std::max(state.participants - 1, 0);
         if (state.participants == 0) {
             g_physical_budgets.erase(found);
         }
     }
     device.budget_registered = false;
-    device.budget_claimed = false;
-    device.budget_ready = false;
     device.budget_limit = 0;
-    device.coordinator_allocated_bytes = 0;
 }
 
-static size_t moe_cache_budget_claim(
+static size_t moe_cache_budget_refresh(
         moe_cache_session & session, moe_cache_device & device,
         size_t free_memory) {
     std::lock_guard<std::mutex> lock(g_budget_mu);
@@ -380,18 +377,15 @@ static size_t moe_cache_budget_claim(
     moe_cache_physical_budget & state = found->second;
     const size_t available_after_reserve = free_memory > state.reserve_bytes
         ? free_memory - state.reserve_bytes : 0;
-    const size_t unclaimed = available_after_reserve > state.outstanding_bytes
-        ? available_after_reserve - state.outstanding_bytes : 0;
-    const int remaining_participants = std::max(
-            state.participants - state.prepared, 1);
-    size_t claim = unclaimed / (size_t)remaining_participants;
+    const size_t share = available_after_reserve /
+        (size_t)std::max(state.participants, 1);
+    const size_t current = moe_cache_device_bytes(device);
+    size_t limit = share > SIZE_MAX - current ? SIZE_MAX : current + share;
     if (session.config.budget_mb > 0) {
-        claim = std::min(claim, session.config.budget_mb << 20);
+        const size_t configured = session.config.budget_mb << 20;
+        limit = std::max(current, std::min(limit, configured));
     }
-    state.prepared++;
-    state.outstanding_bytes += claim;
-    device.budget_claimed = true;
-    return claim;
+    return limit;
 }
 
 static bool moe_cache_env_i64(
@@ -872,7 +866,7 @@ static int moe_cache_query_shape(
     const size_t row_size = ggml_row_size((ggml_type)wtype, n_in);
     if (row_size == 0 || (uint64_t)n_out > SIZE_MAX / row_size ||
         expert_size != (size_t)n_out * row_size ||
-        expert_size > SIZE_MAX / 64) {
+        expert_size > SIZE_MAX / moe_cache_slab_slots) {
         return 0;
     }
 
@@ -881,7 +875,7 @@ static int moe_cache_query_shape(
         return 0;
     }
     const size_t scratch_bytes = moe_cache_scratch_total(scratch);
-    const size_t pool_bytes = expert_size * 64;
+    const size_t pool_bytes = expert_size * moe_cache_slab_slots;
     if (scratch_bytes == SIZE_MAX || pool_bytes > SIZE_MAX - scratch_bytes) {
         return 0;
     }
@@ -1035,7 +1029,8 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
 
         if (error != cudaSuccess) {
             moe_cache_cuda_ok(*device, error, "expert fill", true);
-            moe_cache_trim_session(*session, device->physical);
+            moe_cache_reclaim_session(*session, device->physical,
+                    job.bytes, "expert fill failure");
         }
     }
 
@@ -1066,22 +1061,24 @@ static bool moe_cache_start_worker(
 
 static int moe_cache_find_pool(
         const moe_cache_device & device, size_t expert_size, int wtype) {
+    int fallback = -1;
     for (int index = 0; index < (int)device.pools.size(); index++) {
         const moe_cache_pool & pool = *device.pools[index];
-        if (pool.expert_size == expert_size && pool.wtype == wtype) {
+        if (!pool.slab || pool.expert_size != expert_size || pool.wtype != wtype) {
+            continue;
+        }
+        if (!pool.free_slots.empty()) {
             return index;
         }
+        if (fallback < 0) {
+            fallback = index;
+        }
     }
-    return -1;
+    return fallback;
 }
 
 static bool moe_cache_prepare_budget(
         moe_cache_session & session, moe_cache_device & device) {
-    if (device.budget_ready) {
-        return device.budget_limit > 0;
-    }
-    device.budget_ready = true;
-
     ggml_cuda_set_device(device.logical);
     size_t free_memory = 0;
     size_t total_memory = 0;
@@ -1091,17 +1088,15 @@ static bool moe_cache_prepare_budget(
         return false;
     }
 
-    const size_t available = moe_cache_budget_claim(
+    const size_t limit = moe_cache_budget_refresh(
             session, device, free_memory);
-    device.budget_limit = available;
+    device.budget_limit = limit;
 
-    if (available == 0) {
+    if (limit < moe_cache_device_bytes(device)) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d has no unclaimed cache budget after the shared %zu MiB reserve\n",
                 device.physical, session.config.reserve_mb);
         return false;
     }
-    MOE_CACHE_LOG("[moe-cache] CUDA%d claimed %zu MiB of process-wide cache capacity\n",
-            device.physical, available >> 20);
     return true;
 }
 
@@ -1131,29 +1126,17 @@ static bool moe_cache_allocate_pool(
         return false;
     }
     slot_count = std::min(slot_count, (size_t)INT_MAX / stride_blocks);
-    if (slot_count > INT_MAX) {
-        slot_count = INT_MAX;
-    }
-    if (slot_count < 64) {
+    slot_count = std::min<size_t>(slot_count, moe_cache_slab_slots);
+    if (slot_count < moe_cache_slab_slots) {
         return false;
     }
 
     ggml_cuda_set_device(device.logical);
     char * slab = nullptr;
-    cudaError_t error = cudaSuccess;
-    while (slot_count >= 64) {
-        if (moe_cache_fail(session, "slab")) {
-            error = cudaErrorMemoryAllocation;
-        } else {
-            error = cudaMalloc((void **)&slab, slot_count * shape.expert_size);
-        }
-        if (error == cudaSuccess) {
-            break;
-        }
-        (void)cudaGetLastError();
-        slot_count /= 2;
-    }
-    if (error != cudaSuccess || !slab || slot_count < 64) {
+    cudaError_t error = moe_cache_fail(session, "slab")
+        ? cudaErrorMemoryAllocation
+        : cudaMalloc((void **)&slab, slot_count * shape.expert_size);
+    if (error != cudaSuccess || !slab || slot_count < moe_cache_slab_slots) {
         MOE_CACHE_LOG("[moe-cache] CUDA%d skipped %zu KiB expert pool: allocation failed\n",
                 device.physical, shape.expert_size >> 10);
         return false;
@@ -1185,7 +1168,15 @@ static bool moe_cache_allocate_pool(
         return false;
     }
 
-    shape.pool = (int)device.pools.size() - 1;
+    const int pool_index = (int)device.pools.size() - 1;
+    try {
+        shape.pools.push_back(pool_index);
+    } catch (...) {
+        cudaFree(device.pools.back()->slab);
+        moe_cache_budget_allocation(device, allocated, false);
+        device.pools.pop_back();
+        return false;
+    }
     device.allocated_bytes += allocated;
 
     if (!moe_cache_start_worker(session, device)) {
@@ -1194,7 +1185,7 @@ static bool moe_cache_allocate_pool(
         device.pools.back()->slab = nullptr;
         device.pools.pop_back();
         device.allocated_bytes -= allocated;
-        shape.pool = -1;
+        shape.pools.pop_back();
         return false;
     }
 
@@ -1208,7 +1199,7 @@ static bool moe_cache_allocate_pool(
         session.announced = true;
     }
     MOE_CACHE_LOG("[moe-cache] CUDA%d pool[%d]: type=%s expert=%zu KiB slots=%zu total=%zu MiB\n",
-            device.physical, shape.pool, ggml_type_name((ggml_type)shape.wtype),
+            device.physical, pool_index, ggml_type_name((ggml_type)shape.wtype),
             shape.expert_size >> 10, slot_count, allocated >> 20);
 
     return true;
@@ -1275,11 +1266,6 @@ static int moe_cache_discover_pool(
         moe_cache_session & session, moe_cache_device & device,
         const void * host_base, size_t tensor_size, size_t expert_size,
         int wtype, int64_t n_expert) {
-    int pool = moe_cache_find_pool(device, expert_size, wtype);
-    if (pool >= 0) {
-        return pool;
-    }
-
     moe_cache_shape * shape = nullptr;
     for (moe_cache_shape & candidate : device.shapes) {
         if (candidate.expert_size == expert_size && candidate.wtype == wtype) {
@@ -1288,7 +1274,7 @@ static int moe_cache_discover_pool(
         }
     }
     if (!shape) {
-        device.shapes.push_back({expert_size, wtype, n_expert, 0, -1, false});
+        device.shapes.push_back({expert_size, wtype, n_expert, 0, {}, false});
         shape = &device.shapes.back();
     } else {
         shape->n_expert = std::max(shape->n_expert, n_expert);
@@ -1297,7 +1283,7 @@ static int moe_cache_discover_pool(
     const bool first_visit = device.seen_tensors.emplace(
             host_base, moe_cache_seen_tensor{tensor_size, expert_size, wtype}).second;
     if (first_visit) {
-        if (shape->n_tensors == 0 && shape->pool < 0) {
+        if (shape->n_tensors == 0 && shape->pools.empty()) {
             shape->finished = false;
         }
         shape->n_tensors++;
@@ -1313,8 +1299,30 @@ static int moe_cache_discover_pool(
         return -1;
     }
 
-    moe_cache_build_pending(session, device);
-    return moe_cache_find_pool(device, expert_size, wtype);
+    int pool = moe_cache_find_pool(device, expert_size, wtype);
+    if (pool >= 0 && !device.pools[pool]->free_slots.empty()) {
+        return pool;
+    }
+
+    if (pool < 0) {
+        moe_cache_build_pending(session, device);
+        return moe_cache_find_pool(device, expert_size, wtype);
+    }
+
+    if (std::chrono::steady_clock::now() < device.regrow_after ||
+        !moe_cache_prepare_budget(session, device)) {
+        return pool;
+    }
+    const size_t scratch_reserve = moe_cache_scratch_total(device.scratch_reserve);
+    const size_t slab_limit = device.budget_limit > scratch_reserve
+        ? device.budget_limit - scratch_reserve : 0;
+    const size_t available = slab_limit > device.allocated_bytes
+        ? slab_limit - device.allocated_bytes : 0;
+    if (available >= expert_size * moe_cache_slab_slots &&
+        moe_cache_allocate_pool(session, device, *shape, available)) {
+        return moe_cache_find_pool(device, expert_size, wtype);
+    }
+    return pool;
 }
 
 static void moe_cache_log_stats(moe_cache_device & device) {
@@ -1322,6 +1330,9 @@ static void moe_cache_log_stats(moe_cache_device & device) {
     size_t slots = 0;
     for (const auto & pool_ptr : device.pools) {
         const moe_cache_pool & pool = *pool_ptr;
+        if (!pool.slab) {
+            continue;
+        }
         slots += pool.n_slots;
         used += pool.n_slots - pool.free_slots.size();
     }
@@ -1669,7 +1680,7 @@ static void * moe_cache_begin(
     if (row_size == 0 || (uint64_t)n_out > SIZE_MAX / row_size ||
         expert_size != (size_t)n_out * row_size ||
         (uint64_t)n_expert > SIZE_MAX / expert_size ||
-        expert_size > SIZE_MAX / 64) {
+        expert_size > SIZE_MAX / moe_cache_slab_slots) {
         return nullptr;
     }
     const size_t tensor_size = (size_t)n_expert * expert_size;
@@ -1692,7 +1703,7 @@ static void * moe_cache_begin(
 
         int budget_devices = 0;
         int eligible_devices = 0;
-        const size_t minimum_pool = expert_size * 64;
+        const size_t minimum_pool = expert_size * moe_cache_slab_slots;
         for (const auto & device_ptr : session->devices) {
             moe_cache_device & candidate = *device_ptr;
             if (candidate.dead.load() ||
@@ -1705,25 +1716,28 @@ static void * moe_cache_begin(
             const size_t slab_limit =
                 candidate.budget_limit > reserved
                     ? candidate.budget_limit - reserved : 0;
-            if (slab_limit >= minimum_pool) {
+            const bool has_pool = moe_cache_find_pool(
+                    candidate, expert_size, wtype) >= 0;
+            if ((has_pool && slab_limit >= candidate.allocated_bytes) ||
+                (!has_pool && slab_limit >= minimum_pool)) {
                 eligible_devices++;
             }
         }
-        if (budget_devices == 0 ||
-            (session->config.automatic && budget_devices < 2)) {
+        if (budget_devices == 0) {
             session->dormant.store(true);
             lock.unlock();
             for (const auto & device_ptr : session->devices) {
-                moe_cache_trim_session(*session, device_ptr->physical);
+                moe_cache_reclaim_session(*session, device_ptr->physical,
+                        SIZE_MAX, "session became dormant");
             }
             return nullptr;
         }
-        if (session->config.automatic && eligible_devices < 2) {
+        if (eligible_devices == 0) {
             return nullptr;
         }
 
         auto route_weight = [&](moe_cache_device & candidate) -> size_t {
-            if (candidate.dead.load() || !candidate.budget_ready) {
+            if (candidate.dead.load() || !moe_cache_prepare_budget(session, candidate)) {
                 return 0;
             }
             const size_t reserved = moe_cache_scratch_total(
@@ -1855,8 +1869,11 @@ static void * moe_cache_begin(
 
         const size_t selected_scratch = moe_cache_scratch_total(
                 selected->scratch_reserve, &scratch_requirements);
-        if (selected_scratch >= selected->budget_limit ||
-            minimum_pool > selected->budget_limit - selected_scratch) {
+        const bool selected_has_pool = moe_cache_find_pool(
+                *selected, expert_size, wtype) >= 0;
+        if (selected_scratch > selected->budget_limit ||
+            (!selected_has_pool &&
+             minimum_pool > selected->budget_limit - selected_scratch)) {
             return nullptr;
         }
         selected->scratch_reserve.ids = std::max(
@@ -1955,15 +1972,52 @@ static int moe_cache_plan(
 
     moe_cache_session & session = *node->session;
     moe_cache_device & device = *node->device;
-    moe_cache_pool & pool = *node->pool;
     int hits = 0;
     int inserts_left = session.config.inserts_per_plan;
     bool wake_worker = false;
 
     std::unique_lock<std::mutex> lock(session.mu);
-    if (session.stopping) {
+    if (session.stopping || device.reclaiming) {
         return 0;
     }
+
+    int selected_pool = -1;
+    int selected_hits = -1;
+    bool selected_has_free = false;
+    for (int pool_index = 0; pool_index < (int)device.pools.size(); pool_index++) {
+        moe_cache_pool & candidate = *device.pools[pool_index];
+        if (!candidate.slab || candidate.expert_size != node->expert_size ||
+            candidate.wtype != node->wtype) {
+            continue;
+        }
+        int candidate_hits = 0;
+        for (int index = 0; index < n_ids; index++) {
+            const int32_t expert = ids[index];
+            if (expert < 0 || expert >= node->n_expert) {
+                continue;
+            }
+            const moe_cache_key key{node->host_base, expert};
+            const auto found = candidate.map.find(key);
+            if (found != candidate.map.end() &&
+                candidate.slots[found->second].state == moe_cache_slot_state::valid) {
+                candidate_hits++;
+            }
+        }
+        const bool has_free = !candidate.free_slots.empty();
+        if (selected_pool < 0 || candidate_hits > selected_hits ||
+            (candidate_hits == selected_hits && has_free && !selected_has_free)) {
+            selected_pool = pool_index;
+            selected_hits = candidate_hits;
+            selected_has_free = has_free;
+        }
+    }
+    if (selected_pool < 0) {
+        return 0;
+    }
+    node->pool_index = selected_pool;
+    node->pool = device.pools[selected_pool].get();
+    moe_cache_pool & pool = *node->pool;
+
     for (int index = 0; index < n_ids; index++) {
         const int32_t expert = ids[index];
         if (expert < 0 || expert >= node->n_expert || device.dead.load()) {
@@ -2387,7 +2441,8 @@ static void moe_cache_end(void * opaque) {
     }
     if (trim && node->dispatch_lock.owns_lock()) {
         node->dispatch_lock.unlock();
-        moe_cache_trim_session(session, node->device->physical);
+        moe_cache_reclaim_session(session, node->device->physical,
+                SIZE_MAX, "cache execution failure");
     }
 }
 
@@ -2440,7 +2495,7 @@ static void moe_cache_invalidate_session(
                     if (shape.expert_size == it->second.expert_size &&
                         shape.wtype == it->second.wtype) {
                         shape.n_tensors = std::max<int64_t>(shape.n_tensors - 1, 0);
-                        if (shape.n_tensors == 0 && shape.pool < 0) {
+                        if (shape.n_tensors == 0 && shape.pools.empty()) {
                             shape.finished = false;
                         }
                         break;
@@ -2478,8 +2533,28 @@ static void moe_cache_invalidate(const void * base, size_t size) {
     }
 }
 
-static size_t moe_cache_trim_session(
-        moe_cache_session & session, int physical_device) {
+static void moe_cache_shape_forget_pool(
+        moe_cache_device & device, int pool_index) {
+    for (moe_cache_shape & shape : device.shapes) {
+        shape.pools.erase(std::remove(shape.pools.begin(), shape.pools.end(), pool_index),
+                shape.pools.end());
+        if (shape.pools.empty() && shape.n_tensors > 0) {
+            shape.finished = false;
+        }
+    }
+}
+
+static size_t moe_cache_pool_heat(const moe_cache_pool & pool) {
+    size_t heat = 0;
+    for (const moe_cache_slot & slot : pool.slots) {
+        heat += slot.uses;
+    }
+    return heat;
+}
+
+static size_t moe_cache_reclaim_session(
+        moe_cache_session & session, int physical_device,
+        size_t requested, const char * reason) {
     moe_cache_device * selected = nullptr;
     for (auto & device_ptr : session.devices) {
         if (device_ptr->physical == physical_device) {
@@ -2493,33 +2568,95 @@ static size_t moe_cache_trim_session(
 
     std::unique_lock<std::mutex> dispatch_lock(selected->dispatch_mu);
     std::unique_lock<std::mutex> lock(session.mu);
-    selected->dead.store(true);
+    selected->reclaiming = true;
     moe_cache_cancel_queue_locked(*selected, nullptr, 0, true);
     session.cv.notify_all();
     session.idle_cv.wait(lock, [&] {
         return !selected->inflight;
     });
 
-    size_t freed = 0;
-    for (const auto & pool_ptr : selected->pools) {
-        if (pool_ptr->slab) {
-            freed += (size_t)pool_ptr->n_slots * pool_ptr->expert_size;
+    ggml_cuda_set_device(selected->logical);
+    if (selected->compute_stream) {
+        (void) moe_cache_cuda_ok(*selected,
+                cudaStreamSynchronize(selected->compute_stream),
+                "reclaim synchronization", true);
+    }
+
+    const size_t before = moe_cache_device_bytes(*selected);
+    size_t released = 0;
+    std::vector<int> candidates;
+    for (int index = 0; index < (int)selected->pools.size(); index++) {
+        if (selected->pools[index]->slab) {
+            candidates.push_back(index);
         }
     }
-    freed += selected->d_out_cap + selected->d_act_cap +
-             selected->act_q8_cap + selected->d_ids_cap;
-    lock.unlock();
-    moe_cache_free_device(*selected);
-    moe_cache_budget_unregister(*selected);
+    std::sort(candidates.begin(), candidates.end(), [&](int lhs, int rhs) {
+        const moe_cache_pool & a = *selected->pools[lhs];
+        const moe_cache_pool & b = *selected->pools[rhs];
+        const size_t heat_a = moe_cache_pool_heat(a);
+        const size_t heat_b = moe_cache_pool_heat(b);
+        if (heat_a != heat_b) {
+            return heat_a < heat_b;
+        }
+        return (size_t)a.n_slots * a.expert_size >
+            (size_t)b.n_slots * b.expert_size;
+    });
 
-    if (freed > 0) {
-        MOE_CACHE_LOG("[moe-cache] CUDA%d trimmed %zu MiB after a cache failure or allocator pressure\n",
-                physical_device, freed >> 20);
+    for (int index : candidates) {
+        if (released >= requested) {
+            break;
+        }
+        moe_cache_pool & pool = *selected->pools[index];
+        const size_t bytes = (size_t)pool.n_slots * pool.expert_size;
+        for (int slot = 0; slot < pool.n_slots; slot++) {
+            moe_cache_slot_reset(pool, slot, false);
+        }
+        pool.free_slots.clear();
+        if (moe_cache_cuda_ok(*selected, cudaFree(pool.slab),
+                "reclaim slab free", false)) {
+            pool.slab = nullptr;
+            selected->allocated_bytes = bytes <= selected->allocated_bytes
+                ? selected->allocated_bytes - bytes : 0;
+            moe_cache_budget_allocation(*selected, bytes, false);
+            moe_cache_shape_forget_pool(*selected, index);
+            released += bytes;
+        }
     }
-    return freed;
+
+    auto release_scratch = [&](auto & pointer, size_t & capacity,
+                               const char * name) {
+        if (!pointer || released >= requested) {
+            return;
+        }
+        const size_t bytes = capacity;
+        if (moe_cache_cuda_ok(*selected, cudaFree(pointer), name, false)) {
+            pointer = nullptr;
+            capacity = 0;
+            moe_cache_budget_allocation(*selected, bytes, false);
+            released += bytes;
+        }
+    };
+    release_scratch(selected->d_out, selected->d_out_cap, "reclaim output scratch free");
+    release_scratch(selected->d_act_q8, selected->act_q8_cap, "reclaim quantized scratch free");
+    release_scratch(selected->d_act, selected->d_act_cap, "reclaim activation scratch free");
+    release_scratch(selected->d_ids, selected->d_ids_cap, "reclaim ids scratch free");
+
+    selected->regrow_after = std::chrono::steady_clock::now() +
+        std::chrono::seconds(1);
+    selected->reclaiming = false;
+    session.idle_cv.notify_all();
+
+    if (released > 0) {
+        MOE_CACHE_LOG("[moe-cache] CUDA%d pressure: reason=%s cache-before=%zu MiB requested-release=%zu MiB released=%zu MiB cache-after=%zu MiB\n",
+                physical_device, reason ? reason : "unknown", before >> 20,
+                requested >> 20, released >> 20,
+                moe_cache_device_bytes(*selected) >> 20);
+    }
+    return released;
 }
 
-extern "C" size_t ggml_moe_cache_trim(int device) {
+extern "C" size_t ggml_moe_cache_reclaim(
+        int device, size_t allocation_bytes, const char * reason) {
     if (g_session_count.load(std::memory_order_acquire) == 0) {
         return 0;
     }
@@ -2528,12 +2665,45 @@ extern "C" size_t ggml_moe_cache_trim(int device) {
         return 0;
     }
     const int physical_device = info.devices[device].physical_device;
+    ggml_cuda_set_device(device);
+    size_t free_memory = 0;
+    size_t total_memory = 0;
+    if (cudaMemGetInfo(&free_memory, &total_memory) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return 0;
+    }
+    size_t reserve = 0;
+    {
+        std::lock_guard<std::mutex> budget_lock(g_budget_mu);
+        auto found = g_physical_budgets.find(physical_device);
+        if (found != g_physical_budgets.end()) {
+            reserve = found->second.reserve_bytes;
+        }
+    }
+    const size_t usable_free = free_memory > reserve ? free_memory - reserve : 0;
+    const size_t requested = allocation_bytes > usable_free
+        ? allocation_bytes - usable_free : 0;
+    if (requested == 0) {
+        return 0;
+    }
+
+    MOE_CACHE_LOG("[moe-cache] CUDA%d pressure: compute-request=%zu MiB usable-free=%zu MiB reserve=%zu MiB\n",
+            physical_device, allocation_bytes >> 20, usable_free >> 20, reserve >> 20);
+
     size_t freed = 0;
     std::lock_guard<std::mutex> registry_lock(g_registry_mu);
     for (moe_cache_session * session : g_sessions) {
-        freed += moe_cache_trim_session(*session, physical_device);
+        if (freed >= requested) {
+            break;
+        }
+        freed += moe_cache_reclaim_session(*session, physical_device,
+                requested - freed, reason);
     }
     return freed;
+}
+
+extern "C" size_t ggml_moe_cache_trim(int device) {
+    return ggml_moe_cache_reclaim(device, SIZE_MAX, "explicit cache trim");
 }
 
 void ggml_moe_cache_register(const void * owner) {
