@@ -331,6 +331,8 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
             return new llama_model_mimo2(params);
         case LLM_ARCH_KIMI_LINEAR:
             return new llama_model_kimi_linear(params);
+        case LLM_ARCH_KIMI_K3:
+            return new llama_model_kimi_k3(params);
         case LLM_ARCH_SOLAR_OPEN2:
             return new llama_model_solar_open2(params);
         case LLM_ARCH_STEP35:
@@ -2697,6 +2699,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON_H:
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_KIMI_LINEAR:
+        case LLM_ARCH_KIMI_K3:
         case LLM_ARCH_SOLAR_OPEN2:
         case LLM_ARCH_INKLING:
             return LLAMA_ROPE_TYPE_NONE;
