@@ -48,6 +48,17 @@ enum ggml_moe_cache_mode {
     GGML_MOE_CACHE_MODE_ON = 2,
 };
 
+enum ggml_moe_cache_bypass_reason {
+    GGML_MOE_CACHE_BYPASS_API = 0,
+    GGML_MOE_CACHE_BYPASS_SRC0_OP,
+    GGML_MOE_CACHE_BYPASS_NO_BUFFER,
+    GGML_MOE_CACHE_BYPASS_NOT_HOST,
+    GGML_MOE_CACHE_BYPASS_NOT_WEIGHTS,
+    GGML_MOE_CACHE_BYPASS_SRC1_TYPE,
+    GGML_MOE_CACHE_BYPASS_ROWS,
+    GGML_MOE_CACHE_BYPASS_COUNT,
+};
+
 struct ggml_moe_cache_api {
     const void * owner;
 
@@ -79,6 +90,11 @@ struct ggml_moe_cache_api {
 
     // Releases slot pins and all per-node ownership. Must be called exactly once for every non-NULL begin result, on every success or failure path.
     void (*end)(void * node);
+
+    // Reports why a CPU MUL_MAT_ID node did not reach begin(). This is
+    // diagnostic-only and is not called from worker threads.
+    void (*bypass)(enum ggml_moe_cache_bypass_reason reason,
+                   int64_t n_ids, int64_t n_tokens);
 
     // Dispatch one fused up * SwiGLU(gate) operation for rows whose two experts are resident.
     void * (*fused_begin)(const struct ggml_moe_cache_tensor_desc * up,

@@ -303,8 +303,30 @@ struct moe_cache_scope_stats {
     std::atomic<long long> begin_empty_scope{0};
     std::atomic<long long> begin_suppressed{0};
     std::atomic<long long> begin_inactive_session{0};
+    std::atomic<long long> bypass[GGML_MOE_CACHE_BYPASS_COUNT]{};
+    std::atomic<int64_t> max_bypass_ids{0};
+    std::atomic<int64_t> max_bypass_tokens{0};
 };
 static moe_cache_scope_stats g_scope_stats;
+
+static void moe_cache_atomic_max(std::atomic<int64_t> & target, int64_t value) {
+    int64_t current = target.load(std::memory_order_relaxed);
+    while (current < value && !target.compare_exchange_weak(
+            current, value, std::memory_order_relaxed)) {
+    }
+}
+
+static void moe_cache_bypass(
+        enum ggml_moe_cache_bypass_reason reason, int64_t n_ids, int64_t n_tokens) {
+    if (reason < 0 || reason >= GGML_MOE_CACHE_BYPASS_COUNT) {
+        return;
+    }
+    g_scope_stats.bypass[reason].fetch_add(1, std::memory_order_relaxed);
+    if (reason == GGML_MOE_CACHE_BYPASS_ROWS) {
+        moe_cache_atomic_max(g_scope_stats.max_bypass_ids, n_ids);
+        moe_cache_atomic_max(g_scope_stats.max_bypass_tokens, n_tokens);
+    }
+}
 
 static size_t moe_cache_reclaim_session(
         moe_cache_session & session, int physical_device,
@@ -1352,7 +1374,7 @@ static void moe_cache_log_stats(moe_cache_device & device) {
         used += pool.n_slots - pool.free_slots.size();
     }
     const long long total = device.hits + device.misses;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld heat=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld scope-enter=%lld leave-miss=%lld begin-empty=%lld begin-suppressed=%lld begin-inactive=%lld\n",
+    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld heat=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld scope-enter=%lld leave-miss=%lld begin-empty=%lld begin-suppressed=%lld begin-inactive=%lld bypass-api=%lld op=%lld no-buffer=%lld nonhost=%lld nonweights=%lld src1=%lld rows=%lld(max=%lldx%lld)\n",
             device.physical, device.hits, total,
             total ? 100.0 * (double)device.hits / (double)total : 0.0,
             used, slots, device.inserts, device.fills, device.fill_failures,
@@ -1364,7 +1386,16 @@ static void moe_cache_log_stats(moe_cache_device & device) {
             g_scope_stats.leave_misses.load(std::memory_order_relaxed),
             g_scope_stats.begin_empty_scope.load(std::memory_order_relaxed),
             g_scope_stats.begin_suppressed.load(std::memory_order_relaxed),
-            g_scope_stats.begin_inactive_session.load(std::memory_order_relaxed));
+            g_scope_stats.begin_inactive_session.load(std::memory_order_relaxed),
+            g_scope_stats.bypass[GGML_MOE_CACHE_BYPASS_API].load(std::memory_order_relaxed),
+            g_scope_stats.bypass[GGML_MOE_CACHE_BYPASS_SRC0_OP].load(std::memory_order_relaxed),
+            g_scope_stats.bypass[GGML_MOE_CACHE_BYPASS_NO_BUFFER].load(std::memory_order_relaxed),
+            g_scope_stats.bypass[GGML_MOE_CACHE_BYPASS_NOT_HOST].load(std::memory_order_relaxed),
+            g_scope_stats.bypass[GGML_MOE_CACHE_BYPASS_NOT_WEIGHTS].load(std::memory_order_relaxed),
+            g_scope_stats.bypass[GGML_MOE_CACHE_BYPASS_SRC1_TYPE].load(std::memory_order_relaxed),
+            g_scope_stats.bypass[GGML_MOE_CACHE_BYPASS_ROWS].load(std::memory_order_relaxed),
+            g_scope_stats.max_bypass_ids.load(std::memory_order_relaxed),
+            g_scope_stats.max_bypass_tokens.load(std::memory_order_relaxed));
 }
 
 static void * moe_cache_session_create(
@@ -2919,6 +2950,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.dispatch = moe_cache_dispatch;
     ggml_moe_cache.collect = moe_cache_collect;
     ggml_moe_cache.end = moe_cache_end;
+    ggml_moe_cache.bypass = moe_cache_bypass;
     ggml_moe_cache.fused_begin = moe_cache_fused_begin;
     ggml_moe_cache.invalidate = moe_cache_invalidate;
 }
