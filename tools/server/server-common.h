@@ -458,6 +458,8 @@ struct server_slot_stats {
     json to_json() const;
 };
 
+struct server_slot;
+
 // shared between server_context_impl and server_task_result_*
 // unlike server_slot_stats, server_metrics is server-global and cumulative, not tied to a slot
 struct server_metrics {
@@ -497,6 +499,21 @@ struct server_metrics {
     uint64_t n_decode     = 0;
     uint64_t n_busy_slots = 0;
 
+    // Compatibility counters retained for the server routes that still expose
+    // the pre-bucket Prometheus schema.
+    uint64_t n_prompt_tokens_processed_total = 0;
+    uint64_t t_prompt_processing_total       = 0;
+    uint64_t n_tokens_predicted_total        = 0;
+    uint64_t t_tokens_generation_total       = 0;
+
+    uint64_t n_prompt_tokens_processed = 0;
+    uint64_t t_prompt_processing       = 0;
+    uint64_t n_tokens_predicted        = 0;
+    uint64_t t_tokens_generation       = 0;
+
+    uint64_t n_decode_total     = 0;
+    uint64_t n_busy_slots_total = 0;
+
     uint64_t n_draft_tokens      = 0; // Total draft tokens generated
     uint64_t n_draft_accepted    = 0; // Draft tokens actually accepted
     uint64_t n_draft_verif_steps = 0; // Total draft token verification steps by the target model
@@ -519,6 +536,10 @@ struct server_metrics {
     void add_prompt_cached(uint64_t n_tokens) {
         n_prompt_cached += n_tokens;
     }
+
+    void on_prompt_eval(const server_slot & slot);
+    void on_prediction(const server_slot & slot);
+    void on_decoded(const std::vector<server_slot> & slots);
 };
 
 //

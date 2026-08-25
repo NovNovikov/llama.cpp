@@ -1559,7 +1559,6 @@ struct server_slot {
     int32_t n_ctx       = 0;  // context size per slot
     int32_t n_keep      = 0;
     int32_t n_decoded   = 0;
-    int32_t n_remaining = -1;
     int32_t i_batch     = -1;
 
     int32_t n_prompt_tokens_cache     = 0;
@@ -1570,7 +1569,8 @@ struct server_slot {
 
     size_t last_nl_pos = 0;
 
-    int64_t t_start_generation = 0;
+    int64_t t_start_process_prompt = 0;
+    int64_t t_start_generation     = 0;
     int32_t n_decoded_last = 0;
     double t_prompt_processing = 0.0;
     double t_token_generation  = 0.0;
@@ -1866,29 +1866,6 @@ struct server_slot {
         }
     }
 
-    result_timings get_timings() const {
-        result_timings timings;
-        timings.cache_n = n_prompt_tokens_cache;
-
-        timings.prompt_n            = n_prompt_tokens_processed;
-        timings.prompt_ms           = t_prompt_processing;
-        timings.prompt_per_token_ms = n_prompt_tokens_processed > 0 ? t_prompt_processing / n_prompt_tokens_processed : 0.0;
-        timings.prompt_per_second   = n_prompt_tokens_processed > 0 ? 1e3 / t_prompt_processing * n_prompt_tokens_processed : 0.0;
-
-        timings.predicted_n            = n_decoded;
-        timings.predicted_ms           = t_token_generation;
-        timings.predicted_per_token_ms = t_token_generation / n_decoded;
-        timings.predicted_per_second   = 1e3 / t_token_generation * n_decoded;
-
-        // Add speculative metrics
-        if (n_draft_total > 0) {
-            timings.draft_n          = n_draft_total;
-            timings.draft_n_accepted = n_draft_accepted;
-        }
-
-        return timings;
-    }
-
     size_t find_stopping_strings(const std::string & text, const size_t last_token_size, bool is_full_stop) {
         GGML_ASSERT(task);
 
@@ -2059,6 +2036,32 @@ struct server_slot {
     }
 };
 
+void server_metrics::on_prompt_eval(const server_slot & slot) {
+    n_prompt_tokens_processed_total += slot.n_prompt_tokens_processed;
+    n_prompt_tokens_processed       += slot.n_prompt_tokens_processed;
+    t_prompt_processing             += slot.t_prompt_processing;
+    t_prompt_processing_total       += slot.t_prompt_processing;
+
+    n_tokens_max = std::max(n_tokens_max, (uint64_t) slot.prompt.n_tokens());
+}
+
+void server_metrics::on_prediction(const server_slot & slot) {
+    n_tokens_predicted_total  += slot.n_decoded;
+    n_tokens_predicted        += slot.n_decoded;
+    t_tokens_generation       += slot.t_token_generation;
+    t_tokens_generation_total += slot.t_token_generation;
+}
+
+void server_metrics::on_decoded(const std::vector<server_slot> & slots) {
+    n_decode_total++;
+    for (const auto & slot : slots) {
+        if (slot.is_processing()) {
+            n_busy_slots_total++;
+        }
+        n_tokens_max = std::max(n_tokens_max, (uint64_t) slot.prompt.n_tokens());
+    }
+}
+
 // returns 0 on success
 // caller need to update prompt.tokens after a successful call to keep track of the processing progress
 // note: this is not a member of server_slot because we want to run it inside yield_to_queue
@@ -2113,7 +2116,43 @@ static int process_mtmd_chunk(const server_slot & slot, mtmd::batch_ptr & mbatch
     if (res == 0) {
         return 0;
     }
-};
+    if (res < 0) {
+        // fatal error
+        return res;
+    }
+
+    // otherwise, the batch is either uninitialized or is used up
+    // we need to create & encode a new batch
+    mbatch.reset(mtmd_batch_init(mctx));
+    res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
+    GGML_ASSERT(res == 0); // we should never have an empty batch
+
+    // try batching as much as possible
+    int n_added = 1;
+    size_t idx_cur = idx;
+    while (res == 0) {
+        auto [next_chunk, next_idx] = input_tokens.find_next_media_chunk(idx_cur);
+        if (next_chunk == nullptr) {
+            break;
+        }
+        res = mtmd_batch_add_chunk(mbatch.get(), next_chunk->get());
+        n_added += (res == 0 ? 1 : 0);
+        idx_cur = next_idx;
+        SLT_DBG(slot, "try adding media chunk idx = %zu, res = %d\n", next_idx, res);
+        // if res != 0, batch is full or chunk is not compatible -> this loop breaks
+    }
+
+    // TODO @ngxson : move this log line to debug when it become more stable
+    SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
+
+    res = mtmd_batch_encode(mbatch.get());
+    if (res != 0) {
+        SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
+        return -1;
+    }
+
+    return try_decode();
+}
 
 static std::string debug_make_timestamp_utc() {
     const auto now = std::chrono::system_clock::now();
@@ -2275,61 +2314,6 @@ static std::list<common_prompt_checkpoint>::iterator server_select_checkpoint_to
     }
 
     return best_it;
-}
-
-//
-// server_metrics
-//
-
-struct server_metrics {
-    int64_t t_start = 0;
-
-    uint64_t n_prompt_tokens_processed_total = 0;
-    uint64_t t_prompt_processing_total       = 0;
-    uint64_t n_tokens_predicted_total        = 0;
-    uint64_t t_tokens_generation_total       = 0;
-
-    uint64_t n_tokens_max = 0;
-
-    uint64_t n_prompt_tokens_processed = 0;
-    uint64_t t_prompt_processing       = 0;
-
-    uint64_t n_tokens_predicted  = 0;
-    uint64_t t_tokens_generation = 0;
-
-    uint64_t n_decode_total     = 0;
-    uint64_t n_busy_slots_total = 0;
-
-    void init() {
-        t_start = ggml_time_us();
-    }
-
-    // otherwise, the batch is either uninitialized or is used up
-    // we need to create & encode a new batch
-    mbatch.reset(mtmd_batch_init(mctx));
-    res = mtmd_batch_add_chunk(mbatch.get(), chunk.get());
-    GGML_ASSERT(res == 0); // we should never have an empty batch
-
-        n_tokens_max = std::max(n_tokens_max, (uint64_t) slot.prompt.n_tokens());
-    }
-
-    void on_prediction(const server_slot & slot) {
-        n_tokens_predicted_total   += slot.n_decoded;
-        n_tokens_predicted         += slot.n_decoded;
-        t_tokens_generation        += slot.t_token_generation;
-        t_tokens_generation_total  += slot.t_token_generation;
-    }
-
-    // TODO @ngxson : move this log line to debug when it become more stable
-    SLT_TRC(slot, "encoding mtmd batch from idx = %zu, n_chunks = %d\n", idx, n_added);
-
-    res = mtmd_batch_encode(mbatch.get());
-    if (res != 0) {
-        SLT_ERR(slot, "failed to encode mtmd batch for chunk idx = %zu, res = %d\n", idx, res);
-        return -1;
-    }
-
-    return try_decode();
 }
 
 //
@@ -6499,6 +6483,8 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
+                        slot.t_start_process_prompt = ggml_time_us();
+                        slot.t_start_generation     = 0;
                         slot.stats.update_prompt_start();
 
                         // Persist the shared-context boundary on the slot. Later checkpoint work must
@@ -7358,7 +7344,19 @@ private:
             n_empty_consecutive = 0;
         }
 
-        const int ret = llama_decode(ctx_tgt, batch_view);
+        // TODO @ngxson : dft model may have different n_embd than the tgt model, so we check & reject if that's the case
+        // this case is not currently used by any models, but may need to be supported in the future
+        if (spec && batch.has_embd) {
+            if (llama_model_n_embd_inp(model_dft) != llama_model_n_embd_inp(model_tgt)) {
+                SRV_ERR("%s", "unsupported batch.has_embd + spec case\n");
+                throw std::runtime_error("unsupported batch.has_embd + spec case");
+            }
+        }
+
+        bool has_output = false;
+        for (int i = off; i < off + batch_view.n_tokens; ++i) {
+            has_output |= batch.tokens[i].output;
+        }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
@@ -7669,6 +7667,7 @@ private:
 
             const auto ids = std::move(slot.spec_draft);
 
+            const int64_t t_now = ggml_time_us();
             slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
 
             // update how many tokens out of those tested were accepted
@@ -8388,78 +8387,18 @@ void server_routes::init_routes() {
             return res;
         }
 
-        // request slots data using task queue
-        {
-            server_task task(SERVER_TASK_TYPE_METRICS);
-            task.id = res->rd.get_new_id();
-            res->rd.post_task(std::move(task), true); // high-priority task
-        }
-
-        // get the result
-        auto result = res->rd.next(req.should_stop);
-        if (!result) {
-            // connection was closed
-            GGML_ASSERT(req.should_stop());
-            return res;
-        }
-
-        if (result->is_error()) {
-            res->error(result->to_json());
-            return res;
-        }
-
-        // TODO: get rid of this dynamic_cast
-        auto res_task = dynamic_cast<server_task_result_metrics*>(result.get());
-        GGML_ASSERT(res_task != nullptr);
-
-        // metrics definition: https://prometheus.io/docs/practices/naming/#metric-names
-        json all_metrics_def = json {
-            {"counter", {{
-                    {"name",  "prompt_tokens_total"},
-                    {"help",  "Number of prompt tokens processed."},
-                    {"value",  (uint64_t) res_task->metrics.n_prompt_tokens_processed_total}
-            }, {
-                    {"name",  "prompt_seconds_total"},
-                    {"help",  "Prompt process time"},
-                    {"value",  (uint64_t) res_task->metrics.t_prompt_processing_total / 1.e3}
-            }, {
-                    {"name",  "tokens_predicted_total"},
-                    {"help",  "Number of generation tokens processed."},
-                    {"value",  (uint64_t) res_task->metrics.n_tokens_predicted_total}
-            }, {
-                    {"name",  "tokens_predicted_seconds_total"},
-                    {"help",  "Predict process time"},
-                    {"value",  (uint64_t) res_task->metrics.t_tokens_generation_total / 1.e3}
-            }, {
-                    {"name",  "n_decode_total"},
-                    {"help",  "Total number of llama_decode() calls"},
-                    {"value",  res_task->metrics.n_decode_total}
-            }, {
-                    {"name",  "n_tokens_max"},
-                    {"help",  "Largest observed n_tokens."},
-                    {"value",  res_task->metrics.n_tokens_max}
-            }}},
-            {"gauge", {{
-                    {"name",  "prompt_tokens_seconds"},
-                    {"help",  "Average prompt throughput in tokens/s."},
-                    {"value",  res_task->metrics.n_prompt_tokens_processed ? 1.e3 / res_task->metrics.t_prompt_processing * res_task->metrics.n_prompt_tokens_processed : 0.}
-            },{
-                    {"name",  "predicted_tokens_seconds"},
-                    {"help",  "Average generation throughput in tokens/s."},
-                    {"value",  res_task->metrics.n_tokens_predicted ? 1.e3 / res_task->metrics.t_tokens_generation * res_task->metrics.n_tokens_predicted : 0.}
-            },{
-                    {"name",  "requests_processing"},
-                    {"help",  "Number of requests processing."},
-                    {"value",  (uint64_t) res_task->n_processing_slots}
-            },{
-                    {"name",  "requests_deferred"},
-                    {"help",  "Number of requests deferred."},
-                    {"value",  (uint64_t) res_task->n_tasks_deferred}
-            },{
-                    {"name",  "n_busy_slots_per_decode"},
-                    {"help",  "Average number of busy slots per llama_decode() call"},
-                    {"value",  (float) res_task->metrics.n_busy_slots_total / std::max((float) res_task->metrics.n_decode_total, 1.f)}
-            }}}
+        // render response using cached_metrics
+        auto use_cached_metrics = [&]() {
+            std::unique_lock<std::mutex> lock(mutex_cache);
+            res->headers["Process-Start-Time-Unix"] = std::to_string(cached_metrics.t_start);
+            server_task_result_metrics tmp;
+            tmp.metrics = cached_metrics;
+            res->content_type = "text/plain; version=0.0.4";
+            res->status = 200;
+            res->data = tmp.to_metrics();
+            // the gauges are averaged over the window between two scrapes
+            cached_metrics.reset_bucket();
+            should_reset_buckets = true;
         };
 
         if (queue_tasks.is_sleeping()) {
@@ -8500,10 +8439,6 @@ void server_routes::init_routes() {
             res->data = res_task->to_metrics();
         }
 
-        res->headers["Process-Start-Time-Unix"] = std::to_string(res_task->metrics.t_start);
-        res->content_type = "text/plain; version=0.0.4";
-        res->status = 200;
-        res->data = prometheus.str();
         return res;
     };
 
