@@ -2409,7 +2409,7 @@ mtmd_input_chunk * mtmd_input_chunk_init_stub(mtmd_context * ctx,
     return chunk;
 }
 
-int32_t mtmd_input_chunk_save(const mtmd_input_chunk * chunk, char * out_buf, size_t out_len, size_t * expected_out_len) {
+static int32_t mtmd_input_chunk_save_impl(const mtmd_input_chunk * chunk, std::vector<char> & out_buf) {
     try {
         mtmd_serialization ser(MTMD_SERIALIZATION_VERSION);
         chunk->serialize(ser);

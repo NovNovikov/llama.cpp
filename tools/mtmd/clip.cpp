@@ -1415,7 +1415,7 @@ struct clip_model_loader {
             switch (model.proj_type) {
                 case PROJECTOR_TYPE_INKLING:
                     if (is_vision) {
-                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC_PILLOW;
+                        hparams.image_resize_algo = RESIZE_ALGO_BICUBIC;
                         hparams.image_resize_pad  = PAD_NONE;
                         hparams.warmup_image_size = hparams.patch_size;
                     } else {
