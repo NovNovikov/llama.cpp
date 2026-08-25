@@ -2869,6 +2869,18 @@ void ggml_threadpool_resume(struct ggml_threadpool * threadpool) {
 #endif
 }
 
+struct moe_cache_fused_state {
+    void * node;
+    uint64_t hit_mask;
+    int n_hits;
+    int collect_ok;
+    int32_t ids[32];
+    const float * acts[32];
+    float * rows[32];
+};
+
+#define MOE_CACHE_FUSED_WORK_SIZE GGML_PAD(sizeof(struct moe_cache_fused_state), CACHE_LINE_SIZE)
+
 struct ggml_cplan ggml_graph_plan(
           const struct ggml_cgraph * cgraph,
                                int   n_threads,
@@ -3105,6 +3117,7 @@ struct ggml_cplan ggml_graph_plan(
 
     if (work_size > 0) {
         work_size += CACHE_LINE_SIZE*(n_threads);
+        work_size += MOE_CACHE_FUSED_WORK_SIZE;
     }
 
     cplan.threadpool = threadpool;
@@ -3120,6 +3133,132 @@ struct ggml_cplan ggml_graph_plan(
 // Returns the number of nodes skipped by fusion (>=1), or 0 if no fusion was applied.
 static bool ggml_cpu_disable_fusion = false;  // initialized once in ggml_cpu_init(), read-only afterwards
 
+static bool ggml_moe_cache_weight_is_eligible(const struct ggml_tensor * weight) {
+    if (!weight || weight->op != GGML_OP_NONE || !weight->data ||
+        weight->ne[0] <= 0 || weight->ne[1] <= 0 || weight->ne[2] <= 0 ||
+        weight->nb[0] != ggml_type_size(weight->type)) {
+        return false;
+    }
+    ggml_backend_buffer_t buffer = weight->view_src
+        ? weight->view_src->buffer : weight->buffer;
+    return buffer && ggml_backend_buffer_is_host(buffer) &&
+        ggml_backend_buffer_get_usage(buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS;
+}
+
+static int ggml_cpu_try_fuse_moe_cache(
+        const struct ggml_cgraph * cgraph,
+        int node_n, const struct ggml_compute_params * params) {
+    if (!ggml_moe_cache.fused_begin || !ggml_moe_cache.collect ||
+        !ggml_moe_cache.end || !params->wdata ||
+        params->wsize < MOE_CACHE_FUSED_WORK_SIZE || node_n + 2 >= cgraph->n_nodes) {
+        return 0;
+    }
+
+    const enum ggml_op ops[] = {
+        GGML_OP_MUL_MAT_ID,
+        GGML_OP_MUL_MAT_ID,
+        GGML_OP_GLU,
+    };
+    if (!ggml_can_fuse(cgraph, node_n, ops, 3)) {
+        return 0;
+    }
+
+    struct ggml_tensor * first = cgraph->nodes[node_n];
+    struct ggml_tensor * second = cgraph->nodes[node_n + 1];
+    struct ggml_tensor * glu = cgraph->nodes[node_n + 2];
+    if (ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU ||
+        !glu->src[0] || !glu->src[1] ||
+        ((glu->src[0] != first && glu->src[0] != second) ||
+         (glu->src[1] != first && glu->src[1] != second))) {
+        return 0;
+    }
+
+    struct ggml_tensor * gate = glu->src[0];
+    struct ggml_tensor * up = glu->src[1];
+    const struct ggml_tensor * up_weight = up->src[0];
+    const struct ggml_tensor * gate_weight = gate->src[0];
+    const struct ggml_tensor * acts = up->src[1];
+    const struct ggml_tensor * ids = up->src[2];
+    if (!ggml_moe_cache_weight_is_eligible(up_weight) ||
+        !ggml_moe_cache_weight_is_eligible(gate_weight) ||
+        !acts || !ids || acts != gate->src[1] || ids != gate->src[2] ||
+        acts->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
+        ids->ne[0] < 1 || ids->ne[1] < 1 || ids->ne[0] * ids->ne[1] > 32 ||
+        acts->ne[1] < 1 || acts->ne[2] != ids->ne[1] ||
+        up_weight->type != gate_weight->type ||
+        up_weight->ne[0] != gate_weight->ne[0] ||
+        up_weight->ne[1] != gate_weight->ne[1] ||
+        up_weight->ne[2] != gate_weight->ne[2] ||
+        up_weight->nb[2] != gate_weight->nb[2] ||
+        up->type != GGML_TYPE_F32 || gate->type != GGML_TYPE_F32 ||
+        glu->type != GGML_TYPE_F32 || !ggml_are_same_shape(up, gate) ||
+        !ggml_are_same_shape(up, glu) || !ggml_is_contiguous_1(up) ||
+        !ggml_is_contiguous_1(gate) || !ggml_is_contiguous_1(glu) ||
+        up->ne[1] != ids->ne[0] || up->ne[2] != ids->ne[1] ||
+        ggml_nrows(up) != ids->ne[0]*ids->ne[1] ||
+        up_weight->ne[0] != acts->ne[0] || up_weight->ne[1] != up->ne[0]) {
+        return 0;
+    }
+
+    struct moe_cache_fused_state * state =
+        (struct moe_cache_fused_state *)params->wdata;
+    const int n_ids = (int)ids->ne[0];
+    const int n_tokens = (int)ids->ne[1];
+    const int n_rows = n_ids*n_tokens;
+    if (params->ith == 0) {
+        memset(state, 0, sizeof(*state));
+        const struct ggml_moe_cache_tensor_desc up_desc = {
+            up_weight->name, up_weight->data, up_weight->nb[2],
+            up_weight->ne[0], up_weight->ne[1], up_weight->ne[2],
+            (int32_t)up_weight->type,
+        };
+        const struct ggml_moe_cache_tensor_desc gate_desc = {
+            gate_weight->name, gate_weight->data, gate_weight->nb[2],
+            gate_weight->ne[0], gate_weight->ne[1], gate_weight->ne[2],
+            (int32_t)gate_weight->type,
+        };
+        for (int token = 0; token < n_tokens; ++token) {
+            for (int id = 0; id < n_ids; ++id) {
+                const int row = token*n_ids + id;
+                state->ids[row] = *(const int32_t *)((const char *)ids->data +
+                        token*ids->nb[1] + id*ids->nb[0]);
+                state->acts[row] = (const float *)((const char *)acts->data +
+                        token*acts->nb[2] + (id % acts->ne[1])*acts->nb[1]);
+                state->rows[row] = (float *)((char *)glu->data + row*glu->nb[1]);
+            }
+        }
+        state->node = ggml_moe_cache.fused_begin(
+                &up_desc, &gate_desc, GGML_GLU_OP_SWIGLU,
+                -INFINITY, INFINITY, -INFINITY, INFINITY,
+                state->ids, n_rows, n_tokens, state->acts, &state->hit_mask);
+        if (state->node && state->hit_mask == (UINT64_C(1) << n_rows) - 1) {
+            state->n_hits = n_rows;
+        } else if (state->node) {
+            ggml_moe_cache.end(state->node);
+            state->node = NULL;
+        }
+    }
+    ggml_barrier(params->threadpool);
+    const bool active = state->node != NULL;
+    if (active && params->ith == 0) {
+        state->collect_ok = ggml_moe_cache.collect(
+                state->node, state->n_hits, state->rows, glu->ne[0]);
+        ggml_moe_cache.end(state->node);
+        state->node = NULL;
+    }
+    ggml_barrier(params->threadpool);
+    if (active && !state->collect_ok) {
+        struct ggml_compute_params fallback_params = *params;
+        ggml_compute_forward(&fallback_params, up);
+        ggml_barrier(params->threadpool);
+        ggml_compute_forward(&fallback_params, gate);
+        ggml_barrier(params->threadpool);
+        ggml_compute_forward(&fallback_params, glu);
+        ggml_barrier(params->threadpool);
+    }
+    return active ? 2 : 0;
+}
+
 static int ggml_cpu_try_fuse_ops(
         const struct ggml_cgraph * cgraph,
         const int node_n,
@@ -3131,6 +3270,13 @@ static int ggml_cpu_try_fuse_ops(
     }
 
     struct ggml_tensor * node = cgraph->nodes[node_n];
+
+    if (node->op == GGML_OP_MUL_MAT_ID) {
+        const int fused = ggml_cpu_try_fuse_moe_cache(cgraph, node_n, params);
+        if (fused > 0) {
+            return fused;
+        }
+    }
 
     if (node->op == GGML_OP_RMS_NORM) {
         // RMS_NORM + MUL fusion
