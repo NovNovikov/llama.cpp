@@ -42,9 +42,9 @@ private:
     worker_t worker;
 
     // callback functions
-    std::function<void(server_task &&)> callback_new_task;
-    std::function<void(void)>           callback_update_slots;
-    std::function<void(bool)>           callback_sleeping_state;
+    std::function<bool(server_task &&, bool)> callback_new_task;
+    std::function<void(void)>                 callback_update_slots;
+    std::vector<std::function<void(bool)>>    callback_sleeping_state;
     // idle-delay flush (auto disk cache): callback_idle_deadline returns the absolute ggml_time_ms()
     // deadline of the earliest slot due for a flush (-1 if none / feature off) so the idle wait can
     // be bounded to it; callback_idle_flush runs the due flushes when that wait times out. Both run
