@@ -5091,6 +5091,9 @@ private:
             slot.smpl.reset();
         }
 
+        // the per-request limit takes priority over the global one
+        slot.n_predict_max = task.params.n_predict != -1 ? task.params.n_predict : params_base.n_predict;
+
         slot.auto_disk_checkpoint_published = false;
         slot.task = std::make_unique<const server_task>(std::move(task));
 
