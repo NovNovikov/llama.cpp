@@ -1109,7 +1109,6 @@ static bool moe_cache_allocate_pool(
     if (shape.expert_size == 0 || shape.n_tensors <= 0 || shape.n_expert <= 0) {
         return false;
     }
-    shape.finished = true;
 
     int64_t max_entries = shape.n_tensors;
     if (max_entries > INT_MAX / shape.n_expert) {
@@ -1255,12 +1254,22 @@ static void moe_cache_build_pending(
     for (moe_cache_shape * shape : pending) {
         const double weight =
             (double)shape->expert_size * (double)shape->n_tensors;
-        const size_t share = total_weight > 0.0
+        size_t share = total_weight > 0.0
             ? (size_t)((double)remaining * weight / total_weight) : 0;
-        const size_t before = device.allocated_bytes;
-        moe_cache_allocate_pool(session, device, *shape, share);
-        const size_t consumed = device.allocated_bytes - before;
-        remaining = consumed <= remaining ? remaining - consumed : 0;
+        const size_t slab_bytes = shape->expert_size * moe_cache_slab_slots;
+        while (slab_bytes > 0 && share >= slab_bytes && remaining >= slab_bytes) {
+            const size_t before = device.allocated_bytes;
+            if (!moe_cache_allocate_pool(session, device, *shape, slab_bytes)) {
+                break;
+            }
+            const size_t consumed = device.allocated_bytes - before;
+            if (consumed == 0) {
+                break;
+            }
+            remaining = consumed <= remaining ? remaining - consumed : 0;
+            share = consumed <= share ? share - consumed : 0;
+        }
+        shape->finished = true;
         total_weight -= weight;
     }
 }
@@ -1308,6 +1317,7 @@ static int moe_cache_discover_pool(
     }
 
     if (pool < 0) {
+        shape->finished = false;
         moe_cache_build_pending(session, device);
         return moe_cache_find_pool(device, expert_size, wtype);
     }
