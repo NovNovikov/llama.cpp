@@ -112,6 +112,7 @@ struct moe_cache_shape {
     int64_t n_expert = 0;
     int64_t n_tensors = 0;
     std::vector<int> pools;
+    std::unordered_map<const void *, int> home_pools;
     bool finished = false;
 };
 
@@ -1170,6 +1171,54 @@ static int moe_cache_find_pool(
     return fallback;
 }
 
+// A dispatch can address only one physical slab. Keep each source tensor in
+// one slab where possible, otherwise slots from different layers evict one
+// another while being unusable by the same dispatch.
+static int moe_cache_shape_home_pool(
+        moe_cache_device & device, moe_cache_shape & shape, const void * host_base) {
+    auto known = shape.home_pools.find(host_base);
+    if (known != shape.home_pools.end()) {
+        const int index = known->second;
+        if (index >= 0 && index < (int)device.pools.size()) {
+            const moe_cache_pool & pool = *device.pools[index];
+            if (pool.slab && pool.expert_size == shape.expert_size &&
+                pool.wtype == shape.wtype) {
+                return index;
+            }
+        }
+        shape.home_pools.erase(known);
+    }
+
+    int selected = -1;
+    size_t selected_owners = SIZE_MAX;
+    size_t selected_free = 0;
+    for (const int index : shape.pools) {
+        if (index < 0 || index >= (int)device.pools.size()) {
+            continue;
+        }
+        const moe_cache_pool & pool = *device.pools[index];
+        if (!pool.slab || pool.expert_size != shape.expert_size ||
+            pool.wtype != shape.wtype) {
+            continue;
+        }
+        size_t owners = 0;
+        for (const auto & entry : shape.home_pools) {
+            owners += entry.second == index;
+        }
+        const size_t free_slots = pool.free_slots.size();
+        if (selected < 0 || owners < selected_owners ||
+            (owners == selected_owners && free_slots > selected_free)) {
+            selected = index;
+            selected_owners = owners;
+            selected_free = free_slots;
+        }
+    }
+    if (selected >= 0) {
+        shape.home_pools.emplace(host_base, selected);
+    }
+    return selected;
+}
+
 static bool moe_cache_prepare_budget(
         moe_cache_session & session, moe_cache_device & device) {
     ggml_cuda_set_device(device.logical);
@@ -1376,7 +1425,7 @@ static int moe_cache_discover_pool(
         }
     }
     if (!shape) {
-        device.shapes.push_back({expert_size, wtype, n_expert, 0, {}, false});
+        device.shapes.push_back({expert_size, wtype, n_expert, 0, {}, {}, false});
         shape = &device.shapes.back();
     } else {
         shape->n_expert = std::max(shape->n_expert, n_expert);
@@ -1401,31 +1450,17 @@ static int moe_cache_discover_pool(
         return -1;
     }
 
-    int pool = moe_cache_find_pool(device, expert_size, wtype);
-    if (pool >= 0 && !device.pools[pool]->free_slots.empty()) {
+    int pool = moe_cache_shape_home_pool(device, *shape, host_base);
+    if (pool >= 0) {
         return pool;
     }
 
-    if (pool < 0) {
-        shape->finished = false;
-        moe_cache_build_pending(session, device);
-        return moe_cache_find_pool(device, expert_size, wtype);
-    }
-
-    if (std::chrono::steady_clock::now() < device.regrow_after ||
-        !moe_cache_prepare_budget(session, device)) {
-        return pool;
-    }
-    const size_t scratch_reserve = moe_cache_scratch_total(device.scratch_reserve);
-    const size_t slab_limit = device.budget_limit > scratch_reserve
-        ? device.budget_limit - scratch_reserve : 0;
-    const size_t available = slab_limit > device.allocated_bytes
-        ? slab_limit - device.allocated_bytes : 0;
-    if (available >= expert_size * moe_cache_slab_slots &&
-        moe_cache_allocate_pool(session, device, *shape, available)) {
-        return moe_cache_find_pool(device, expert_size, wtype);
-    }
-    return pool;
+    // A source without a live slab can use a newly regrown slab. Do not grow
+    // a full home slab: the one-slab CUDA dispatch could not use the extra
+    // slab, so that allocation would only consume reclaimable VRAM.
+    shape->finished = false;
+    moe_cache_build_pending(session, device);
+    return moe_cache_shape_home_pool(device, *shape, host_base);
 }
 
 static void moe_cache_log_stats(moe_cache_device & device) {
@@ -2107,42 +2142,16 @@ static int moe_cache_plan(
         return 0;
     }
 
-    int selected_pool = -1;
-    int selected_hits = -1;
-    bool selected_has_free = false;
-    for (int pool_index = 0; pool_index < (int)device.pools.size(); pool_index++) {
-        moe_cache_pool & candidate = *device.pools[pool_index];
-        if (!candidate.slab || candidate.expert_size != node->expert_size ||
-            candidate.wtype != node->wtype) {
-            continue;
-        }
-        int candidate_hits = 0;
-        for (int index = 0; index < n_ids; index++) {
-            const int32_t expert = ids[index];
-            if (expert < 0 || expert >= node->n_expert) {
-                continue;
-            }
-            const moe_cache_key key{node->host_base, expert};
-            const auto found = candidate.map.find(key);
-            if (found != candidate.map.end() &&
-                candidate.slots[found->second].state == moe_cache_slot_state::valid) {
-                candidate_hits++;
-            }
-        }
-        const bool has_free = !candidate.free_slots.empty();
-        if (selected_pool < 0 || candidate_hits > selected_hits ||
-            (candidate_hits == selected_hits && has_free && !selected_has_free)) {
-            selected_pool = pool_index;
-            selected_hits = candidate_hits;
-            selected_has_free = has_free;
-        }
-    }
-    if (selected_pool < 0) {
+    const int selected_pool = node->pool_index;
+    if (selected_pool < 0 || selected_pool >= (int)device.pools.size()) {
         return 0;
     }
-    node->pool_index = selected_pool;
     node->pool = device.pools[selected_pool].get();
     moe_cache_pool & pool = *node->pool;
+    if (!pool.slab || pool.expert_size != node->expert_size ||
+        pool.wtype != node->wtype) {
+        return 0;
+    }
     if (device.frequency_epoch < std::numeric_limits<uint64_t>::max()) {
         device.frequency_epoch++;
     }
@@ -2798,6 +2807,7 @@ static void moe_cache_invalidate_session(
                 for (moe_cache_shape & shape : device.shapes) {
                     if (shape.expert_size == it->second.expert_size &&
                         shape.wtype == it->second.wtype) {
+                        shape.home_pools.erase(it->first);
                         shape.n_tensors = std::max<int64_t>(shape.n_tensors - 1, 0);
                         if (shape.n_tensors == 0 && shape.pools.empty()) {
                             shape.finished = false;
@@ -2854,6 +2864,13 @@ static void moe_cache_shape_forget_pool(
     for (moe_cache_shape & shape : device.shapes) {
         shape.pools.erase(std::remove(shape.pools.begin(), shape.pools.end(), pool_index),
                 shape.pools.end());
+        for (auto it = shape.home_pools.begin(); it != shape.home_pools.end();) {
+            if (it->second == pool_index) {
+                it = shape.home_pools.erase(it);
+            } else {
+                ++it;
+            }
+        }
         if (shape.pools.empty() && shape.n_tensors > 0) {
             shape.finished = false;
         }
