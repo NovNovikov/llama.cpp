@@ -2190,6 +2190,11 @@ static int moe_cache_plan(
 
             const void * source =
                 (const char *)node->host_base + (size_t)expert * node->expert_size;
+
+            // Admission evidence is consumed by this fill. Keeping it would make
+            // readmit_after permanent: an evicted expert would immediately evict
+            // another slot on its next miss, even when it is no longer hot.
+            device.demand_count.erase(key);
             device.queue.push_back({
                     node->pool_index, slot_index, slot.generation,
                     key, source, node->expert_size});
