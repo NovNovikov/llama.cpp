@@ -133,6 +133,7 @@ struct moe_cache_job {
 
 struct moe_cache_demand {
     uint16_t count = 0;
+    uint64_t epoch = 0;
     size_t expert_size = 0;
 };
 
@@ -2194,6 +2195,9 @@ static int moe_cache_plan(
             continue;
         }
         demand->expert_size = node->expert_size;
+        demand->count = moe_cache_frequency_decay(
+                demand->count, demand->epoch, device.frequency_epoch, frequency_horizon);
+        demand->epoch = device.frequency_epoch;
         if (demand->count < std::numeric_limits<uint16_t>::max()) {
             demand->count++;
         }
@@ -2244,6 +2248,10 @@ static int moe_cache_plan(
             const uint16_t victim_frequency = moe_cache_frequency_peek(
                     device, pool.slots[slot_index].key, frequency_horizon);
             if (candidate_frequency <= victim_frequency) {
+                // This evidence failed against the current victim. Require a
+                // fresh local run of demand before trying to displace another
+                // resident expert instead of retrying forever on stale misses.
+                device.demand_count.erase(key);
                 device.admission_skips++;
                 device.victim_rejections++;
                 continue;
