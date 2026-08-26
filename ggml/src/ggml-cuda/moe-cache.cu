@@ -56,10 +56,6 @@ void ggml_moe_cache_register(const void * owner) {
 // This was the old minimum viable pool size. Keeping it as one physical slab
 // makes each reclaim meaningful while avoiding a new arbitrary allocator unit.
 static constexpr size_t moe_cache_slab_slots = 64;
-// The diagnostic session benchmark has a final 2k-token decode phase. Emit at
-// most one non-final source snapshot at that useful granularity so force-killed
-// benchmark servers still leave usable source-local evidence.
-static constexpr uint64_t moe_cache_shadow_snapshot_tokens = 2048;
 
 enum class moe_cache_slot_state : uint8_t {
     free,
@@ -147,46 +143,6 @@ struct moe_cache_frequency {
     size_t expert_size = 0;
 };
 
-struct moe_cache_shadow_lru {
-    int capacity = 0;
-    int size = 0;
-    int head = -1;
-    int tail = -1;
-    std::vector<int> prev;
-    std::vector<int> next;
-    std::vector<uint8_t> resident;
-    uint64_t hits = 0;
-    uint64_t misses = 0;
-};
-
-struct moe_cache_shadow_window {
-    uint32_t width = 0;
-    uint32_t tokens = 0;
-    uint32_t unique = 0;
-    std::vector<uint32_t> counts;
-    std::vector<int> touched;
-    std::vector<uint16_t> completed;
-};
-
-struct moe_cache_shadow_source {
-    std::string name;
-    int n_expert = 0;
-    uint64_t decode_accesses = 0;
-    uint64_t decode_tokens = 0;
-    uint64_t reported_tokens = 0;
-    uint64_t actual_hits = 0;
-    uint64_t actual_misses = 0;
-    std::vector<uint64_t> access_counts;
-    moe_cache_shadow_lru cache64;
-    moe_cache_shadow_lru cache128;
-    moe_cache_shadow_window window64;
-    moe_cache_shadow_window window256;
-    moe_cache_shadow_window window1024;
-    std::vector<int> previous_hot64;
-    double hot64_jaccard_sum = 0.0;
-    uint64_t hot64_jaccard_count = 0;
-};
-
 struct moe_cache_config {
     bool enabled = true;
     bool automatic = true;
@@ -209,7 +165,6 @@ struct moe_cache_config {
     bool dedicated_mmv = true;
     int overlap_cpu_rows = 0;
     bool overlap_cpu_rows_explicit = false;
-    bool shadow_stats = false;
     std::string fail_stage;
 };
 
@@ -235,7 +190,6 @@ struct moe_cache_device {
     std::unordered_map<const void *, moe_cache_seen_tensor> seen_tensors;
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
     std::unordered_map<moe_cache_key, moe_cache_frequency, moe_cache_key_hash> frequency;
-    std::unordered_map<const void *, moe_cache_shadow_source> shadow_sources;
     uint64_t frequency_epoch = 0;
     int stable_visits = 0;
     bool saw_repeat = false;
@@ -327,9 +281,7 @@ struct moe_cache_node {
     int64_t n_in = 0;
     int64_t n_out = 0;
     int64_t n_expert = 0;
-    int64_t n_tokens = 0;
     int wtype = -1;
-    const char * tensor_name = nullptr;
     std::unique_lock<std::mutex> dispatch_lock;
     moe_cache_pin pins[64];
     int n_pins = 0;
@@ -588,9 +540,6 @@ static moe_cache_config moe_cache_read_config() {
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_STATS", 0, INT_MAX, value)) {
         config.stats_every = (int)value;
     }
-    if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_SHADOW_STATS", 0, 1, value)) {
-        config.shadow_stats = value != 0;
-    }
     if (moe_cache_env_i64("GGML_CUDA_MOE_CACHE_NDEV", 1, INT_MAX, value)) {
         config.max_devices = (int)value;
     }
@@ -809,275 +758,6 @@ static uint16_t moe_cache_frequency_peek(
     return found == device.frequency.end() ? 0 : moe_cache_frequency_decay(
             found->second.count, found->second.epoch,
             device.frequency_epoch, horizon);
-}
-
-static void moe_cache_shadow_lru_init(
-        moe_cache_shadow_lru & cache, int n_expert, int capacity) {
-    cache = {};
-    cache.capacity = std::min(n_expert, capacity);
-    cache.prev.assign(n_expert, -1);
-    cache.next.assign(n_expert, -1);
-    cache.resident.assign(n_expert, 0);
-}
-
-static void moe_cache_shadow_lru_remove(moe_cache_shadow_lru & cache, int expert) {
-    const int previous = cache.prev[expert];
-    const int next = cache.next[expert];
-    if (previous >= 0) {
-        cache.next[previous] = next;
-    } else {
-        cache.head = next;
-    }
-    if (next >= 0) {
-        cache.prev[next] = previous;
-    } else {
-        cache.tail = previous;
-    }
-    cache.prev[expert] = -1;
-    cache.next[expert] = -1;
-}
-
-static void moe_cache_shadow_lru_push_back(moe_cache_shadow_lru & cache, int expert) {
-    cache.prev[expert] = cache.tail;
-    cache.next[expert] = -1;
-    if (cache.tail >= 0) {
-        cache.next[cache.tail] = expert;
-    } else {
-        cache.head = expert;
-    }
-    cache.tail = expert;
-}
-
-static void moe_cache_shadow_lru_touch(moe_cache_shadow_lru & cache, int expert) {
-    if (cache.capacity <= 0 || expert < 0 || expert >= (int)cache.resident.size()) {
-        return;
-    }
-    if (cache.resident[expert]) {
-        cache.hits++;
-        if (cache.tail != expert) {
-            moe_cache_shadow_lru_remove(cache, expert);
-            moe_cache_shadow_lru_push_back(cache, expert);
-        }
-        return;
-    }
-
-    cache.misses++;
-    if (cache.size >= cache.capacity && cache.head >= 0) {
-        const int victim = cache.head;
-        moe_cache_shadow_lru_remove(cache, victim);
-        cache.resident[victim] = 0;
-        cache.size--;
-    }
-    cache.resident[expert] = 1;
-    cache.size++;
-    moe_cache_shadow_lru_push_back(cache, expert);
-}
-
-static void moe_cache_shadow_window_init(
-        moe_cache_shadow_window & window, int n_expert, uint32_t width) {
-    window = {};
-    window.width = width;
-    window.counts.assign(n_expert, 0);
-}
-
-static void moe_cache_shadow_window_touch(moe_cache_shadow_window & window, int expert) {
-    if (expert < 0 || expert >= (int)window.counts.size()) {
-        return;
-    }
-    if (window.counts[expert] == 0) {
-        window.touched.push_back(expert);
-        window.unique++;
-    }
-    window.counts[expert]++;
-}
-
-static std::vector<int> moe_cache_shadow_window_top(
-        const moe_cache_shadow_window & window, size_t limit) {
-    std::vector<int> result = window.touched;
-    std::sort(result.begin(), result.end(), [&window](int lhs, int rhs) {
-        if (window.counts[lhs] != window.counts[rhs]) {
-            return window.counts[lhs] > window.counts[rhs];
-        }
-        return lhs < rhs;
-    });
-    if (result.size() > limit) {
-        result.resize(limit);
-    }
-    return result;
-}
-
-static void moe_cache_shadow_window_finish(
-        moe_cache_shadow_source & source, moe_cache_shadow_window & window,
-        bool track_hot64_jaccard) {
-    if (window.width == 0 || ++window.tokens < window.width) {
-        return;
-    }
-    window.completed.push_back((uint16_t)std::min<uint32_t>(
-            window.unique, std::numeric_limits<uint16_t>::max()));
-    if (track_hot64_jaccard) {
-        std::vector<int> current = moe_cache_shadow_window_top(window, 64);
-        if (!source.previous_hot64.empty()) {
-            size_t intersection = 0;
-            for (int expert : current) {
-                intersection += std::find(
-                        source.previous_hot64.begin(), source.previous_hot64.end(), expert) !=
-                    source.previous_hot64.end();
-            }
-            const size_t total = current.size() + source.previous_hot64.size() - intersection;
-            if (total > 0) {
-                source.hot64_jaccard_sum += (double)intersection / (double)total;
-                source.hot64_jaccard_count++;
-            }
-        }
-        source.previous_hot64 = std::move(current);
-    }
-    for (int expert : window.touched) {
-        window.counts[expert] = 0;
-    }
-    window.touched.clear();
-    window.unique = 0;
-    window.tokens = 0;
-}
-
-static void moe_cache_shadow_source_init(
-        moe_cache_shadow_source & source, const char * name, int n_expert) {
-    source = {};
-    source.name = name ? name : "<unnamed>";
-    source.n_expert = n_expert;
-    source.access_counts.assign(n_expert, 0);
-    moe_cache_shadow_lru_init(source.cache64, n_expert, 64);
-    moe_cache_shadow_lru_init(source.cache128, n_expert, 128);
-    moe_cache_shadow_window_init(source.window64, n_expert, 64);
-    moe_cache_shadow_window_init(source.window256, n_expert, 256);
-    moe_cache_shadow_window_init(source.window1024, n_expert, 1024);
-}
-
-static moe_cache_shadow_source * moe_cache_shadow_source_get(
-        moe_cache_device & device, const moe_cache_node & node) {
-    if (node.n_expert <= 0 || node.n_expert > INT_MAX) {
-        return nullptr;
-    }
-    try {
-        auto result = device.shadow_sources.try_emplace(node.host_base);
-        moe_cache_shadow_source & source = result.first->second;
-        if (result.second || source.n_expert != (int)node.n_expert) {
-            moe_cache_shadow_source_init(source, node.tensor_name, (int)node.n_expert);
-        }
-        return &source;
-    } catch (...) {
-        return nullptr;
-    }
-}
-
-static void moe_cache_shadow_source_touch(
-        moe_cache_shadow_source & source, int expert, bool actual_hit) {
-    if (expert < 0 || expert >= source.n_expert) {
-        return;
-    }
-    source.decode_accesses++;
-    source.access_counts[expert]++;
-    source.actual_hits += actual_hit;
-    source.actual_misses += !actual_hit;
-    moe_cache_shadow_lru_touch(source.cache64, expert);
-    moe_cache_shadow_lru_touch(source.cache128, expert);
-    moe_cache_shadow_window_touch(source.window64, expert);
-    moe_cache_shadow_window_touch(source.window256, expert);
-    moe_cache_shadow_window_touch(source.window1024, expert);
-}
-
-static void moe_cache_shadow_source_finish_token(moe_cache_shadow_source & source) {
-    source.decode_tokens++;
-    moe_cache_shadow_window_finish(source, source.window64, false);
-    moe_cache_shadow_window_finish(source, source.window256, true);
-    moe_cache_shadow_window_finish(source, source.window1024, false);
-}
-
-static void moe_cache_shadow_window_metrics(
-        const moe_cache_shadow_window & window, double & average,
-        uint16_t & p95, uint16_t & maximum) {
-    average = 0.0;
-    p95 = 0;
-    maximum = 0;
-    if (window.completed.empty()) {
-        return;
-    }
-    uint64_t total = 0;
-    for (uint16_t value : window.completed) {
-        total += value;
-        maximum = std::max(maximum, value);
-    }
-    average = (double)total / (double)window.completed.size();
-    std::vector<uint16_t> sorted = window.completed;
-    std::sort(sorted.begin(), sorted.end());
-    p95 = sorted[(sorted.size() * 95 + 99) / 100 - 1];
-}
-
-static void moe_cache_log_shadow_stats(moe_cache_device & device, bool final) {
-    std::vector<moe_cache_shadow_source *> sources;
-    sources.reserve(device.shadow_sources.size());
-    for (auto & entry : device.shadow_sources) {
-        moe_cache_shadow_source & source = entry.second;
-        if (source.decode_accesses > 0 && (final ||
-                source.decode_tokens - source.reported_tokens >=
-                    moe_cache_shadow_snapshot_tokens)) {
-            sources.push_back(&source);
-        }
-    }
-    std::sort(sources.begin(), sources.end(), [](const auto * lhs, const auto * rhs) {
-        return lhs->name < rhs->name;
-    });
-    for (moe_cache_shadow_source * source : sources) {
-        uint64_t top64 = 0;
-        std::vector<uint64_t> ranked = source->access_counts;
-        std::sort(ranked.begin(), ranked.end(), [](uint64_t lhs, uint64_t rhs) {
-            return lhs > rhs;
-        });
-        for (size_t index = 0; index < std::min<size_t>(64, ranked.size()); index++) {
-            top64 += ranked[index];
-        }
-        double entropy = 0.0;
-        for (uint64_t count : source->access_counts) {
-            if (count == 0) {
-                continue;
-            }
-            const double probability = (double)count / (double)source->decode_accesses;
-            entropy -= probability * std::log(probability);
-        }
-        double unique64_avg = 0.0;
-        double unique256_avg = 0.0;
-        double unique1024_avg = 0.0;
-        uint16_t unique64_p95 = 0;
-        uint16_t unique256_p95 = 0;
-        uint16_t unique1024_p95 = 0;
-        uint16_t unique64_max = 0;
-        uint16_t unique256_max = 0;
-        uint16_t unique1024_max = 0;
-        moe_cache_shadow_window_metrics(source->window64, unique64_avg, unique64_p95, unique64_max);
-        moe_cache_shadow_window_metrics(source->window256, unique256_avg, unique256_p95, unique256_max);
-        moe_cache_shadow_window_metrics(source->window1024, unique1024_avg, unique1024_p95, unique1024_max);
-        const uint64_t shadow64_total = source->cache64.hits + source->cache64.misses;
-        const uint64_t shadow128_total = source->cache128.hits + source->cache128.misses;
-        const double actual_rate = source->decode_accesses > 0
-            ? 100.0 * (double)source->actual_hits / (double)source->decode_accesses : 0.0;
-        const double shadow64_rate = shadow64_total > 0
-            ? 100.0 * (double)source->cache64.hits / (double)shadow64_total : 0.0;
-        const double shadow128_rate = shadow128_total > 0
-            ? 100.0 * (double)source->cache128.hits / (double)shadow128_total : 0.0;
-        const double coverage = source->decode_accesses > 0
-            ? 100.0 * (double)top64 / (double)source->decode_accesses : 0.0;
-        const double jaccard = source->hot64_jaccard_count > 0
-            ? source->hot64_jaccard_sum / (double)source->hot64_jaccard_count : 1.0;
-        MOE_CACHE_LOG("[moe-cache-shadow] kind=%s CUDA%d source=%s decode=%llu actual=%.1f%% shadow64=%.1f%% shadow128=%.1f%% gain=%.1fpp top64=%.1f%% effective=%.1f unique64=%.1f/%u/%u[%zu] unique256=%.1f/%u/%u[%zu] unique1024=%.1f/%u/%u[%zu] hot64-jaccard=%.3f[%llu]\n",
-                final ? "final" : "snapshot", device.physical, source->name.c_str(),
-                (unsigned long long)source->decode_accesses, actual_rate,
-                shadow64_rate, shadow128_rate, shadow128_rate - shadow64_rate,
-                coverage, std::exp(entropy), unique64_avg, unique64_p95, unique64_max,
-                source->window64.completed.size(), unique256_avg, unique256_p95,
-                unique256_max, source->window256.completed.size(), unique1024_avg,
-                unique1024_p95, unique1024_max, source->window1024.completed.size(),
-                jaccard, (unsigned long long)source->hot64_jaccard_count);
-        source->reported_tokens = source->decode_tokens;
-    }
 }
 
 static bool moe_cache_cuda_ok(
@@ -1658,9 +1338,6 @@ static bool moe_cache_allocate_pool(
                 session.config.reserve_mb, session.config.min_expert_bytes >> 10,
                 session.config.admit_after, session.config.readmit_after,
                 session.config.overlap_cpu_rows);
-        if (session.config.shadow_stats) {
-            MOE_CACHE_LOG("[moe-cache] shadow diagnostics enabled: decode only, summary on session destroy\n");
-        }
         session.announced = true;
     }
     MOE_CACHE_LOG("[moe-cache] CUDA%d pool[%d]: type=%s expert=%zu KiB slots=%zu total=%zu MiB\n",
@@ -2048,13 +1725,6 @@ static void moe_cache_session_destroy(void * opaque) {
 
     for (auto & device_ptr : session->devices) {
         moe_cache_log_stats(*device_ptr);
-        if (session->config.shadow_stats) {
-            try {
-                moe_cache_log_shadow_stats(*device_ptr, true);
-            } catch (...) {
-                MOE_CACHE_LOG("[moe-cache-shadow] CUDA%d summary failed\n", device_ptr->physical);
-            }
-        }
     }
 
     for (auto & device_ptr : session->devices) {
@@ -2446,9 +2116,7 @@ static void * moe_cache_begin(
     node->n_in = n_in;
     node->n_out = n_out;
     node->n_expert = n_expert;
-    node->n_tokens = n_tokens;
     node->wtype = wtype;
-    node->tensor_name = name;
     node->dispatch_lock = std::move(dispatch_lock);
     return node.release();
 }
@@ -2490,11 +2158,6 @@ static int moe_cache_plan(
     }
     const uint64_t frequency_horizon = moe_cache_frequency_horizon(
             device, session.config.readmit_after);
-    moe_cache_shadow_source * shadow_source = nullptr;
-    if (session.config.shadow_stats && node->n_tokens == 1) {
-        shadow_source = moe_cache_shadow_source_get(device, *node);
-    }
-    bool shadow_touched = false;
 
     for (int index = 0; index < n_ids; index++) {
         const int32_t expert = ids[index];
@@ -2504,17 +2167,6 @@ static int moe_cache_plan(
 
         const moe_cache_key key{node->host_base, expert};
         auto found = pool.map.find(key);
-        const bool actual_hit = found != pool.map.end() &&
-            pool.slots[found->second].state == moe_cache_slot_state::valid;
-        if (shadow_source) {
-            try {
-                moe_cache_shadow_source_touch(*shadow_source, expert, actual_hit);
-                shadow_touched = true;
-            } catch (...) {
-                // Diagnostics must never affect a cache lookup or admission.
-                shadow_source = nullptr;
-            }
-        }
         if (found != pool.map.end()) {
             moe_cache_frequency_touch(
                     device, key, node->expert_size, frequency_horizon);
@@ -2645,13 +2297,6 @@ static int moe_cache_plan(
         device.inserts++;
         inserts_left--;
         wake_worker = true;
-    }
-    if (shadow_source && shadow_touched) {
-        try {
-            moe_cache_shadow_source_finish_token(*shadow_source);
-        } catch (...) {
-            // Keep the optional shadow counters outside the execution path.
-        }
     }
     if (hits == n_ids && session.config.overlap_cpu_rows > 0) {
         int rows = std::min(session.config.overlap_cpu_rows, n_ids - 1);
@@ -2941,13 +2586,6 @@ static int moe_cache_collect(
         if (session.config.stats_every > 0 &&
             device.collect_calls % session.config.stats_every == 0) {
             moe_cache_log_stats(device);
-            if (session.config.shadow_stats) {
-                try {
-                    moe_cache_log_shadow_stats(device, false);
-                } catch (...) {
-                    // Optional diagnostics must never affect an expert result.
-                }
-            }
         }
     }
     return ok ? 1 : 0;
@@ -3174,7 +2812,6 @@ static void moe_cache_invalidate_session(
         for (auto it = device.seen_tensors.begin(); it != device.seen_tensors.end();) {
             if (moe_cache_ranges_overlap(it->first, it->second.bytes, base, size)) {
                 session.tensor_devices.erase(it->first);
-                device.shadow_sources.erase(it->first);
                 for (moe_cache_shape & shape : device.shapes) {
                     if (shape.expert_size == it->second.expert_size &&
                         shape.wtype == it->second.wtype) {
