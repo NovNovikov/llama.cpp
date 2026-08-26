@@ -56,6 +56,10 @@ void ggml_moe_cache_register(const void * owner) {
 // This was the old minimum viable pool size. Keeping it as one physical slab
 // makes each reclaim meaningful while avoiding a new arbitrary allocator unit.
 static constexpr size_t moe_cache_slab_slots = 64;
+// The diagnostic session benchmark has a final 2k-token decode phase. Emit at
+// most one non-final source snapshot at that useful granularity so force-killed
+// benchmark servers still leave usable source-local evidence.
+static constexpr uint64_t moe_cache_shadow_snapshot_tokens = 2048;
 
 enum class moe_cache_slot_state : uint8_t {
     free,
@@ -168,6 +172,8 @@ struct moe_cache_shadow_source {
     std::string name;
     int n_expert = 0;
     uint64_t decode_accesses = 0;
+    uint64_t decode_tokens = 0;
+    uint64_t reported_tokens = 0;
     uint64_t actual_hits = 0;
     uint64_t actual_misses = 0;
     std::vector<uint64_t> access_counts;
@@ -980,6 +986,7 @@ static void moe_cache_shadow_source_touch(
 }
 
 static void moe_cache_shadow_source_finish_token(moe_cache_shadow_source & source) {
+    source.decode_tokens++;
     moe_cache_shadow_window_finish(source, source.window64, false);
     moe_cache_shadow_window_finish(source, source.window256, true);
     moe_cache_shadow_window_finish(source, source.window1024, false);
@@ -1005,18 +1012,21 @@ static void moe_cache_shadow_window_metrics(
     p95 = sorted[(sorted.size() * 95 + 99) / 100 - 1];
 }
 
-static void moe_cache_log_shadow_stats(const moe_cache_device & device) {
-    std::vector<const moe_cache_shadow_source *> sources;
+static void moe_cache_log_shadow_stats(moe_cache_device & device, bool final) {
+    std::vector<moe_cache_shadow_source *> sources;
     sources.reserve(device.shadow_sources.size());
-    for (const auto & entry : device.shadow_sources) {
-        if (entry.second.decode_accesses > 0) {
-            sources.push_back(&entry.second);
+    for (auto & entry : device.shadow_sources) {
+        moe_cache_shadow_source & source = entry.second;
+        if (source.decode_accesses > 0 && (final ||
+                source.decode_tokens - source.reported_tokens >=
+                    moe_cache_shadow_snapshot_tokens)) {
+            sources.push_back(&source);
         }
     }
     std::sort(sources.begin(), sources.end(), [](const auto * lhs, const auto * rhs) {
         return lhs->name < rhs->name;
     });
-    for (const moe_cache_shadow_source * source : sources) {
+    for (moe_cache_shadow_source * source : sources) {
         uint64_t top64 = 0;
         std::vector<uint64_t> ranked = source->access_counts;
         std::sort(ranked.begin(), ranked.end(), [](uint64_t lhs, uint64_t rhs) {
@@ -1057,8 +1067,8 @@ static void moe_cache_log_shadow_stats(const moe_cache_device & device) {
             ? 100.0 * (double)top64 / (double)source->decode_accesses : 0.0;
         const double jaccard = source->hot64_jaccard_count > 0
             ? source->hot64_jaccard_sum / (double)source->hot64_jaccard_count : 1.0;
-        MOE_CACHE_LOG("[moe-cache-shadow] CUDA%d source=%s decode=%llu actual=%.1f%% shadow64=%.1f%% shadow128=%.1f%% gain=%.1fpp top64=%.1f%% effective=%.1f unique64=%.1f/%u/%u[%zu] unique256=%.1f/%u/%u[%zu] unique1024=%.1f/%u/%u[%zu] hot64-jaccard=%.3f[%llu]\n",
-                device.physical, source->name.c_str(),
+        MOE_CACHE_LOG("[moe-cache-shadow] kind=%s CUDA%d source=%s decode=%llu actual=%.1f%% shadow64=%.1f%% shadow128=%.1f%% gain=%.1fpp top64=%.1f%% effective=%.1f unique64=%.1f/%u/%u[%zu] unique256=%.1f/%u/%u[%zu] unique1024=%.1f/%u/%u[%zu] hot64-jaccard=%.3f[%llu]\n",
+                final ? "final" : "snapshot", device.physical, source->name.c_str(),
                 (unsigned long long)source->decode_accesses, actual_rate,
                 shadow64_rate, shadow128_rate, shadow128_rate - shadow64_rate,
                 coverage, std::exp(entropy), unique64_avg, unique64_p95, unique64_max,
@@ -1066,6 +1076,7 @@ static void moe_cache_log_shadow_stats(const moe_cache_device & device) {
                 unique256_max, source->window256.completed.size(), unique1024_avg,
                 unique1024_p95, unique1024_max, source->window1024.completed.size(),
                 jaccard, (unsigned long long)source->hot64_jaccard_count);
+        source->reported_tokens = source->decode_tokens;
     }
 }
 
@@ -2039,7 +2050,7 @@ static void moe_cache_session_destroy(void * opaque) {
         moe_cache_log_stats(*device_ptr);
         if (session->config.shadow_stats) {
             try {
-                moe_cache_log_shadow_stats(*device_ptr);
+                moe_cache_log_shadow_stats(*device_ptr, true);
             } catch (...) {
                 MOE_CACHE_LOG("[moe-cache-shadow] CUDA%d summary failed\n", device_ptr->physical);
             }
@@ -2930,6 +2941,13 @@ static int moe_cache_collect(
         if (session.config.stats_every > 0 &&
             device.collect_calls % session.config.stats_every == 0) {
             moe_cache_log_stats(device);
+            if (session.config.shadow_stats) {
+                try {
+                    moe_cache_log_shadow_stats(device, false);
+                } catch (...) {
+                    // Optional diagnostics must never affect an expert result.
+                }
+            }
         }
     }
     return ok ? 1 : 0;
