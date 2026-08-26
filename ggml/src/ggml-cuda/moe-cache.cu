@@ -687,6 +687,99 @@ static void moe_cache_lru_push_back(moe_cache_pool & pool, int index) {
     pool.lru_tail = index;
 }
 
+struct moe_cache_source_lru_stats {
+    const void * tensor = nullptr;
+    int slots = 0;
+    int recency_sum = 0;
+    uint64_t uses_sum = 0;
+};
+
+static bool moe_cache_source_is_colder(
+        const moe_cache_source_lru_stats & lhs,
+        const moe_cache_source_lru_stats & rhs) {
+    const int64_t lhs_recency = (int64_t)lhs.recency_sum * rhs.slots;
+    const int64_t rhs_recency = (int64_t)rhs.recency_sum * lhs.slots;
+    if (lhs_recency != rhs_recency) {
+        return lhs_recency < rhs_recency;
+    }
+    const uint64_t lhs_uses = lhs.uses_sum * (uint64_t)rhs.slots;
+    const uint64_t rhs_uses = rhs.uses_sum * (uint64_t)lhs.slots;
+    if (lhs_uses != rhs_uses) {
+        return lhs_uses < rhs_uses;
+    }
+    return lhs.slots > rhs.slots;
+}
+
+// This is intentionally computed only after a candidate has passed admission
+// and a 64-slot slab is full. It protects sources whose resident slots are
+// collectively recent/useful without adding per-router-row bookkeeping.
+static int moe_cache_select_source_aware_victim(
+        const moe_cache_pool & pool, int hot_uses) {
+    if (pool.n_slots <= 0 || pool.n_slots > (int)moe_cache_slab_slots) {
+        return -1;
+    }
+
+    moe_cache_source_lru_stats sources[moe_cache_slab_slots] = {};
+    int source_indices[moe_cache_slab_slots] = {};
+    int n_sources = 0;
+    int rank = 0;
+    for (int index = pool.lru_head; index >= 0; index = pool.slots[index].next, rank++) {
+        const moe_cache_slot & slot = pool.slots[index];
+        int source_index = -1;
+        for (int candidate = 0; candidate < n_sources; candidate++) {
+            if (sources[candidate].tensor == slot.key.tensor) {
+                source_index = candidate;
+                break;
+            }
+        }
+        if (source_index < 0) {
+            if (n_sources >= pool.n_slots) {
+                return -1;
+            }
+            source_index = n_sources++;
+            sources[source_index].tensor = slot.key.tensor;
+        }
+        source_indices[index] = source_index;
+        moe_cache_source_lru_stats & source = sources[source_index];
+        source.slots++;
+        source.recency_sum += rank;
+        source.uses_sum += slot.uses;
+    }
+
+    auto is_better_victim = [&](int lhs, int rhs) {
+        if (rhs < 0) {
+            return true;
+        }
+        const moe_cache_source_lru_stats & lhs_source = sources[source_indices[lhs]];
+        const moe_cache_source_lru_stats & rhs_source = sources[source_indices[rhs]];
+        if (moe_cache_source_is_colder(lhs_source, rhs_source)) {
+            return true;
+        }
+        if (moe_cache_source_is_colder(rhs_source, lhs_source)) {
+            return false;
+        }
+        const moe_cache_slot & lhs_slot = pool.slots[lhs];
+        const moe_cache_slot & rhs_slot = pool.slots[rhs];
+        return lhs_slot.uses < rhs_slot.uses;
+    };
+
+    int cold_candidate = -1;
+    int fallback = -1;
+    for (int index = pool.lru_head; index >= 0; index = pool.slots[index].next) {
+        const moe_cache_slot & slot = pool.slots[index];
+        if (slot.readers > 0) {
+            continue;
+        }
+        if (is_better_victim(index, fallback)) {
+            fallback = index;
+        }
+        if ((int)slot.uses <= hot_uses && is_better_victim(index, cold_candidate)) {
+            cold_candidate = index;
+        }
+    }
+    return cold_candidate >= 0 ? cold_candidate : fallback;
+}
+
 static void moe_cache_map_erase(moe_cache_pool & pool, int index) {
     moe_cache_slot & slot = pool.slots[index];
     auto it = pool.map.find(slot.key);
@@ -2222,29 +2315,12 @@ static int moe_cache_plan(
             slot_index = pool.free_slots.back();
             pool.free_slots.pop_back();
         } else {
-            int candidate = -1;
-            int fallback = -1;
-            for (int index = pool.lru_head; index >= 0; index = pool.slots[index].next) {
-                const moe_cache_slot & candidate_slot = pool.slots[index];
-                if (candidate_slot.readers > 0) {
-                    continue;
-                }
-                if (fallback < 0) {
-                    fallback = index;
-                }
-                if ((int) candidate_slot.uses <= session.config.hot_uses) {
-                    candidate = index;
-                    break;
-                }
-            }
-            if (candidate < 0) {
-                candidate = fallback;
-            }
-            if (candidate < 0) {
+            slot_index = moe_cache_select_source_aware_victim(
+                    pool, session.config.hot_uses);
+            if (slot_index < 0) {
                 device.insert_skips++;
                 continue;
             }
-            slot_index = candidate;
             const uint16_t victim_frequency = moe_cache_frequency_peek(
                     device, pool.slots[slot_index].key, frequency_horizon);
             if (candidate_frequency <= victim_frequency) {
