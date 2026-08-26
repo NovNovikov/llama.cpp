@@ -135,6 +135,12 @@ struct moe_cache_demand {
     size_t expert_size = 0;
 };
 
+struct moe_cache_frequency {
+    uint16_t count = 0;
+    uint64_t epoch = 0;
+    size_t expert_size = 0;
+};
+
 struct moe_cache_config {
     bool enabled = true;
     bool automatic = true;
@@ -181,6 +187,8 @@ struct moe_cache_device {
     std::vector<moe_cache_shape> shapes;
     std::unordered_map<const void *, moe_cache_seen_tensor> seen_tensors;
     std::unordered_map<moe_cache_key, moe_cache_demand, moe_cache_key_hash> demand_count;
+    std::unordered_map<moe_cache_key, moe_cache_frequency, moe_cache_key_hash> frequency;
+    uint64_t frequency_epoch = 0;
     int stable_visits = 0;
     bool saw_repeat = false;
     bool budget_registered = false;
@@ -227,6 +235,7 @@ struct moe_cache_device {
     long long collect_failures = 0;
     long long activation_dedup = 0;
     long long overlap_rows = 0;
+    long long victim_rejections = 0;
     long long nodes = 0;
     long long collect_calls = 0;
     std::atomic<int> error_logs{0};
@@ -700,6 +709,53 @@ static void moe_cache_slot_reset(moe_cache_pool & pool, int index, bool add_to_f
     if (add_to_free) {
         pool.free_slots.push_back(index);
     }
+}
+
+static uint16_t moe_cache_frequency_decay(
+        uint16_t count, uint64_t then, uint64_t now, uint64_t horizon) {
+    if (count == 0 || now <= then || horizon == 0) {
+        return count;
+    }
+    const uint64_t shifts = (now - then) / horizon;
+    return shifts >= 16 ? 0 : (uint16_t)(count >> shifts);
+}
+
+static uint64_t moe_cache_frequency_horizon(
+        const moe_cache_device & device, int readmit_after) {
+    uint64_t slots = 0;
+    for (const auto & pool_ptr : device.pools) {
+        if (pool_ptr->slab) {
+            slots += (uint64_t)pool_ptr->n_slots;
+        }
+    }
+    return std::max<uint64_t>(1, slots) * std::max(1, readmit_after);
+}
+
+static uint16_t moe_cache_frequency_touch(
+        moe_cache_device & device, const moe_cache_key & key,
+        size_t expert_size, uint64_t horizon) {
+    try {
+        moe_cache_frequency & frequency = device.frequency[key];
+        frequency.count = moe_cache_frequency_decay(
+                frequency.count, frequency.epoch, device.frequency_epoch, horizon);
+        frequency.epoch = device.frequency_epoch;
+        frequency.expert_size = expert_size;
+        if (frequency.count < std::numeric_limits<uint16_t>::max()) {
+            frequency.count++;
+        }
+        return frequency.count;
+    } catch (...) {
+        return 0;
+    }
+}
+
+static uint16_t moe_cache_frequency_peek(
+        const moe_cache_device & device, const moe_cache_key & key,
+        uint64_t horizon) {
+    const auto found = device.frequency.find(key);
+    return found == device.frequency.end() ? 0 : moe_cache_frequency_decay(
+            found->second.count, found->second.epoch,
+            device.frequency_epoch, horizon);
 }
 
 static bool moe_cache_cuda_ok(
@@ -1384,12 +1440,13 @@ static void moe_cache_log_stats(moe_cache_device & device) {
         used += pool.n_slots - pool.free_slots.size();
     }
     const long long total = device.hits + device.misses;
-    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld heat=%lld skips=%lld admission=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld scope-enter=%lld leave-miss=%lld begin-empty=%lld begin-suppressed=%lld begin-inactive=%lld bypass-api=%lld op=%lld no-buffer=%lld nonhost=%lld nonweights=%lld src1=%lld rows=%lld(max=%lldx%lld)\n",
+    MOE_CACHE_LOG("[moe-cache] CUDA%d hits=%lld/%lld (%.1f%%) used=%zu/%zu enqueued=%lld filled=%lld fill-fail=%lld evictions=%lld heat=%lld skips=%lld admission=%lld victim-reject=%lld queue=%zu jobs/%zu MiB dispatch-fail=%lld collect-fail=%lld act-dedup=%lld cpu-overlap=%lld scope-enter=%lld leave-miss=%lld begin-empty=%lld begin-suppressed=%lld begin-inactive=%lld bypass-api=%lld op=%lld no-buffer=%lld nonhost=%lld nonweights=%lld src1=%lld rows=%lld(max=%lldx%lld)\n",
             device.physical, device.hits, total,
             total ? 100.0 * (double)device.hits / (double)total : 0.0,
             used, slots, device.inserts, device.fills, device.fill_failures,
             device.evictions, device.heat_evictions, device.insert_skips,
-            device.admission_skips, device.queue.size(), device.queued_bytes >> 20,
+            device.admission_skips, device.victim_rejections,
+            device.queue.size(), device.queued_bytes >> 20,
             device.dispatch_failures, device.collect_failures,
             device.activation_dedup, device.overlap_rows,
             g_scope_stats.enters.load(std::memory_order_relaxed),
@@ -2086,6 +2143,11 @@ static int moe_cache_plan(
     node->pool_index = selected_pool;
     node->pool = device.pools[selected_pool].get();
     moe_cache_pool & pool = *node->pool;
+    if (device.frequency_epoch < std::numeric_limits<uint64_t>::max()) {
+        device.frequency_epoch++;
+    }
+    const uint64_t frequency_horizon = moe_cache_frequency_horizon(
+            device, session.config.readmit_after);
 
     for (int index = 0; index < n_ids; index++) {
         const int32_t expert = ids[index];
@@ -2096,6 +2158,8 @@ static int moe_cache_plan(
         const moe_cache_key key{node->host_base, expert};
         auto found = pool.map.find(key);
         if (found != pool.map.end()) {
+            moe_cache_frequency_touch(
+                    device, key, node->expert_size, frequency_horizon);
             moe_cache_slot & slot = pool.slots[found->second];
             if (slot.state == moe_cache_slot_state::valid) {
                 slot.readers++;
@@ -2124,6 +2188,8 @@ static int moe_cache_plan(
         if (demand->count < std::numeric_limits<uint16_t>::max()) {
             demand->count++;
         }
+        const uint16_t candidate_frequency = moe_cache_frequency_touch(
+                device, key, node->expert_size, frequency_horizon);
         const int admit_after = pool.free_slots.empty()
             ? std::max(session.config.admit_after, session.config.readmit_after)
             : session.config.admit_after;
@@ -2166,6 +2232,13 @@ static int moe_cache_plan(
                 continue;
             }
             slot_index = candidate;
+            const uint16_t victim_frequency = moe_cache_frequency_peek(
+                    device, pool.slots[slot_index].key, frequency_horizon);
+            if (candidate_frequency <= victim_frequency) {
+                device.admission_skips++;
+                device.victim_rejections++;
+                continue;
+            }
             const bool sacrificed_hot =
                 (int) pool.slots[slot_index].uses > session.config.hot_uses;
             moe_cache_slot_reset(pool, slot_index, false);
@@ -2746,6 +2819,18 @@ static void moe_cache_invalidate_session(
             if (moe_cache_ranges_overlap(
                     source, it->second.expert_size, base, size)) {
                 it = device.demand_count.erase(it);
+            } else {
+                ++it;
+            }
+        }
+        for (auto it = device.frequency.begin(); it != device.frequency.end();) {
+            const void * source = it->first.expert >= 0
+                ? (const char *)it->first.tensor +
+                    (size_t)it->first.expert * it->second.expert_size
+                : nullptr;
+            if (moe_cache_ranges_overlap(
+                    source, it->second.expert_size, base, size)) {
+                it = device.frequency.erase(it);
             } else {
                 ++it;
             }
