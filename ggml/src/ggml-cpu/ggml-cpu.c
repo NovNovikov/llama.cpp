@@ -1640,13 +1640,24 @@ static void ggml_compute_forward_mul_mat_id(
     if (ith == 0) {
         ggml_backend_buffer_t src0_buffer =
             src0->view_src ? src0->view_src->buffer : src0->buffer;
-        if (ggml_moe_cache.begin && ggml_moe_cache.plan &&
-            ggml_moe_cache.dispatch && ggml_moe_cache.collect && ggml_moe_cache.end &&
-            src0->op == GGML_OP_NONE && src0_buffer &&
-            ggml_backend_buffer_is_host(src0_buffer) &&
-            ggml_backend_buffer_get_usage(src0_buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
-            src1->type == GGML_TYPE_F32 &&
-            moe_cache_rows_fit) {
+        enum ggml_moe_cache_bypass_reason moe_cache_bypass = GGML_MOE_CACHE_BYPASS_COUNT;
+        if (!ggml_moe_cache.begin || !ggml_moe_cache.plan ||
+            !ggml_moe_cache.dispatch || !ggml_moe_cache.collect || !ggml_moe_cache.end) {
+            moe_cache_bypass = GGML_MOE_CACHE_BYPASS_API;
+        } else if (src0->op != GGML_OP_NONE) {
+            moe_cache_bypass = GGML_MOE_CACHE_BYPASS_SRC0_OP;
+        } else if (!src0_buffer) {
+            moe_cache_bypass = GGML_MOE_CACHE_BYPASS_NO_BUFFER;
+        } else if (!ggml_backend_buffer_is_host(src0_buffer)) {
+            moe_cache_bypass = GGML_MOE_CACHE_BYPASS_NOT_HOST;
+        } else if (ggml_backend_buffer_get_usage(src0_buffer) != GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+            moe_cache_bypass = GGML_MOE_CACHE_BYPASS_NOT_WEIGHTS;
+        } else if (src1->type != GGML_TYPE_F32) {
+            moe_cache_bypass = GGML_MOE_CACHE_BYPASS_SRC1_TYPE;
+        } else if (!moe_cache_rows_fit) {
+            moe_cache_bypass = GGML_MOE_CACHE_BYPASS_ROWS;
+        }
+        if (moe_cache_bypass == GGML_MOE_CACHE_BYPASS_COUNT) {
             moe_cache_node = ggml_moe_cache.begin(src0->name, src0->data, nb02,
                                                   ne00, ne01, (int) type, ne02, ids->ne[1]);
             if (moe_cache_node) {
@@ -1658,6 +1669,8 @@ static void ggml_compute_forward_mul_mat_id(
                 }
                 ggml_moe_cache.plan(moe_cache_node, expert_ids, n_ids * ids->ne[1], moe_cache_slot_idx);
             }
+        } else if (ggml_moe_cache.bypass) {
+            ggml_moe_cache.bypass(moe_cache_bypass, n_ids, ids->ne[1]);
         }
 
         // initialize matrix_row_counts
