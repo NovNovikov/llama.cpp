@@ -194,6 +194,7 @@ struct moe_cache_device {
     size_t queued_bytes = 0;
     bool worker_started = false;
     bool inflight = false;
+    int fill_pauses = 0;
     const void * inflight_source = nullptr;
     size_t inflight_bytes = 0;
     std::thread worker;
@@ -290,6 +291,7 @@ static std::unordered_map<int, moe_cache_physical_budget> g_physical_budgets;
 struct moe_cache_scope_frame {
     moe_cache_session * requested = nullptr;
     moe_cache_session * active = nullptr;
+    bool fills_paused = false;
 };
 static thread_local std::vector<moe_cache_scope_frame> g_session_stack;
 static thread_local int g_session_suppressed = 0;
@@ -956,7 +958,7 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
             std::unique_lock<std::mutex> lock(session->mu);
             session->cv.wait(lock, [&] {
                 return session->stopping || device->dead.load() ||
-                    !device->queue.empty();
+                    (!device->queue.empty() && device->fill_pauses == 0);
             });
             if ((session->stopping || device->dead.load()) &&
                 device->queue.empty()) {
@@ -1643,6 +1645,35 @@ static void moe_cache_session_destroy(void * opaque) {
     delete session;
 }
 
+static void moe_cache_pause_fills_for_scope(moe_cache_session & session) {
+    auto frame = std::find_if(
+            g_session_stack.rbegin(), g_session_stack.rend(),
+            [&session](const moe_cache_scope_frame & candidate) {
+                return candidate.active == &session;
+            });
+    if (frame == g_session_stack.rend() || frame->fills_paused) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock(session.mu);
+    if (session.stopping) {
+        return;
+    }
+    frame->fills_paused = true;
+    for (const auto & device_ptr : session.devices) {
+        device_ptr->fill_pauses++;
+    }
+    session.cv.notify_all();
+    session.idle_cv.wait(lock, [&] {
+        for (const auto & device_ptr : session.devices) {
+            if (device_ptr->inflight) {
+                return false;
+            }
+        }
+        return true;
+    });
+}
+
 static void moe_cache_session_enter(void * opaque) {
     g_scope_stats.enters.fetch_add(1, std::memory_order_relaxed);
     if (g_session_suppressed > 0) {
@@ -1710,12 +1741,21 @@ static void moe_cache_session_leave(void * opaque) {
         return;
     }
     moe_cache_session * active = found->active;
+    const bool fills_paused = found->fills_paused;
     g_session_stack.erase(std::next(found).base());
     if (active) {
         std::lock_guard<std::mutex> lock(active->mu);
+        if (fills_paused) {
+            for (const auto & device_ptr : active->devices) {
+                if (device_ptr->fill_pauses > 0) {
+                    device_ptr->fill_pauses--;
+                }
+            }
+        }
         if (active->active_scopes > 0) {
             active->active_scopes--;
         }
+        active->cv.notify_all();
         active->idle_cv.notify_all();
     }
 }
@@ -1736,9 +1776,18 @@ static void * moe_cache_begin(
         g_scope_stats.begin_inactive_session.fetch_add(1, std::memory_order_relaxed);
         return nullptr;
     }
+    if (n_tokens < 1) {
+        return nullptr;
+    }
+    if (n_tokens > session->config.max_batch) {
+        // The cache does not serve prompt-processing rows, but its fill worker
+        // still competes for host bandwidth. Let this foreground graph finish
+        // before accepting another host-to-device expert copy.
+        moe_cache_pause_fills_for_scope(*session);
+        return nullptr;
+    }
     if (!name || !host_base ||
-        !moe_cache_tensor_name_supported(name) || n_tokens < 1 ||
-        n_tokens > session->config.max_batch ||
+        !moe_cache_tensor_name_supported(name) ||
         expert_size < session->config.min_expert_bytes ||
         n_in <= 0 || n_out <= 0 || n_expert <= 0 ||
         !moe_cache_type_supported((ggml_type)wtype)) {
