@@ -134,7 +134,8 @@ int llama_server(common_params & params, int argc, char ** argv) {
     // preset/model handler initialization above, but defer backend init until we
     // know we are actually launching a model child.
     const bool is_router_server = params.model.path.empty()
-                               && params.model.hf_repo.empty();
+                               && params.model.hf_repo.empty()
+                               && params.model.docker_repo.empty();
     if (!is_router_server) {
         // Set an abort callback that prints a structured error message to
         // stdout before abort() kills the process.  The parent's log thread
