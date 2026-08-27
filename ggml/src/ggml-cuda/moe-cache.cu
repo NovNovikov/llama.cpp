@@ -56,6 +56,7 @@ void ggml_moe_cache_register(const void * owner) {
 // This was the old minimum viable pool size. Keeping it as one physical slab
 // makes each reclaim meaningful while avoiding a new arbitrary allocator unit.
 static constexpr size_t moe_cache_slab_slots = 64;
+static constexpr auto   moe_cache_watchdog_interval = std::chrono::seconds(1);
 
 enum class moe_cache_slot_state : uint8_t {
     free,
@@ -1003,16 +1004,42 @@ static bool moe_cache_grow_host(
     return true;
 }
 
+static void moe_cache_watch_memory_pressure(
+        moe_cache_session & session, moe_cache_device & device) {
+    ggml_cuda_set_device(device.logical);
+    size_t free_memory = 0;
+    size_t total_memory = 0;
+    if (cudaMemGetInfo(&free_memory, &total_memory) != cudaSuccess) {
+        (void) cudaGetLastError();
+        return;
+    }
+
+    size_t reserve = 0;
+    {
+        std::lock_guard<std::mutex> budget_lock(g_budget_mu);
+        auto found = g_physical_budgets.find(device.physical);
+        if (found != g_physical_budgets.end()) {
+            reserve = found->second.reserve_bytes;
+        }
+    }
+    if (free_memory < reserve) {
+        (void) moe_cache_reclaim_session(
+                session, device.physical, reserve - free_memory, "VRAM watchdog");
+    }
+}
+
 static void moe_cache_worker(moe_cache_session * session, moe_cache_device * device) {
     char * stage = nullptr;
     size_t stage_capacity = 0;
     cudaStream_t stream = nullptr;
+    auto next_watchdog = std::chrono::steady_clock::now() + moe_cache_watchdog_interval;
 
     for (;;) {
         moe_cache_job job;
+        bool run_watchdog = false;
         {
             std::unique_lock<std::mutex> lock(session->mu);
-            session->cv.wait(lock, [&] {
+            session->cv.wait_until(lock, next_watchdog, [&] {
                 return session->stopping || device->dead.load() ||
                     !device->queue.empty();
             });
@@ -1021,13 +1048,29 @@ static void moe_cache_worker(moe_cache_session * session, moe_cache_device * dev
                 break;
             }
 
-            job = device->queue.front();
-            device->queue.pop_front();
-            device->queued_bytes = job.bytes <= device->queued_bytes
-                ? device->queued_bytes - job.bytes : 0;
-            device->inflight = true;
-            device->inflight_source = job.source;
-            device->inflight_bytes = job.bytes;
+            if (std::chrono::steady_clock::now() >= next_watchdog) {
+                next_watchdog = std::chrono::steady_clock::now() + moe_cache_watchdog_interval;
+                run_watchdog = moe_cache_device_bytes(*device) > 0;
+            }
+            if (run_watchdog) {
+                // Reclaim takes dispatch_mu before session->mu, so do not hold
+                // session->mu while checking external VRAM pressure.
+            } else if (device->queue.empty()) {
+                continue;
+            } else {
+                job = device->queue.front();
+                device->queue.pop_front();
+                device->queued_bytes = job.bytes <= device->queued_bytes
+                    ? device->queued_bytes - job.bytes : 0;
+                device->inflight = true;
+                device->inflight_source = job.source;
+                device->inflight_bytes = job.bytes;
+            }
+        }
+
+        if (run_watchdog) {
+            moe_cache_watch_memory_pressure(*session, *device);
+            continue;
         }
 
         cudaError_t error = cudaSuccess;
@@ -3032,15 +3075,16 @@ extern "C" size_t ggml_moe_cache_reclaim(
             reserve = found->second.reserve_bytes;
         }
     }
-    const size_t usable_free = free_memory > reserve ? free_memory - reserve : 0;
-    const size_t requested = allocation_bytes > usable_free
-        ? allocation_bytes - usable_free : 0;
+    const size_t required_free = allocation_bytes > SIZE_MAX - reserve
+        ? SIZE_MAX : allocation_bytes + reserve;
+    const size_t requested = required_free > free_memory
+        ? required_free - free_memory : 0;
     if (requested == 0) {
         return 0;
     }
 
-    MOE_CACHE_LOG("[moe-cache] CUDA%d pressure: compute-request=%zu MiB usable-free=%zu MiB reserve=%zu MiB\n",
-            physical_device, allocation_bytes >> 20, usable_free >> 20, reserve >> 20);
+    MOE_CACHE_LOG("[moe-cache] CUDA%d pressure: compute-request=%zu MiB free=%zu MiB reserve=%zu MiB\n",
+            physical_device, allocation_bytes >> 20, free_memory >> 20, reserve >> 20);
 
     size_t freed = 0;
     std::lock_guard<std::mutex> registry_lock(g_registry_mu);
