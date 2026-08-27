@@ -881,7 +881,7 @@ static constexpr uint32_t SLOT_META_ID_MAX    = 256u;
 // rope/yarn scale (positions are baked into the saved state), silently corrupts —
 // so cache_type_k/v and rope_scale are NOT optional.
 struct model_fp {
-    uint64_t fp_model      = 0; // hash of llama_model_desc + size + n_params (+ n_embd/n_layer)
+    uint64_t fp_model      = 0; // hash of model metadata, file identity, and projector identity
     uint32_t fp_n_vocab    = 0;
     uint32_t fp_n_ctx_train= 0;
     uint32_t fp_n_embd     = 0;
@@ -956,7 +956,36 @@ static inline uint64_t auto_hash_mix(uint64_t h, int32_t tok) {
     return auto_hash_mix64(h, (uint64_t) (uint32_t) tok);
 }
 
-// Fingerprint the projector's GGUF header, never its tensor payload. Media KV
+// Stable enough file identity for the disk KV cache. This is deliberately not a
+// content hash: it runs at server startup, and canonical path + size + mtime
+// reliably invalidates a locally replaced model, LoRA, or projector without
+// reading multi-GB weight files again.
+static uint64_t auto_file_identity_hash(const std::string & path) {
+    uint64_t hash = 0xcbf29ce484222325ULL;
+    std::error_code ec;
+    const std::filesystem::path canonical = std::filesystem::weakly_canonical(path, ec);
+    const std::string identity_path = ec ? path : canonical.generic_u8string();
+    for (const unsigned char c : identity_path) {
+        hash ^= (uint64_t) c;
+        hash *= 0x100000001b3ULL;
+    }
+    if (ec) {
+        return auto_hash_mix64(hash, UINT64_MAX);
+    }
+
+    const uintmax_t size = std::filesystem::file_size(canonical, ec);
+    if (ec) {
+        return auto_hash_mix64(hash, UINT64_MAX - 1);
+    }
+    const auto modified = std::filesystem::last_write_time(canonical, ec);
+    if (ec) {
+        return auto_hash_mix64(hash, UINT64_MAX - 2);
+    }
+    hash = auto_hash_mix64(hash, (uint64_t) size);
+    return auto_hash_mix64(hash, (uint64_t) modified.time_since_epoch().count());
+}
+
+// Fingerprint the projector's GGUF header plus its file identity. Media KV
 // embeddings depend on projector weights and geometry, so a projector swap must
 // invalidate a media disk snapshot even when the text model is unchanged.
 static bool mmproj_header_fingerprint(const std::string & path, uint64_t & out) {
@@ -1029,12 +1058,7 @@ static bool mmproj_header_fingerprint(const std::string & path, uint64_t & out) 
     }
     gguf_free(gctx);
 
-    std::error_code ec;
-    const uintmax_t size = std::filesystem::file_size(path, ec);
-    if (ec) {
-        return false;
-    }
-    mix_u64((uint64_t) size);
+    mix_u64(auto_file_identity_hash(path));
     out = hash;
     return true;
 }
@@ -2379,7 +2403,7 @@ public:
     mtmd_helper_init_opt init_opt = mtmd_helper_init_opt_default();
     const llama_vocab * vocab = nullptr;
 
-    // Header-only fingerprint of the loaded projector; zero without --mmproj.
+    // Header + file-identity fingerprint of the loaded projector; zero without --mmproj.
     uint64_t fp_mmproj = 0;
 
     server_queue    queue_tasks;
@@ -2688,7 +2712,7 @@ private:
 
     // ----- auto disk cache: fingerprint, index, restore, save (all gated by auto_cache_enabled()) -----
 
-    // hash of the active LoRA set (ids/scales) for the fingerprint; 0 when no adapter is active.
+    // Hash the active LoRA set's file identities and scales; 0 when no adapter is active.
     static uint64_t auto_lora_hash(const std::vector<common_adapter_lora_info> & lora) {
         uint64_t h = 0xcbf29ce484222325ULL;
         bool any = false;
@@ -2697,9 +2721,7 @@ private:
                 continue; // disabled adapter does not affect inference identity
             }
             any = true;
-            for (char c : a.path) {
-                h ^= (uint64_t) (unsigned char) c; h *= 0x100000001b3ULL;
-            }
+            h = auto_hash_mix64(h, auto_file_identity_hash(a.path));
             uint32_t sc; std::memcpy(&sc, &a.scale, sizeof(sc));
             h = auto_hash_mix(h, (int32_t) sc);
         }
@@ -2711,7 +2733,8 @@ private:
     // See README "Automatic disk prompt cache" for which flags invalidate the cache.
     model_fp auto_compute_fingerprint() const {
         model_fp fp;
-        // model identity string (arch + params + quant), hardened with size/n_params/n_embd/n_layer.
+        // Model identity string (arch + params + quant), hardened with model-file identity,
+        // size/n_params/n_embd/n_layer, and the loaded projector identity.
         char desc[256] = {0};
         llama_model_desc(model_tgt, desc, sizeof(desc));
         uint64_t h = 0xcbf29ce484222325ULL;
@@ -2722,6 +2745,8 @@ private:
         const uint64_t np = llama_model_n_params(model_tgt);
         h = auto_hash_mix(h, (int32_t) (sz & 0xFFFFFFFFu)); h = auto_hash_mix(h, (int32_t) (sz >> 32));
         h = auto_hash_mix(h, (int32_t) (np & 0xFFFFFFFFu)); h = auto_hash_mix(h, (int32_t) (np >> 32));
+        h = auto_hash_mix64(h, auto_file_identity_hash(params_base.model.path));
+        h = auto_hash_mix64(h, fp_mmproj);
 
         fp.fp_model       = h;
         fp.fp_n_vocab     = (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
