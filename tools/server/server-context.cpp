@@ -881,7 +881,7 @@ static constexpr uint32_t SLOT_META_ID_MAX    = 256u;
 // rope/yarn scale (positions are baked into the saved state), silently corrupts —
 // so cache_type_k/v and rope_scale are NOT optional.
 struct model_fp {
-    uint64_t fp_model      = 0; // hash of model metadata, file identity, and projector identity
+    uint64_t fp_model      = 0; // hash of model metadata, file identity, projector, and KV-affecting transforms
     uint32_t fp_n_vocab    = 0;
     uint32_t fp_n_ctx_train= 0;
     uint32_t fp_n_embd     = 0;
@@ -2728,13 +2728,95 @@ private:
         return any ? h : 0;
     }
 
+    // Control vectors alter the activations that produce every following layer's
+    // K/V rows. Keep their ordered file identities and the effective layer range
+    // in the model identity used for persistent snapshots.
+    static uint64_t auto_control_vector_hash(
+            const std::vector<common_control_vector_load_info> & control_vectors,
+            int32_t layer_start,
+            int32_t layer_end,
+            int32_t n_layer) {
+        if (control_vectors.empty()) {
+            return 0;
+        }
+
+        uint64_t h = 0xcbf29ce484222325ULL;
+        for (const auto & control_vector : control_vectors) {
+            h = auto_hash_mix64(h, auto_file_identity_hash(control_vector.fname));
+            uint32_t strength;
+            std::memcpy(&strength, &control_vector.strength, sizeof(strength));
+            h = auto_hash_mix64(h, strength);
+        }
+
+        // Match common_init_from_params(), which resolves omitted/non-positive
+        // bounds immediately before calling llama_set_adapter_cvec().
+        const int32_t effective_start = layer_start <= 0 ? 1 : layer_start;
+        const int32_t effective_end   = layer_end   <= 0 ? n_layer : layer_end;
+        h = auto_hash_mix64(h, (uint32_t) effective_start);
+        h = auto_hash_mix64(h, (uint32_t) effective_end);
+        return h;
+    }
+
+    // The model loader retains the first override for each key. Hash that exact
+    // effective map in key order rather than the CLI order (and skip the empty
+    // sentinel appended by common_params_parse()).
+    static uint64_t auto_kv_overrides_hash(const std::vector<llama_model_kv_override> & overrides) {
+        std::map<std::string, const llama_model_kv_override *> effective;
+        for (const auto & override : overrides) {
+            if (override.key[0] != '\0') {
+                effective.emplace(override.key, &override);
+            }
+        }
+        if (effective.empty()) {
+            return 0;
+        }
+
+        uint64_t h = 0xcbf29ce484222325ULL;
+        auto mix_string = [&h](const char * value, size_t size) {
+            h = auto_hash_mix64(h, size);
+            for (size_t i = 0; i < size; ++i) {
+                h = auto_hash_mix64(h, (unsigned char) value[i]);
+            }
+        };
+
+        for (const auto & item : effective) {
+            const auto & override = *item.second;
+            mix_string(item.first.data(), item.first.size());
+            h = auto_hash_mix64(h, (uint32_t) override.tag);
+            switch (override.tag) {
+                case LLAMA_KV_OVERRIDE_TYPE_INT:
+                    h = auto_hash_mix64(h, (uint64_t) override.val_i64);
+                    break;
+                case LLAMA_KV_OVERRIDE_TYPE_FLOAT: {
+                    uint64_t value;
+                    std::memcpy(&value, &override.val_f64, sizeof(value));
+                    h = auto_hash_mix64(h, value);
+                } break;
+                case LLAMA_KV_OVERRIDE_TYPE_BOOL:
+                    h = auto_hash_mix64(h, override.val_bool ? 1u : 0u);
+                    break;
+                case LLAMA_KV_OVERRIDE_TYPE_STR: {
+                    size_t length = 0;
+                    while (length < sizeof(override.val_str) && override.val_str[length] != '\0') {
+                        ++length;
+                    }
+                    mix_string(override.val_str, length);
+                } break;
+                default:
+                    h = auto_hash_mix64(h, UINT64_MAX);
+                    break;
+            }
+        }
+        return h;
+    }
+
     // Compute the live model fingerprint once at load (invariant 3). Pure-CPU; only called from
     // an auto_cache_enabled() branch so it costs nothing when OFF.
     // See README "Automatic disk prompt cache" for which flags invalidate the cache.
     model_fp auto_compute_fingerprint() const {
         model_fp fp;
         // Model identity string (arch + params + quant), hardened with model-file identity,
-        // size/n_params/n_embd/n_layer, and the loaded projector identity.
+        // size/n_params/n_embd/n_layer, projector, and KV-affecting runtime transforms.
         char desc[256] = {0};
         llama_model_desc(model_tgt, desc, sizeof(desc));
         uint64_t h = 0xcbf29ce484222325ULL;
@@ -2747,6 +2829,12 @@ private:
         h = auto_hash_mix(h, (int32_t) (np & 0xFFFFFFFFu)); h = auto_hash_mix(h, (int32_t) (np >> 32));
         h = auto_hash_mix64(h, auto_file_identity_hash(params_base.model.path));
         h = auto_hash_mix64(h, fp_mmproj);
+        h = auto_hash_mix64(h, auto_control_vector_hash(
+                params_base.control_vectors,
+                params_base.control_vector_layer_start,
+                params_base.control_vector_layer_end,
+                llama_model_n_layer(model_tgt)));
+        h = auto_hash_mix64(h, auto_kv_overrides_hash(params_base.kv_overrides));
 
         fp.fp_model       = h;
         fp.fp_n_vocab     = (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
