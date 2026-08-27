@@ -2537,8 +2537,9 @@ static int moe_cache_dispatch_internal(
 static int moe_cache_collect(
         void * opaque, int n_hits, float * const * dst_rows, int64_t n_out) {
     moe_cache_node * node = (moe_cache_node *)opaque;
+    const int pins_per_hit = node && node->host_base2 ? 2 : 1;
     if (!node || !node->dispatched || n_hits <= 0 || n_hits > 64 ||
-        n_hits != node->n_pins || !dst_rows || n_out != node->n_out) {
+        n_hits * pins_per_hit != node->n_pins || !dst_rows || n_out != node->n_out) {
         return 0;
     }
     for (int index = 0; index < n_hits; index++) {
