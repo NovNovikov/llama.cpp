@@ -1455,13 +1455,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const std::string arch_tgt = common_speculative_get_model_arch(llama_get_model(ctx_tgt));
         const std::string arch_dft = common_speculative_get_model_arch(llama_get_model(ctx_dft));
         const bool is_gemma4_mtp = arch_tgt == "gemma4" && arch_dft == "gemma4-assistant";
+        const bool needs_nextn = is_gemma4_mtp || arch_tgt == "nemotron_h_moe";
 
         // Qwen/Step-style native MTP consumes the target's pre-norm rows.
-        // Gemma4 and Nemotron MTP consume post-final-norm rows via t_h_nextn;
-        // keep that fallback available for every target architecture.
-        llama_set_embeddings_pre_norm(ctx_tgt, !is_gemma4_mtp);
+        // Gemma4 and Nemotron-H MoE MTP consume post-final-norm rows via t_h_nextn.
+        llama_set_embeddings_pre_norm(ctx_tgt, !needs_nextn);
         llama_set_embeddings_pre_norm(ctx_dft, true);
-        llama_set_embeddings_nextn(ctx_tgt, true,          /*masked*/ false);
+        llama_set_embeddings_nextn(ctx_tgt, needs_nextn,   /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true,        /*masked*/ true);
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
