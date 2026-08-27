@@ -1717,6 +1717,8 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
+        spec_is_replay = false;
+
         n_prompt_tokens_cache = 0;
         ctx_save_pos = -1;
 
@@ -7705,6 +7707,7 @@ private:
                         }
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                        slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;
@@ -7745,14 +7748,20 @@ private:
             slot.t_token_generation = std::max<int64_t>(1, t_now - slot.t_start_generation) / 1e3;
 
             // update how many tokens out of those tested were accepted
-            slot.n_draft_accepted += ids.size() - 1;
+            size_t n_accepted = ids.size() - 1;
+            if (slot.spec_is_replay && n_accepted > 0) {
+                n_accepted--;
+            }
+            slot.spec_is_replay = false;
+
+            slot.n_draft_accepted += n_accepted;
             slot.n_draft_verif_steps += 1;
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
                 n_accepted_per_pos.resize(common_speculative_n_max(spec.get()), 0);
             }
-            for (size_t i = 0; i < ids.size() - 1 && i < slot.n_accepted_per_pos.size(); ++i) {
+            for (size_t i = 0; i < n_accepted && i < slot.n_accepted_per_pos.size(); ++i) {
                 slot.n_accepted_per_pos[i]++;
             }
 
@@ -7787,7 +7796,7 @@ private:
 
             slot.print_timings_tg();
 
-            SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) ids.size() - 1, (int) n_draft, slot.prompt.n_tokens());
+            SLT_DBG(slot, "accepted %d/%d draft tokens, new n_tokens = %d\n", (int) n_accepted, (int) n_draft, slot.prompt.n_tokens());
         });
     }
 
