@@ -1311,7 +1311,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // i_last addresses logits / masked-nextn by raw batch position. Pre-norm
+    // output is compacted to output rows, so it needs its own index.
     std::vector<int>                i_last;
+    std::vector<int>                i_last_output;
     std::vector<std::vector<float>> chain_h;
 
     void reset_seq_state(llama_seq_id seq_id) {
@@ -1323,6 +1326,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         verify_h[seq_id].clear();
         verify_h_rows[seq_id] = 0;
         i_last[seq_id]        = -1;
+        i_last_output[seq_id] = -1;
         i_batch_beg[seq_id]   = -1;
         i_batch_end[seq_id]   = -1;
 
@@ -1413,6 +1417,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         pending_h.assign(n_seq, std::vector<float>(n_embd, 0.0f));
 
         i_last.assign(n_seq, -1);
+        i_last_output.assign(n_seq, -1);
         i_batch_beg.assign(n_seq, -1);
         i_batch_end.assign(n_seq, -1);
 
@@ -1595,6 +1600,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
+        int i_output = 0;
         std::vector<bool> drafting(n_seq);
 
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
@@ -1613,7 +1619,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             common_batch_add(batch, dp.id_last, dp.n_past, { seq_id }, true);
             std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, pending_h[seq_id].data(), row_bytes);
 
-            i_last[seq_id] = batch.n_tokens - 1;
+            i_last[seq_id]        = batch.n_tokens - 1;
+            i_last_output[seq_id] = i_output++;
 
             if (chain_heads) {
                 chain_h[seq_id].assign(pending_h[seq_id].begin(), pending_h[seq_id].end());
@@ -1650,6 +1657,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             // new token (the KV already holds the prefix), while chained heads re-add the
             // whole prefix at the next head. dropped sequences are simply not re-added.
             common_batch_clear(batch);
+            i_output = 0;
 
             for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
                 if (!drafting[seq_id]) {
@@ -1660,7 +1668,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
                 const float * h_row = use_pre_norm
-                    ? llama_get_embeddings_pre_norm_ith(ctx_dft, i_last[seq_id])
+                    ? llama_get_embeddings_pre_norm_ith(ctx_dft, i_last_output[seq_id])
                     : llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
@@ -1716,7 +1724,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
                 }
 
-                i_last[seq_id] = batch.n_tokens - 1;
+                i_last[seq_id]        = batch.n_tokens - 1;
+                i_last_output[seq_id] = i_output++;
             }
 
             if (batch.n_tokens == 0) {
