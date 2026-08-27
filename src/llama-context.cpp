@@ -169,6 +169,7 @@ llama_context::llama_context(
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_UNSPECIFIED) {
         rope_scaling_type = hparams.rope_scaling_type_train;
     }
+    cparams.rope_scaling_type = rope_scaling_type;
 
     if (rope_scaling_type == LLAMA_ROPE_SCALING_TYPE_NONE) {
         cparams.rope_freq_scale = 1.0f; // never scale if scaling type is none
@@ -3826,6 +3827,20 @@ uint32_t llama_n_seq_max(const llama_context * ctx) {
 
 uint32_t llama_n_rs_seq(const llama_context * ctx) {
     return ctx->get_cparams().n_rs_seq;
+}
+
+void llama_context_get_rope_params(
+        const llama_context * ctx,
+        llama_context_rope_params * params) {
+    const auto & cparams = ctx->get_cparams();
+    params->rope_scaling_type = cparams.rope_scaling_type;
+    params->rope_freq_base    = cparams.rope_freq_base;
+    params->rope_freq_scale   = cparams.rope_freq_scale;
+    params->yarn_ext_factor   = cparams.yarn_ext_factor;
+    params->yarn_attn_factor  = cparams.yarn_attn_factor;
+    params->yarn_beta_fast    = cparams.yarn_beta_fast;
+    params->yarn_beta_slow    = cparams.yarn_beta_slow;
+    params->yarn_orig_ctx     = cparams.n_ctx_orig_yarn;
 }
 
 const llama_model * llama_get_model(const llama_context * ctx) {

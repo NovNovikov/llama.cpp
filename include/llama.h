@@ -428,6 +428,20 @@ extern "C" {
         struct llama_context * ctx_other;
     };
 
+    // Resolved RoPE configuration used by an initialized context. Unlike
+    // llama_context_params, these values include model defaults and the
+    // context's final YaRN adjustments.
+    struct llama_context_rope_params {
+        enum llama_rope_scaling_type rope_scaling_type;
+        float    rope_freq_base;
+        float    rope_freq_scale;
+        float    yarn_ext_factor;
+        float    yarn_attn_factor;
+        float    yarn_beta_fast;
+        float    yarn_beta_slow;
+        uint32_t yarn_orig_ctx;
+    };
+
     struct llama_model_tensor_override {
         const char * pattern;
         enum ggml_type type;
@@ -580,6 +594,9 @@ extern "C" {
     LLAMA_API uint32_t llama_n_ubatch   (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_seq_max  (const struct llama_context * ctx);
     LLAMA_API uint32_t llama_n_rs_seq   (const struct llama_context * ctx);
+    LLAMA_API void llama_context_get_rope_params(
+            const struct llama_context * ctx,
+            struct llama_context_rope_params * params);
 
     DEPRECATED(LLAMA_API int32_t llama_n_ctx_train(const struct llama_model * model), "use llama_model_n_ctx_train instead");
     DEPRECATED(LLAMA_API int32_t llama_n_embd     (const struct llama_model * model), "use llama_model_n_embd instead");

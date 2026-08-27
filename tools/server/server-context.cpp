@@ -2849,30 +2849,21 @@ private:
         fp.fp_n_ctx       = (uint32_t) llama_n_ctx_seq(ctx_tgt);
         fp.fp_kv_full     = (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) ? 1u : 0u;
         fp.fp_block       = (uint32_t) params_base.slot_save_block;
-        // effective rope scale (positions are baked into the saved state). rope_freq_scale==0 means
-        // "use the model's trained value", so fall back to that for a stable comparison.
-        float rs = params_base.rope_freq_scale != 0.0f
-                       ? params_base.rope_freq_scale
-                       : llama_model_rope_freq_scale_train(model_tgt);
-        uint32_t rsb; std::memcpy(&rsb, &rs, sizeof(rsb));
-        fp.fp_rope_scale  = (uint64_t) rsb;
-        // rope_freq_base + the five YaRN params also bake positions into the saved
-        // KV, so they MUST be part of identity. There is no public getter for the model's trained
-        // rope base, so we normalize "use-model-default" to a single canonical 0 sentinel: when the
-        // operator left the knob at its default (rope_freq_base==0; YaRN floats<0, i.e. -1.0 "auto";
-        // yarn_orig_ctx<=0), we store 0. Two runs that both rely on the model default thus match;
-        // any explicit override (or two different overrides) yields a different fp and refuses
-        // (conservative — a needless miss is safe, a wrong restore is not). yarn_orig_ctx is an int.
+        // Positions are baked into the saved state. Read the context's resolved
+        // configuration rather than reimplementing its model-default, NONE, and
+        // YaRN resolution here.
+        llama_context_rope_params rope = {};
+        llama_context_get_rope_params(ctx_tgt, &rope);
+        h = auto_hash_mix64(h, (uint32_t) rope.rope_scaling_type);
         auto bitcast_f = [](float v) -> uint32_t { uint32_t u; std::memcpy(&u, &v, sizeof(u)); return u; };
-        auto norm_yarn = [&](float v) -> uint32_t { return v < 0.0f ? 0u : bitcast_f(v); }; // <0 == model default
-        const float rb = params_base.rope_freq_base > 0.0f ? params_base.rope_freq_base : 0.0f; // 0 == model default
-        uint32_t rbb; std::memcpy(&rbb, &rb, sizeof(rbb));
-        fp.fp_rope_base      = (uint64_t) rbb;
-        fp.fp_yarn_ext       = norm_yarn(params_base.yarn_ext_factor);
-        fp.fp_yarn_attn      = norm_yarn(params_base.yarn_attn_factor);
-        fp.fp_yarn_beta_fast = norm_yarn(params_base.yarn_beta_fast);
-        fp.fp_yarn_beta_slow = norm_yarn(params_base.yarn_beta_slow);
-        fp.fp_yarn_orig_ctx  = params_base.yarn_orig_ctx > 0 ? (uint32_t) params_base.yarn_orig_ctx : 0u;
+        const uint32_t rsb = bitcast_f(rope.rope_freq_scale);
+        fp.fp_rope_scale  = (uint64_t) rsb;
+        fp.fp_rope_base      = (uint64_t) bitcast_f(rope.rope_freq_base);
+        fp.fp_yarn_ext       = bitcast_f(rope.yarn_ext_factor);
+        fp.fp_yarn_attn      = bitcast_f(rope.yarn_attn_factor);
+        fp.fp_yarn_beta_fast = bitcast_f(rope.yarn_beta_fast);
+        fp.fp_yarn_beta_slow = bitcast_f(rope.yarn_beta_slow);
+        fp.fp_yarn_orig_ctx  = rope.yarn_orig_ctx;
         // LoRA: fingerprint the global adapter set so a snapshot under adapter A never restores
         // under B. (Per-request adapter overrides additionally gate at the restore hook.)
         fp.fp_lora        = auto_lora_hash(params_base.lora_adapters);
