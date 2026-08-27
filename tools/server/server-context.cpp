@@ -6820,7 +6820,13 @@ private:
 
                                 slot.just_restored = false; // one-shot consume (this path owns it)
 
-                                if (!slot.restored_logits.empty()) {
+                                // Pre-sampling probabilities come from raw target logits at a decode
+                                // index. The saved sidecar cannot reproduce that contract, so use the
+                                // normal reprefill path in that case.
+                                const bool requires_prefill_for_probs =
+                                    slot.task->params.sampling.n_probs > 0 && !slot.task->params.post_sampling_probs;
+
+                                if (!slot.restored_logits.empty() && !requires_prefill_for_probs) {
                                     // --- fast path: emit first token from saved logits, no decode ---
                                     slot.n_prompt_tokens_cache     = n_past; // entire prompt "reused"
                                     slot.n_prompt_tokens_processed = 0;      // prompt_n = 0 => observable reuse signal
@@ -6898,11 +6904,11 @@ private:
                                     return; // skip the rest of prompt-batch building for this slot; iterate() proceeds to the next
                                 }
 
-                                // --- safe fallback: no valid sidecar -> clear restored seq, then reprefill ---
+                                // --- safe fallback: no usable sidecar -> clear restored seq, then reprefill ---
                                 // FULL models support full-sequence removal; clearing first guarantees the
                                 // subsequent reprefill writes into an EMPTY sequence instead of re-decoding
                                 // into the already-occupied restored state (which is the crash being fixed).
-                                SLT_WRN(slot, "%s", "restore-continue: no saved logits; clearing restored state and re-prefilling\n");
+                                SLT_WRN(slot, "%s", "restore-continue: saved logits cannot serve this request; clearing restored state and re-prefilling\n");
                                 llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
                                 slot.prompt.tokens.clear();
                                 slot.prompt.checkpoints.clear();
