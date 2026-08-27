@@ -926,6 +926,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     bool sample_from_anchor = true;
 
+    const bool is_dspark;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -936,6 +938,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             common_speculative_type type = COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH)
         : common_speculative_impl(type, n_seq, params.draft.n_max)
         , params(params.draft)
+        , is_dspark(type == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
     {
         auto * ctx_tgt = this->params.ctx_tgt;
         auto * ctx_dft = this->params.ctx_dft;
@@ -965,17 +968,18 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
         }
         mask_token_id = llama_vocab_mask(llama_model_get_vocab(model_dft));
 
-        LOG_INF("%s: adding speculative implementation 'draft-dflash'\n", __func__);
+        LOG_INF("%s: adding speculative implementation '%s'\n", __func__, common_speculative_type_to_str(type).c_str());
         LOG_INF("%s: - n_max=%d, n_min=%d, p_min=%.2f\n", __func__, this->params.n_max, this->params.n_min, this->params.p_min);
         LOG_INF("%s: - block_size=%d, mask_token_id=%d, n_extract=%u, sample_from_anchor=%s\n", __func__,
                 block_size, mask_token_id, target_layer_ids_n, sample_from_anchor ? "true" : "false");
 
-        // DFlash input is [id_last, <mask> * (block_size-1)], so it can draft at most block_size-1 tokens per step
-        if (this->params.n_max > block_size - 1 || this->params.n_min > block_size - 1) {
-            LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained DFlash block size %d -- clamping to %d\n",
-                    __func__, this->params.n_max, this->params.n_min, block_size, block_size - 1);
-            this->params.n_max = std::min(this->params.n_max, block_size - 1);
-            this->params.n_min = std::min(this->params.n_min, block_size - 1);
+        // DFlash predicts after the anchor; anchor-first DSpark predicts from it.
+        const int32_t n_draft_max = is_dspark && sample_from_anchor ? block_size : block_size - 1;
+        if (this->params.n_max > n_draft_max || this->params.n_min > n_draft_max) {
+            LOG_WRN("%s: requested draft size (n_max=%d, n_min=%d) exceeds the trained block size %d -- clamping to %d\n",
+                    __func__, this->params.n_max, this->params.n_min, block_size, n_draft_max);
+            this->params.n_max = std::min(this->params.n_max, n_draft_max);
+            this->params.n_min = std::min(this->params.n_min, n_draft_max);
         }
         this->n_max = this->params.n_max;
 
@@ -1180,7 +1184,7 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 n_draft = std::min(n_draft, dp.n_max);
             }
 
-            const int32_t n_block_tokens = n_draft + 1; // id_last + n_draft * <mask>
+            const int32_t n_block_tokens = n_draft + (is_dspark && sample_from_anchor ? 0 : 1);
             i_block_beg[seq_id] = batch.n_tokens;
             n_block    [seq_id] = n_block_tokens;
             for (int32_t i = 0; i < n_block_tokens; ++i) {
@@ -1212,27 +1216,45 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
             auto & result = *dp.result;
 
-            // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
-            for (int32_t i = 1; i < n_block_tokens; ++i) {
-                common_sampler_sample(smpl, ctx_dft, beg + i, true);
+            if (is_dspark) {
+                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
+                const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
 
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                    const int32_t idx = beg + i;
+                    if (conf && conf[(size_t) idx * n_embd_dec] < params.p_min) {
+                        break;
+                    }
 
-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
-                    LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
-                            seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    common_sampler_sample(smpl, ctx_dft, idx, true);
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
+                    const llama_token id = cur_p->data[0].id;
+
+                    common_sampler_accept(smpl, id, true);
+                    result.push_back(id);
                 }
+            } else {
+                // greedily read the predicted block at this sequence's noise positions 1..n_block_tokens-1
+                for (int32_t i = 1; i < n_block_tokens; ++i) {
+                    common_sampler_sample(smpl, ctx_dft, beg + i, true);
 
-                const llama_token id = cur_p->data[0].id;
+                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
-                if (cur_p->data[0].p < params.p_min) {
-                    break;
+                    for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+                        LOG_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+                                seq_id, k, i - 1, cur_p->data[k].id, cur_p->data[k].p,
+                                common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+                    }
+
+                    const llama_token id = cur_p->data[0].id;
+
+                    if (cur_p->data[0].p < params.p_min) {
+                        break;
+                    }
+
+                    common_sampler_accept(smpl, id, true);
+                    result.push_back(id);
                 }
-
-                common_sampler_accept(smpl, id, true);
-
-                result.push_back(id);
             }
 
             if (result.size() < (size_t) params.n_min) {
@@ -1243,94 +1265,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
     void accept(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/, bool /*is_other*/) override {
         // noop
-    }
-};
-
-// DSpark: DFlash backbone + a semi-autoregressive Markov head; reuses process(), only draft() differs.
-struct common_speculative_impl_draft_dspark : public common_speculative_impl_draft_dflash {
-    common_speculative_impl_draft_dspark(const common_params_speculative & params_in, uint32_t n_seq)
-        : common_speculative_impl_draft_dflash(params_in, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK)
-    {
-        const llama_model * model_dft = llama_get_model(params.ctx_dft);
-        {
-            char buf[32] = {};
-            if (llama_model_meta_val_str(model_dft, "dspark.block_size", buf, sizeof(buf)) < 0) {
-                GGML_ABORT("DSpark: missing required metadata key 'dspark.block_size'");
-            }
-            block_size = std::atoi(buf);
-        }
-        if (params.n_max > block_size) {
-            params.n_max = block_size;
-        }
-
-        LOG_INF("%s: adding speculative implementation 'draft-dspark'\n", __func__);
-        LOG_INF("%s: - block_size=%d, n_max=%d\n", __func__, block_size, params.n_max);
-    }
-
-    void draft(common_speculative_draft_params_vec & dparams) override {
-        auto * ctx_dft = params.ctx_dft;
-
-        common_batch_clear(batch);
-
-        std::vector<int32_t> i_block_beg(n_seq, -1);
-        std::vector<int32_t> n_block    (n_seq,  0);
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            auto & dp = dparams[seq_id];
-            if (!dp.drafting) {
-                continue;
-            }
-
-            common_sampler_reset(smpls[seq_id].get());
-
-            const int32_t n = (int32_t) dp.n_past;
-
-            int32_t n_draft = params.n_max;
-            if (dp.n_max > 0) {
-                n_draft = std::min(n_draft, dp.n_max);
-            }
-            n_draft = std::min(n_draft, block_size);
-            if (n_draft <= 0) {
-                continue;
-            }
-
-            // Submit the whole anchor-first block so the in-graph Markov head can
-            // chain logits from the anchor through the remaining positions.
-            i_block_beg[seq_id] = batch.n_tokens;
-            n_block    [seq_id] = n_draft;
-            for (int32_t i = 0; i < block_size; ++i) {
-                common_batch_add(batch, i == 0 ? dp.id_last : mask_token_id, n + i, { seq_id }, true);
-            }
-        }
-
-        if (batch.n_tokens == 0) {
-            return;
-        }
-
-        if (llama_decode(ctx_dft, batch) != 0) {
-            LOG_WRN("%s: llama_decode failed\n", __func__);
-            return;
-        }
-
-        for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
-            if (i_block_beg[seq_id] < 0) {
-                continue;
-            }
-            auto & dp     = dparams[seq_id];
-            auto & result = *dp.result;
-
-            const int32_t beg = i_block_beg[seq_id];
-            const int32_t nb  = n_block[seq_id];
-            auto * smpl = smpls[seq_id].get();
-
-            for (int32_t i = 0; i < nb; ++i) {
-                common_sampler_sample(smpl, ctx_dft, beg + i, true);
-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
-                const llama_token id = cur_p->data[0].id;
-                common_sampler_accept(smpl, id, true);
-                result.push_back(id);
-            }
-        }
     }
 };
 
@@ -2798,7 +2732,8 @@ common_speculative * common_speculative_init(common_params_speculative & params,
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK: {
-                impls.push_back(std::make_unique<common_speculative_impl_draft_dspark>(config.params, n_seq));
+                impls.push_back(std::make_unique<common_speculative_impl_draft_dflash>(
+                        config.params, n_seq, COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK));
                 break;
             }
             case COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE: {
