@@ -147,7 +147,7 @@ struct moe_cache_config {
     bool enabled = true;
     bool automatic = true;
     size_t budget_mb = 0;
-    size_t reserve_mb = 0;
+    size_t reserve_mb = 500;
     size_t min_expert_bytes = 1u << 20;
     bool min_expert_explicit = false;
     int max_batch = 1;
