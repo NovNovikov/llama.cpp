@@ -3328,6 +3328,13 @@ private:
     // actually-restorable RAM prefix, not merely the raw token LCP.
     int auto_restore_into_slot(server_slot & slot, const auto_cache_entry & cand,
                                const server_tokens & req, int n_keep_mem) {
+        // Disk snapshots contain target KV only. The draft KV and speculative
+        // carry state cannot be reconstructed from them, so fall through to a
+        // normal prompt evaluation when speculation is active.
+        if (slot.can_speculate()) {
+            return 0;
+        }
+
         // Read the small .meta sidecar (cells + fp + optional media records) — never opens the
         // multi-GB state file until identity has passed every gate.
         model_fp disk_fp;
