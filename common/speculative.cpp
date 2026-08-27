@@ -1380,11 +1380,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const bool is_gemma4_mtp = arch_tgt == "gemma4" && arch_dft == "gemma4-assistant";
 
         // Qwen/Step-style native MTP consumes the target's pre-norm rows.
-        // Gemma4 assistants instead consume the target's post-final-norm hidden
-        // state via t_h_nextn, so keep nextn export enabled for that path.
+        // Gemma4 and Nemotron MTP consume post-final-norm rows via t_h_nextn;
+        // keep that fallback available for every target architecture.
         llama_set_embeddings_pre_norm(ctx_tgt, !is_gemma4_mtp);
         llama_set_embeddings_pre_norm(ctx_dft, true);
-        llama_set_embeddings_nextn(ctx_tgt, is_gemma4_mtp, /*masked*/ false);
+        llama_set_embeddings_nextn(ctx_tgt, true,          /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true,        /*masked*/ true);
 
         is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
