@@ -5667,7 +5667,8 @@ private:
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
     bool create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
-        const int id_task = slot.task->id;
+        // Manual SLOT_RESTORE runs on an idle slot, which has no active task.
+        const int id_task = slot.task ? slot.task->id : -1;
         const int64_t n_tokens = slot.prompt.n_tokens() - n_tokens_cur;
 
         // A disk restore recreates a RAM checkpoint at its exact resume position. Do not retain a
