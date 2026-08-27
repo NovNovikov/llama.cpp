@@ -1225,16 +1225,8 @@ void llama_context::set_embeddings_pre_norm(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
-    if (cparams.embeddings_nextn == value && cparams.embeddings_nextn_masked == masked) {
-        return;
-    }
-
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
-
-    // This changes the graph's retained rows and output buffer shape. Contexts
-    // are initially reserved before speculative setup enables this extraction.
-    sched_need_reserve = true;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
