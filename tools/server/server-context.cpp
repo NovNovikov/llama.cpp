@@ -2278,9 +2278,7 @@ static void debug_log_generated_output_jsonl(
     if (slot.id >= 0) {
         rec["slot_id"] = slot.id;
     }
-    if (slot.n_decoded >= 0) {
-        rec["output_token_count"] = slot.n_decoded;
-    }
+    rec["output_token_count"] = slot.stats.n_gen;
 
     debug_append_jsonl_record(params.log_generated_output, "--log-generated-output", rec);
 }
