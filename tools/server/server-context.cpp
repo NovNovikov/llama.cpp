@@ -6855,7 +6855,7 @@ private:
 
                                     // mirror the generation accounting from the normal sample path
                                     const int64_t t_current = ggml_time_us();
-                                    slot.n_decoded += 1;
+                                    slot.stats.n_gen += 1;
                                     slot.t_start_generation  = t_current;
                                     slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
                                     metrics.on_prompt_eval(slot);
