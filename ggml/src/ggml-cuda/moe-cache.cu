@@ -1587,6 +1587,9 @@ static void * moe_cache_session_create(
             MOE_CACHE_LOG("[moe-cache] session creation failed: unable to register the shared VRAM budget\n");
             return nullptr;
         }
+        for (const auto & device_ptr : session->devices) {
+            (void) moe_cache_prepare_budget(*session, *device_ptr);
+        }
 
         MOE_CACHE_LOG("[moe-cache] session ready: mode=%s selected-devices=%zu; pools allocate lazily after stable routed-expert demand\n",
                 session->config.automatic ? "auto" : "on", session->devices.size());
@@ -1868,8 +1871,7 @@ static void * moe_cache_begin(
         const size_t minimum_pool = expert_size * moe_cache_slab_slots;
         for (const auto & device_ptr : session->devices) {
             moe_cache_device & candidate = *device_ptr;
-            if (candidate.dead.load() ||
-                !moe_cache_prepare_budget(*session, candidate)) {
+            if (candidate.dead.load()) {
                 continue;
             }
             budget_devices++;
@@ -1899,7 +1901,7 @@ static void * moe_cache_begin(
         }
 
         auto route_weight = [&](moe_cache_device & candidate) -> size_t {
-            if (candidate.dead.load() || !moe_cache_prepare_budget(*session, candidate)) {
+            if (candidate.dead.load()) {
                 return 0;
             }
             const size_t reserved = moe_cache_scratch_total(
