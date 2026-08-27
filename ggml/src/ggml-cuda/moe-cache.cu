@@ -3067,24 +3067,16 @@ extern "C" size_t ggml_moe_cache_reclaim(
         (void) cudaGetLastError();
         return 0;
     }
-    size_t reserve = 0;
-    {
-        std::lock_guard<std::mutex> budget_lock(g_budget_mu);
-        auto found = g_physical_budgets.find(physical_device);
-        if (found != g_physical_budgets.end()) {
-            reserve = found->second.reserve_bytes;
-        }
-    }
-    const size_t required_free = allocation_bytes > SIZE_MAX - reserve
-        ? SIZE_MAX : allocation_bytes + reserve;
-    const size_t requested = required_free > free_memory
-        ? required_free - free_memory : 0;
+    // The reserve limits cache growth and is enforced by the watchdog. Mandatory
+    // llama allocations reclaim only the bytes they themselves need.
+    const size_t requested = allocation_bytes > free_memory
+        ? allocation_bytes - free_memory : 0;
     if (requested == 0) {
         return 0;
     }
 
-    MOE_CACHE_LOG("[moe-cache] CUDA%d pressure: compute-request=%zu MiB free=%zu MiB reserve=%zu MiB\n",
-            physical_device, allocation_bytes >> 20, free_memory >> 20, reserve >> 20);
+    MOE_CACHE_LOG("[moe-cache] CUDA%d pressure: compute-request=%zu MiB free=%zu MiB\n",
+            physical_device, allocation_bytes >> 20, free_memory >> 20);
 
     size_t freed = 0;
     std::lock_guard<std::mutex> registry_lock(g_registry_mu);
