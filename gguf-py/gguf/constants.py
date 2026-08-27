@@ -162,6 +162,7 @@ class Keys:
         TARGET_LAYERS                     = "{arch}.target_layers"
         TARGET_HIDDEN_SIZE                = "{arch}.target_hidden_size"
         BLOCK_SIZE                        = "{arch}.block_size"
+        SAMPLE_FROM_ANCHOR                = "{arch}.sample_from_anchor"
         MARKOV_RANK                       = "{arch}.markov_rank"
         NORM_BEFORE_RESIDUAL              = "{arch}.norm_before_residual"
         NORM_BEFORE_FC                    = "{arch}.norm_before_fc"
@@ -211,6 +212,7 @@ class Keys:
         SHARED_KV_LAYERS             = "{arch}.attention.shared_kv_layers"
         SLIDING_WINDOW_PATTERN       = "{arch}.attention.sliding_window_pattern"
         TEMPERATURE_SCALE            = "{arch}.attention.temperature_scale"
+        ROPE_PATTERN                 = "{arch}.attention.rope_pattern"
         GATE_PER_HEAD                = "{arch}.attention.gate_per_head"
 
         class Indexer:

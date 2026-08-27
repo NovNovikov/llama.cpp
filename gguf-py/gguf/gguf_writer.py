@@ -998,6 +998,9 @@ class GGUFWriter:
     def add_block_size(self, value: int) -> None:
         self.add_uint32(Keys.LLM.BLOCK_SIZE.format(arch=self.arch), value)
 
+    def add_sample_from_anchor(self, value: bool) -> None:
+        self.add_bool(Keys.LLM.SAMPLE_FROM_ANCHOR.format(arch=self.arch), value)
+
     def add_markov_rank(self, value: int) -> None:
         self.add_uint32(Keys.LLM.MARKOV_RANK.format(arch=self.arch), value)
 
