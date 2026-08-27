@@ -1147,10 +1147,6 @@ class MODEL_TENSOR(IntEnum):
     DSPARK_MARKOV_W2       = auto()  # dspark markov head: bias projection  [vocab, rank]
     DSPARK_CONF_PROJ       = auto()  # dspark confidence head: proj         [1, hidden+rank]
     D2T                    = auto()  # draft to target vocabulary mapping
-    # dspark
-    DSPARK_MARKOV_W1       = auto()  # markov head: prev-token embed
-    DSPARK_MARKOV_W2       = auto()  # markov head: bias projection
-    DSPARK_CONF_PROJ       = auto()  # confidence head
     # lfm2 audio
     A_ENC_NORM_CONV        = auto()
     A_ENC_LINEAR_POS       = auto()
