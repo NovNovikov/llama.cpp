@@ -6831,6 +6831,9 @@ private:
                                     // --- fast path: emit first token from saved logits, no decode ---
                                     slot.n_prompt_tokens_cache     = n_past; // entire prompt "reused"
                                     slot.n_prompt_tokens_processed = 0;      // prompt_n = 0 => observable reuse signal
+                                    slot.stats.n_prompt_cached     = n_past;
+                                    slot.stats.n_prompt_processed  = 0;
+                                    metrics.add_prompt_cached(n_past);
 
                                     // prime the sampler over the full restored prompt (penalties/grammar
                                     // history), exactly as the normal DONE_PROMPT transition (init_sampler) would.
