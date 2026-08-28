@@ -684,6 +684,8 @@ struct llama_model {
     struct ggml_tensor * dspark_conf_proj_b = nullptr; // [1]
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
+    // DFlash adds a scale tensor for dspark_markov_w2; legacy DSpark does not.
+    struct ggml_tensor * dspark_markov_w2_s = nullptr;
     struct ggml_tensor * dflash_selector_prev   = nullptr;
     struct ggml_tensor * dflash_selector_next   = nullptr;
     struct ggml_tensor * dflash_selector_hidden = nullptr;

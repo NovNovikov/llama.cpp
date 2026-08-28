@@ -220,6 +220,7 @@ This is a fork-local debug feature and is not part of upstream `master`.
 | -------- | ----------- |
 | `-lcs, --lookup-cache-static FNAME` | path to static lookup cache to use for lookup decoding (not updated by generation) |
 | `-lcd, --lookup-cache-dynamic FNAME` | path to dynamic lookup cache to use for lookup decoding (updated by generation) |
+| `--kv-unified-per-slot N` | context limit per parallel slot (default: unset, behavior unchanged).<br/>when set without -c/--ctx-size, the shared KV pool is sized to n_parallel*N<br/>(env: LLAMA_ARG_KV_UNIFIED_PER_SLOT) |
 | `-ctxcp, --ctx-checkpoints, --swa-checkpoints N` | max number of context checkpoints to keep per slot (default: 32)[(more info)](https://github.com/ggml-org/llama.cpp/pull/15293)<br/>(env: LLAMA_ARG_CTX_CHECKPOINTS) |
 | `-cpent, --checkpoint-every-n-tokens N` | create context checkpoints every N prompt tokens during prefill (default: 4096, <= 0 disables periodic scheduling)<br/>(env: LLAMA_ARG_CHECKPOINT_EVERY_NT) |
 | `-cms, --checkpoint-min-step N` | minimum spacing filter between checkpoints in tokens (default: 256, 0 = no minimum)<br/>does not schedule checkpoints by itself<br/>(env: LLAMA_ARG_CHECKPOINT_MIN_SPACING_NT) |
