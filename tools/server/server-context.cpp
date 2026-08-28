@@ -3378,7 +3378,13 @@ private:
     // therefore NOT a usable RAM resume point: only a checkpoint at or before the
     // divergence is. This is computed before inspecting disk candidates so the disk
     // margin is measured against a real alternative rather than an impossible rewind.
-    int usable_ram_prefix_for_disk(server_slot & slot, int raw_lcp) const {
+    int usable_ram_prefix_for_disk(
+            server_slot & slot,
+            int raw_lcp,
+            const common_prompt_checkpoint ** selected_out = nullptr) const {
+        if (selected_out != nullptr) {
+            *selected_out = nullptr;
+        }
         if (raw_lcp <= 0 || ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
             raw_lcp == (int) slot.prompt.tokens.size()) {
             SLT_INF(slot, "auto-restore: RAM raw prefix=%d, usable prefix=%d (direct reuse)\n",
@@ -3412,6 +3418,9 @@ private:
 
         int usable_prefix = 0;
         if (selected != nullptr) {
+            if (selected_out != nullptr) {
+                *selected_out = selected;
+            }
             const llama_pos pos_restore = std::min(
                 pos_diverge, std::max(selected->pos_min + 1, selected->pos_max));
             usable_prefix = (int) std::min(
@@ -6775,27 +6784,69 @@ private:
                                     // multi-GB state loads only once a candidate passes its gates. This
                                     // fall-through lets a corrupt or colliding longer snapshot yield to the
                                     // next shorter exact prefix without opening unrelated cache files.
-                                    const int n_keep_ram = usable_ram_prefix_for_disk(slot, (int) n_past);
+                                    const common_prompt_checkpoint * ram_checkpoint = nullptr;
+                                    const int n_keep_ram = usable_ram_prefix_for_disk(
+                                        slot, (int) n_past, &ram_checkpoint);
                                     const auto disk_candidates = auto_index_lookup(input_tokens.get_cell_tokens(), req_media);
                                     SLT_INF(slot, "auto-restore: RAM raw prefix=%d, usable prefix=%d, disk candidates=%zu\n",
                                             n_past, n_keep_ram, disk_candidates.size());
+
+                                    // A disk restore clears the slot before it reads the first state byte. Keep
+                                    // the resident FULL-memory checkpoint outside the slot while probing disk so a
+                                    // torn/corrupt .bin cannot turn a valid RAM resume point into a cold prefill.
+                                    // std::list::splice transfers ownership without copying its potentially large
+                                    // KV blobs. A direct PART-memory prefix has no serialised checkpoint to restore,
+                                    // so prefer that already-resident state over a destructive disk probe.
+                                    std::list<common_prompt_checkpoint> saved_ram_checkpoints;
+                                    server_tokens saved_ram_tokens;
+                                    const bool preserve_ram_checkpoint = ram_checkpoint != nullptr;
+                                    if (preserve_ram_checkpoint) {
+                                        saved_ram_tokens = slot.prompt.tokens.clone();
+                                        saved_ram_checkpoints.splice(
+                                            saved_ram_checkpoints.end(), slot.prompt.checkpoints);
+                                    }
+
+                                    bool disk_restored = false;
                                     for (const auto & cand : disk_candidates) {
-                                        // auto_restore_into_slot may CLEAR the slot
-                                        // (KV seq + prompt.tokens) and then have do_slot_restore FAIL
-                                        // (corrupt/short .bin, KV-capacity exceeded, racing LRU eviction
-                                        // deleting the file mid-read). In that case the slot tokens are now
-                                        // empty. We therefore RECOMPUTE n_past UNCONDITIONALLY after any
-                                        // attempt — not only on success — so a cleared-but-failed restore
-                                        // falls back to n_past=0 (clean cold prefill) instead of carrying a
-                                        // stale n_keep_mem>0 into keep_first() on an empty token vector
-                                        // (which would GGML_ASSERT/abort). The recompute is harmless on the
-                                        // early-return-before-clear paths (margin/fp/verify rejects): those
-                                        // leave prompt.tokens untouched, so the LCP is identical to before.
+                                        if (n_keep_ram > 0 && !preserve_ram_checkpoint) {
+                                            SLT_INF(slot,
+                                                    "auto-restore: disk candidate skipped (resident RAM prefix %d has no rollback checkpoint)\n",
+                                                    n_keep_ram);
+                                            break;
+                                        }
+
+                                        // auto_restore_into_slot may clear the slot and then have do_slot_restore
+                                        // fail (corrupt/short .bin, capacity failure, racing file removal). Recompute
+                                        // n_past after every attempt. If such a failure destroyed a FULL-memory slot,
+                                        // restore the checkpoint that was kept outside the slot before trying the
+                                        // next candidate or continuing with its suffix.
                                         const int restored = auto_restore_into_slot(slot, cand, input_tokens, n_keep_ram);
                                         n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
                                         if (restored > 0) {
+                                            disk_restored = true;
                                             break; // restored; stop trying shorter candidates
                                         }
+
+                                        if (preserve_ram_checkpoint && n_past < n_keep_ram) {
+                                            llama_memory_seq_rm(llama_get_memory(ctx_tgt), slot.id, -1, -1);
+                                            ram_checkpoint->load_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            ram_checkpoint->load_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                            common_speculative_set_state(spec.get(), slot.id, ram_checkpoint->data_spec);
+                                            slot.prompt.tokens = saved_ram_tokens.clone();
+                                            n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+                                            SLT_WRN(slot,
+                                                    "auto-restore: disk load failed; restored RAM checkpoint (%" PRId64
+                                                    " tokens, reusable prefix %d)\n",
+                                                    ram_checkpoint->n_tokens, n_past);
+                                        }
+                                    }
+
+                                    // A successful disk restore owns a newly-created checkpoint. Otherwise put the
+                                    // original RAM checkpoints back exactly as they were; the selected checkpoint
+                                    // remains available to the normal suffix-reuse path below.
+                                    if (preserve_ram_checkpoint && !disk_restored) {
+                                        slot.prompt.checkpoints.splice(
+                                            slot.prompt.checkpoints.end(), saved_ram_checkpoints);
                                     }
                                 }
                                 // ===== end AUTO-RESTORE =====================================================
