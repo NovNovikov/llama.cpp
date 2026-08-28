@@ -30,6 +30,8 @@ public:
                 ggml_type   type_r,
                 ggml_type   type_s,
                  uint32_t   rs_size,
+                            /* indexer */
+                 uint32_t   idx_row_size,   // floats cached per token; 0 means indexer_head_size
                             /* common */
                  uint32_t   n_seq_max,
                  uint32_t   n_rs_seq,
@@ -151,6 +153,16 @@ public:
                        ggml_tensor * block_mask, ggml_tensor * selected,
                        const ggml_tensor * kq_mask, const llama_ubatch * ubatch,
                        uint32_t ratio, uint32_t block_topk) const;
+
+    // k-pool selection (glm5next DSA) over the same cells. Where set_input_qsa biases attention
+    // scores, this biases the top-k that picks the pools, so a pool is offered to a query only
+    // when it is complete and its last member is already visible:
+    //   pool_cells I32 [ratio*n_pools, ns]      cells making up each pool
+    //   pool_bias  F32 [n_pools, n_tokens/ns, ns] 0 where selectable, -inf otherwise
+    //   tail_cells I32 [ratio-1, n_tokens/ns, 1, ns] optional: the cells of each query's own
+    //     incomplete trailing pool, which has no pool key and so is expanded directly
+    void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_bias, ggml_tensor * tail_cells,
+                         const llama_ubatch * ubatch, uint32_t ratio) const;
 
 private:
     llama_memory_hybrid_idx * mem = nullptr;
