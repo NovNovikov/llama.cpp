@@ -1362,6 +1362,19 @@ void llama_model_loader::done_getting_tensors(bool partial) const {
     }
 }
 
+bool llama_model_loader::is_lazy_tensor(const llama_tensor_weight & w) const {
+    const auto it = lazy_tensor_ranges.find(w.idx);
+    if (it == lazy_tensor_ranges.end()) {
+        return false;
+    }
+
+    const size_t first = w.offs;
+    const size_t last = first + ggml_nbytes(w.tensor);
+    return std::any_of(it->second.begin(), it->second.end(), [first, last](const auto & range) {
+        return range.first <= first && last <= range.second;
+    });
+}
+
 void llama_model_loader::init_mappings(bool prefetch, llama_mlocks * mlock_mmaps) {
     if (use_mmap) {
         mappings.reserve(files.size());
@@ -1592,9 +1605,9 @@ bool llama_model_loader::load_all_data(
             GGML_ASSERT(buf_mmap || cur->data); // either we have a buffer to allocate the tensor in, or it is already allocated
             if (buf_mmap && cur->data == nullptr) {
                 ggml_backend_tensor_alloc(buf_mmap, cur, data);
-                if (lmlocks) {
+                if (lmlocks && !is_lazy_tensor(*weight)) {
                     const auto & lmlock = lmlocks->at(weight->idx);
-                    lmlock->grow_to(weight->offs + n_size);
+                    lmlock->lock_range(weight->offs, n_size);
                 }
 
                 auto & mmap_used = mmaps_used[weight->idx];
