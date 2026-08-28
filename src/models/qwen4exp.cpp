@@ -628,8 +628,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
         ggml_tensor * scores = ggml_mul_mat(ctx0, block_keys, query);
         ggml_mul_mat_set_prec(scores, GGML_PREC_F32);
         scores = ggml_relu(ctx0, scores);
-        scores = ggml_sum_rows(ctx0, ggml_cont(ctx0, ggml_permute(ctx0, scores, 1, 0, 2, 3)));
-        scores = ggml_scale(ctx0, ggml_reshape_2d(ctx0, scores, n_blocks, n_tps),
+
+        // The heads are adjacent on ne[1] and there are few of them, so summing slices beats a
+        // transpose that would carry the whole block-by-token surface twice over.
+        ggml_tensor * summed = nullptr;
+        for (int64_t h = 0; h < n_idx_h; ++h) {
+            ggml_tensor * slice = ggml_view_3d(ctx0, scores, n_blocks, n_tps, 1,
+                    scores->nb[2], scores->nb[3], h*scores->nb[1]);
+            summed = summed ? ggml_add(ctx0, summed, slice) : ggml_cont(ctx0, slice);
+        }
+        scores = ggml_scale(ctx0, ggml_reshape_2d(ctx0, summed, n_blocks, n_tps),
                 1.0f/sqrtf((float) idx_dim));
 
         ggml_tensor * block_mask = ggml_view_2d(ctx0, inp->block_mask, n_blocks, n_tps,
