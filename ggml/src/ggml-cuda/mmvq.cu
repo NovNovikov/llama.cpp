@@ -830,20 +830,22 @@ static __global__ void mul_mat_vec_q_moe(
         const int kqs = vdr * (threadIdx.x % (qi/vdr));
 
 #pragma unroll
-    for (int i = 0; i < c_rows_per_block; ++i) {
-        if constexpr (check_row_bounds) {
-            if (uint32_t(row0 + i) < nrows_x) {
+        for (int i = 0; i < c_rows_per_block; ++i) {
+            if constexpr (check_row_bounds) {
+                if (uint32_t(row0 + i) < nrows_x) {
+                    tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+                    if constexpr (has_fusion) {
+                        tmp_gate[i] += vec_dot_q_cuda(gate, &y[kby], gate_kbx_offset + i*stride_row_x + kbx, kqs);
+                    }
+                }
+            } else {
                 tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
                 if constexpr (has_fusion) {
                     tmp_gate[i] += vec_dot_q_cuda(gate, &y[kby], gate_kbx_offset + i*stride_row_x + kbx, kqs);
                 }
             }
-        } else {
-            tmp[i] += vec_dot_q_cuda(vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
-            if constexpr (has_fusion) {
-                tmp_gate[i] += vec_dot_q_cuda(gate, &y[kby], gate_kbx_offset + i*stride_row_x + kbx, kqs);
-            }
         }
+
     }
 
     ggml_cuda_pdl_lc();
