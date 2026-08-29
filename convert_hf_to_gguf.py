@@ -156,6 +156,20 @@ def parse_args() -> argparse.Namespace:
         "--fp8-as-q8", action="store_true",
         help="Store tensors dequantized from FP8 as Q8_0 instead of BF16/F16.",
     )
+    parser.add_argument(
+        "--direct-quant-recipe", type=Path,
+        help=(
+            "opt-in direct FP8 conversion recipe in llama-quantize --tensor-type-file format; "
+            "patterns match final GGUF tensor names"
+        ),
+    )
+    parser.add_argument(
+        "--direct-quant-lib", type=Path,
+        help=(
+            "directory containing llama.dll and ggml-base.dll built from this source tree; "
+            "required with --direct-quant-recipe"
+        ),
+    )
 
     parser.add_argument(
         "--target-model-dir", type=str, default=None,
@@ -169,6 +183,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if not args.print_supported_models and args.model is None:
         parser.error("the following arguments are required: model")
+    if (args.direct_quant_recipe is None) != (args.direct_quant_lib is None):
+        parser.error("--direct-quant-recipe and --direct-quant-lib must be used together")
     return args
 
 
@@ -290,6 +306,8 @@ def main() -> None:
                                      target_model_dir=Path(args.target_model_dir) if args.target_model_dir else None,
                                      fuse_gate_up_exps=args.fuse_gate_up_exps,
                                      fp8_as_q8=args.fp8_as_q8,
+                                     direct_quant_recipe=args.direct_quant_recipe,
+                                     direct_quant_lib=args.direct_quant_lib,
                                      )
 
         if args.vocab_only:

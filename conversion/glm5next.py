@@ -1,14 +1,21 @@
 from __future__ import annotations
 
 import re
-from typing import Iterable
+from typing import Any, Iterable
 
 import torch
 from torch import Tensor
 
 import gguf
 
-from .base import ModelBase
+from .base import LazyTorchTensor, ModelBase, logger
+from .direct_quant import DirectQuantError, DirectStorageTensor, FP8ExpertTensor, FP8ScaledTensor, GGMLChunkQuantizer
+from .direct_recipe import (
+    DirectModelDescriptor,
+    DirectQuantRecipe,
+    DirectTensorDescriptor,
+    NativeDirectRecipePlanner,
+)
 from .glm import GlmMoeDsaModel
 
 
@@ -104,3 +111,210 @@ class Glm5NextModel(GlmMoeDsaModel):
                 return [(self.format_tensor_name(tensor, bid) + ext, data_torch)]
 
         return super().modify_tensors(data_torch, name, bid)
+
+    @staticmethod
+    def _direct_normalize_name(name: str) -> str:
+        return re.sub(r"^model\.language_model\.", "model.", name)
+
+    def _direct_output_name(self, name: str) -> str:
+        """Map an unmodified GLM-5.3 source tensor to its final GGUF name."""
+        name = self._direct_normalize_name(name)
+        if name.endswith(".dt_bias"):
+            name = name.removesuffix(".dt_bias") + ".dt_proj.bias"
+
+        bid_match = re.search(r"\.layers\.(\d+)\.", name)
+        bid = int(bid_match.group(1)) if bid_match else None
+        for suffix, (tensor, ext) in self._direct_map.items():
+            if name.endswith(suffix) and bid is not None:
+                return self.format_tensor_name(tensor, bid) + ext
+
+        if name == "model.embed_tokens.weight":
+            name = "token_embd.weight"
+        return self.map_tensor_name(name)
+
+    def _direct_model_descriptor(self) -> DirectModelDescriptor:
+        hparams = self.hparams
+        head_dim = int(hparams.get("head_dim", hparams["hidden_size"] // hparams["num_attention_heads"]))
+        return DirectModelDescriptor(
+            architecture=gguf.MODEL_ARCH_NAMES[self.model_arch],
+            n_embd=int(hparams["hidden_size"]),
+            n_ff=int(hparams.get("moe_intermediate_size", hparams.get("intermediate_size", 1))),
+            n_layer=self.block_count,
+            n_head=int(hparams["num_attention_heads"]),
+            n_head_kv=int(hparams.get("num_key_value_heads", hparams["num_attention_heads"])),
+            n_expert=int(hparams.get("n_routed_experts", 0)),
+            n_embd_head_k=int(hparams.get("qk_nope_head_dim", 0)) + int(hparams.get("qk_rope_head_dim", head_dim)),
+            n_embd_head_v=int(hparams.get("v_head_dim", head_dim)),
+        )
+
+    def _direct_prepare_tensors(self) -> None:
+        if self.direct_quant_recipe is None or self.direct_quant_lib is None:
+            raise AssertionError("direct quantization requires both recipe and native library directory")
+        if self.fuse_gate_up_exps:
+            raise ValueError("direct quantization does not support --fuse-gate-up-exps yet")
+
+        library_dir = self.direct_quant_lib.resolve()
+        planner_path = library_dir / "llama.dll"
+        quantizer_path = library_dir / "ggml-base.dll"
+        recipe = DirectQuantRecipe.from_file(self.direct_quant_recipe)
+        planner = NativeDirectRecipePlanner(planner_path)
+        quantizer = GGMLChunkQuantizer(quantizer_path)
+
+        by_normalized: dict[str, tuple[str, Any]] = {}
+        for source_name, local_tensor in self.direct_local_tensors.items():
+            normalized = self._direct_normalize_name(source_name)
+            if normalized in by_normalized:
+                raise ValueError(
+                    f"direct quantization found duplicate normalized tensor name {normalized!r}")
+            by_normalized[normalized] = (source_name, local_tensor)
+
+        fp8_types = FP8ScaledTensor._FP8_TORCH_DTYPES
+        scale_for_weight: dict[str, str] = {}
+        for normalized, (_, local_tensor) in by_normalized.items():
+            if local_tensor.dtype not in fp8_types:
+                continue
+            candidates = (
+                normalized.removesuffix(".weight") + ".scale",
+                normalized + "_scale_inv",
+                normalized + "_scale",
+            )
+            scale_name = next((candidate for candidate in candidates if candidate in by_normalized), None)
+            if scale_name is None:
+                raise DirectQuantError(f"direct FP8 tensor {normalized!r} has no associated scale tensor")
+            scale_for_weight[normalized] = scale_name
+
+        def fp8_source(normalized: str) -> FP8ScaledTensor:
+            _, weight = by_normalized[normalized]
+            scale_name = scale_for_weight[normalized]
+            _, scale = by_normalized[scale_name]
+            return FP8ScaledTensor(weight, scale)
+
+        expert_pattern = re.compile(
+            r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+        experts: dict[tuple[int, str], dict[int, str]] = {}
+        for normalized in by_normalized:
+            match = expert_pattern.match(normalized)
+            if match is None:
+                continue
+            bid, eid, projection = int(match.group(1)), int(match.group(2)), match.group(3)
+            experts.setdefault((bid, projection), {})[eid] = normalized
+
+        records: list[dict[str, Any]] = []
+        consumed: set[str] = set(scale_for_weight.values())
+        for (bid, projection), entries in sorted(experts.items()):
+            n_experts = int(self.hparams["n_routed_experts"])
+            expected = set(range(n_experts))
+            if set(entries) != expected:
+                raise DirectQuantError(
+                    f"direct FP8 experts for layer {bid} {projection} are incomplete; "
+                    f"expected {n_experts}, found {sorted(entries)}")
+            ordered_names = [entries[eid] for eid in range(n_experts)]
+            if any(by_normalized[name][1].dtype not in fp8_types for name in ordered_names):
+                raise DirectQuantError(
+                    f"direct expert layer {bid} {projection} mixes non-FP8 source weights")
+            merged_name = f"model.layers.{bid}.mlp.experts.{projection}.weight"
+            records.append({
+                "name": self._direct_output_name(merged_name),
+                "source_dtype": "FP8",
+                "source_type": gguf.GGMLQuantizationType.Q8_0,
+                "shape": (n_experts, *fp8_source(ordered_names[0]).shape),
+                "kind": "experts",
+                "data": FP8ExpertTensor([fp8_source(name) for name in ordered_names]),
+            })
+            consumed.update(ordered_names)
+
+        for normalized, (source_name, local_tensor) in by_normalized.items():
+            if normalized in consumed:
+                continue
+            if expert_pattern.match(normalized) is not None:
+                continue
+
+            output_name = self._direct_output_name(normalized)
+            if local_tensor.dtype in fp8_types:
+                source = fp8_source(normalized)
+                records.append({
+                    "name": output_name,
+                    "source_dtype": local_tensor.dtype,
+                    "source_type": gguf.GGMLQuantizationType.Q8_0,
+                    "shape": source.shape,
+                    "kind": "fp8",
+                    "data": source,
+                })
+                consumed.add(normalized)
+                continue
+
+            if normalized.endswith(".A_log"):
+                data = LazyTorchTensor.to_eager(self.model_tensors[source_name]())
+                records.append({
+                    "name": output_name,
+                    "source_dtype": local_tensor.dtype,
+                    "source_type": gguf.GGMLQuantizationType.F32,
+                    "shape": tuple(data.shape),
+                    "kind": "transformed",
+                    "data": -torch.exp(data.float()).numpy(),
+                })
+                consumed.add(normalized)
+                continue
+
+            storage = DirectStorageTensor(local_tensor)
+            records.append({
+                "name": output_name,
+                "source_dtype": local_tensor.dtype,
+                "source_type": storage.ggml_type,
+                "shape": storage.shape,
+                "kind": "storage",
+                "data": storage,
+            })
+            consumed.add(normalized)
+
+        output_names = [record["name"] for record in records]
+        duplicates = sorted({name for name in output_names if output_names.count(name) > 1})
+        if duplicates:
+            raise DirectQuantError(f"direct quantization maps multiple sources to {duplicates}")
+
+        descriptors = tuple(
+            DirectTensorDescriptor(
+                record["name"],
+                record["source_dtype"],
+                record["source_type"],
+                record["shape"],
+            )
+            for record in records
+        )
+        plans = planner.plan(self._direct_model_descriptor(), recipe, descriptors)
+
+        for record, plan in zip(records, plans, strict=True):
+            if record["kind"] == "storage":
+                if plan.target_type != record["source_type"]:
+                    raise DirectQuantError(
+                        f"recipe changes non-FP8 tensor {plan.name} from {record['source_type'].name} "
+                        f"to {plan.target_type.name}; direct re-quantization of F16/BF16/F32 is not implemented")
+                self.gguf_writer.add_tensor(plan.name, record["data"].lazy_storage(), raw_dtype=plan.target_type)
+            elif record["kind"] == "transformed":
+                if plan.target_type != gguf.GGMLQuantizationType.F32:
+                    raise DirectQuantError(
+                        f"recipe changes transformed tensor {plan.name}; direct transformed-tensor quantization is not implemented")
+                self.gguf_writer.add_tensor(plan.name, record["data"], raw_dtype=plan.target_type)
+            else:
+                if not plan.target_type.name.startswith(("Q", "TQ")):
+                    raise DirectQuantError(
+                        f"direct FP8 tensor {plan.name} requires a native quantized target, got {plan.target_type.name}")
+                encoded = record["data"].lazy_quantized(quantizer, plan.target_type)
+                self.gguf_writer.add_tensor(
+                    plan.name,
+                    encoded,
+                    raw_shape=record["shape"],
+                    raw_dtype=plan.target_type,
+                )
+            logger.info(
+                "%-48s %s --> %s, shape = {%s}",
+                plan.name,
+                plan.source_dtype,
+                plan.target_type.name,
+                ", ".join(str(size) for size in reversed(plan.shape)),
+            )
+
+    def prepare_tensors(self):
+        if self.direct_quant_recipe is None:
+            return super().prepare_tensors()
+        self._direct_prepare_tensors()

@@ -101,6 +101,9 @@ class ModelBase:
     dir_model_card: Path
     remote_hf_model_id: str | None
     target_model_dir: Path | None
+    direct_quant_recipe: Path | None
+    direct_quant_lib: Path | None
+    direct_local_tensors: dict[str, gguf.utility.LocalTensor]
 
     # subclasses should define this!
     model_arch: gguf.MODEL_ARCH
@@ -130,7 +133,9 @@ class ModelBase:
                  sentence_transformers_dense_modules: bool = False,
                  target_model_dir: Path | None = None,
                  fuse_gate_up_exps: bool = False,
-                 fp8_as_q8: bool = False):
+                 fp8_as_q8: bool = False,
+                 direct_quant_recipe: Path | None = None,
+                 direct_quant_lib: Path | None = None):
         if type(self) is ModelBase or \
                 type(self) is TextModel or \
                 type(self) is MmprojModel:
@@ -153,6 +158,9 @@ class ModelBase:
         self.fuse_gate_up_exps = fuse_gate_up_exps
         self._gate_exp_buffer: dict[int, Tensor] = {}
         self._up_exp_buffer: dict[int, Tensor] = {}
+        self.direct_quant_recipe = direct_quant_recipe
+        self.direct_quant_lib = direct_quant_lib
+        self.direct_local_tensors = {}
         self.hparams = ModelBase.load_hparams(self.dir_model, self.is_mistral_format) if hparams is None else hparams
         self.model_tensors = self.index_tensors(remote_hf_model_id=remote_hf_model_id)
         self.metadata_override = metadata_override
@@ -206,6 +214,9 @@ class ModelBase:
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
         tensors: dict[str, Callable[[], Tensor]] = {}
 
+        if self.direct_quant_recipe is not None and remote_hf_model_id is not None:
+            raise ValueError("direct quantization requires local safetensors files, not --remote")
+
         if remote_hf_model_id is not None:
             is_safetensors = True
 
@@ -223,6 +234,8 @@ class ModelBase:
         part_names: list[str] = ModelBase.get_model_part_names(self.dir_model, prefix, ".safetensors")
         is_safetensors: bool = len(part_names) > 0
         if not is_safetensors:
+            if self.direct_quant_recipe is not None:
+                raise ValueError("direct quantization requires local safetensors files")
             part_names = ModelBase.get_model_part_names(self.dir_model, "pytorch_model", ".bin")
 
         tensor_names_from_index: set[str] = set()
@@ -286,6 +299,9 @@ class ModelBase:
                                 f"duplicate tensor '{tname}' found in multiple model parts; "
                                 f"refusing to silently overwrite")
                         tensors[tname] = tgen
+                        if self.direct_quant_recipe is not None:
+                            assert is_safetensors
+                            self.direct_local_tensors[tname] = data
 
         # verify tensor name presence and identify potentially missing files
         if len(tensor_names_from_index) > 0:

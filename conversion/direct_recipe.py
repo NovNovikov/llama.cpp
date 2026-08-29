@@ -136,9 +136,17 @@ class NativeDirectRecipePlanner:
         if not library_path.is_file():
             raise DirectRecipeError(f"native direct recipe planner does not exist: {library_path}")
 
-        self._dll_directory = None
+        self._dll_directories = []
         if os.name == "nt":
-            self._dll_directory = os.add_dll_directory(str(library_path.parent))
+            self._dll_directories.append(os.add_dll_directory(str(library_path.parent)))
+            cuda_paths = [os.environ.get("CUDA_PATH")]
+            cuda_paths.extend(value for key, value in os.environ.items() if key.startswith("CUDA_PATH_V"))
+            for cuda_path in cuda_paths:
+                if cuda_path is None:
+                    continue
+                cuda_bin = Path(cuda_path) / "bin"
+                if cuda_bin.is_dir():
+                    self._dll_directories.append(os.add_dll_directory(str(cuda_bin)))
 
         try:
             self._library = ctypes.CDLL(str(library_path))
