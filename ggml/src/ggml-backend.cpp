@@ -26,6 +26,7 @@ void ggml_moe_cache_unregister(const void * owner) {
 #include <assert.h>
 #include <limits.h>
 #include <stdarg.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -894,6 +895,14 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // Assignment fingerprint for MUL_MAT_ID operations. This is intentionally
+    // checked only while splitting a new graph, never in the compute hot path.
+    bool     mmid_assignment_seen;
+    uint64_t mmid_layout_hash;
+    uint64_t mmid_assignment_hash;
+    uint32_t mmid_count;
+    uint32_t mmid_cpu_count;
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1116,6 +1125,54 @@ static void ggml_backend_sched_set_if_supported(ggml_backend_sched_t sched, stru
         *node_backend_id = cur_backend_id;
         SET_CAUSE(node, "2.sup");
     }
+}
+
+static void ggml_backend_sched_check_mmid_assignment(ggml_backend_sched_t sched, struct ggml_cgraph * graph) {
+    uint64_t layout_hash = 1469598103934665603ull;
+    uint64_t assignment_hash = layout_hash;
+    uint32_t mmid_count = 0;
+    uint32_t mmid_cpu_count = 0;
+
+    for (int i = 0; i < graph->n_nodes; ++i) {
+        struct ggml_tensor * node = graph->nodes[i];
+        if (node->op != GGML_OP_MUL_MAT_ID) {
+            continue;
+        }
+
+        const int backend_id = tensor_backend_id(node);
+        const enum ggml_backend_dev_type backend_type = ggml_backend_dev_type(
+                ggml_backend_get_device(sched->backends[backend_id]));
+
+        // The expert-weight pointer is stable across prompt/decode graph instances.
+        // It distinguishes otherwise identical MUL_MAT_ID nodes without hashing names.
+        layout_hash ^= (uint64_t) (uintptr_t) node->src[0];
+        layout_hash *= 1099511628211ull;
+        assignment_hash ^= (uint64_t) backend_id;
+        assignment_hash *= 1099511628211ull;
+
+        ++mmid_count;
+        mmid_cpu_count += backend_type == GGML_BACKEND_DEVICE_TYPE_CPU;
+    }
+
+    if (mmid_count == 0) {
+        return;
+    }
+
+    const bool same_layout = sched->mmid_assignment_seen && sched->mmid_layout_hash == layout_hash && sched->mmid_count == mmid_count;
+    const bool assignment_changed = same_layout && sched->mmid_assignment_hash != assignment_hash;
+    const bool cpu_assignment_appeared = mmid_cpu_count > 0 && (!same_layout || sched->mmid_cpu_count == 0);
+
+    if (assignment_changed || cpu_assignment_appeared) {
+        GGML_LOG_WARN("%s: MUL_MAT_ID backend assignment%s: nodes=%u, cpu=%u (previous cpu=%u)\n",
+                __func__, assignment_changed ? " changed" : " includes CPU",
+                mmid_count, mmid_cpu_count, same_layout ? sched->mmid_cpu_count : 0);
+    }
+
+    sched->mmid_assignment_seen = true;
+    sched->mmid_layout_hash = layout_hash;
+    sched->mmid_assignment_hash = assignment_hash;
+    sched->mmid_count = mmid_count;
+    sched->mmid_cpu_count = mmid_cpu_count;
 }
 
 // assigns backends to ops and splits the graph into subgraphs that can be computed on the same backend
@@ -1490,6 +1547,8 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
         split->i_end = graph->n_nodes;
         sched->n_splits = i_split + 1;
     }
+
+    ggml_backend_sched_check_mmid_assignment(sched, graph);
 
     if (sched->debug) {
         ggml_backend_sched_print_assignments(sched, graph);
