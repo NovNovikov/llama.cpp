@@ -121,6 +121,7 @@ class ModelBase:
     # Architectures that implement the filtering/export behavior opt in by
     # setting supports_mtp_export = True on their model class or a mixin.
     supports_mtp_export: bool = False
+    supports_direct_quant: bool = False
     mtp_only: bool = False
     no_mtp: bool = False
 
@@ -143,6 +144,9 @@ class ModelBase:
 
         if self.is_mistral_format and not _mistral_common_installed:
             raise ImportError(_mistral_import_error_msg)
+        if direct_quant_recipe is not None and not self.supports_direct_quant:
+            raise ValueError(
+                f"direct quantization is not supported for {type(self).__name__}")
 
         self.dir_model = dir_model
         self.ftype = ftype

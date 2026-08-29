@@ -33,6 +33,7 @@ class Glm5NextModel(GlmMoeDsaModel):
     """
 
     model_arch = gguf.MODEL_ARCH.GLM5NEXT
+    supports_direct_quant = True
 
     # Tensors that carry no per-layer index and are named differently from the
     # generic mapping, resolved by suffix (same approach as DeepseekV4Model).
