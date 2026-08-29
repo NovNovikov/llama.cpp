@@ -1,0 +1,3 @@
+blk\..*\.ffn_gate_exps\.weight=q2_K
+blk\..*\.ffn_up_exps\.weight=q2_K
+blk\..*\.ffn_down_exps\.weight=q3_K
