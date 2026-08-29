@@ -15,6 +15,7 @@ from .direct_recipe import (
     DirectQuantRecipe,
     DirectTensorDescriptor,
     NativeDirectRecipePlanner,
+    format_direct_plan,
 )
 from .glm import GlmMoeDsaModel
 
@@ -282,6 +283,8 @@ class Glm5NextModel(GlmMoeDsaModel):
             for record in records
         )
         plans = planner.plan(self._direct_model_descriptor(), recipe, descriptors)
+        if self.dry_run:
+            logger.info("Direct quantization plan:\n%s", format_direct_plan(plans))
 
         for record, plan in zip(records, plans, strict=True):
             if record["kind"] == "storage":
