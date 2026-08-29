@@ -45,6 +45,32 @@ class TestFP8ScaledTensor(unittest.TestCase):
             self.assertEqual(lazy.shape, bits.shape)
             self.assertTrue(np.array_equal(restored, bits.reshape(-1)))
 
+    def test_writer_accepts_direct_encoded_shape(self):
+        direct_quant = load_direct_quant_module()
+        with tempfile.TemporaryDirectory() as directory:
+            output = Path(directory) / "direct.gguf"
+            encoded = direct_quant.gguf.LazyChunkedTensor(
+                [lambda: np.zeros((2, 84), dtype=np.uint8)], (2, 84), np.uint8)
+            writer = direct_quant.gguf.GGUFWriter(output, "test")
+            writer.add_tensor(
+                "blk.0.ffn_gate_exps.weight",
+                encoded,
+                raw_shape=(2, 256),
+                raw_dtype=direct_quant.gguf.GGMLQuantizationType.Q2_K,
+            )
+            writer.write_header_to_file()
+            writer.write_kv_data_to_file()
+            writer.write_tensors_to_file()
+            writer.close()
+
+            reader = direct_quant.gguf.GGUFReader(output)
+            tensor = reader.tensors[0]
+            self.assertEqual(tensor.tensor_type, direct_quant.gguf.GGMLQuantizationType.Q2_K)
+            self.assertEqual(tuple(tensor.shape), (256, 2))
+            del tensor
+            reader.data._mmap.close()
+            del reader
+
     def test_expands_glm_e8m0_grid(self):
         direct_quant = load_direct_quant_module()
         weights = np.full((4, 256), 56, dtype=np.uint8)  # E4M3FN value 1.0
