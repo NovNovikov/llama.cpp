@@ -24,6 +24,59 @@ class DirectQuantError(RuntimeError):
     """The direct quantization path cannot safely encode the requested tensor."""
 
 
+class DirectStorageTensor:
+    """Byte-preserving lazy storage for an unmodified local safetensors tensor."""
+
+    _DTYPES = {
+        "F16": np.dtype("<f2"),
+        "BF16": np.dtype("<u2"),
+        "F32": np.dtype("<f4"),
+    }
+    _GGML_TYPES = {
+        "F16": gguf.GGMLQuantizationType.F16,
+        "BF16": gguf.GGMLQuantizationType.BF16,
+        "F32": gguf.GGMLQuantizationType.F32,
+    }
+
+    def __init__(self, tensor: LocalTensor) -> None:
+        try:
+            self.dtype = self._DTYPES[tensor.dtype]
+            self.ggml_type = self._GGML_TYPES[tensor.dtype]
+        except KeyError as exc:
+            raise DirectQuantError(
+                f"direct byte-preserving tensor has unsupported safetensors dtype {tensor.dtype}") from exc
+        expected_size = int(np.prod(tensor.shape, dtype=np.int64)) * self.dtype.itemsize
+        if tensor.data_range.size != expected_size:
+            raise DirectQuantError(
+                f"direct tensor byte range has {tensor.data_range.size} bytes, expected {expected_size}")
+        self.tensor = tensor
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return self.tensor.shape
+
+    def lazy_storage(self, *, elements_per_chunk: int = 1 << 20) -> gguf.LazyChunkedTensor:
+        if elements_per_chunk <= 0:
+            raise DirectQuantError(
+                f"direct tensor elements_per_chunk must be positive, got {elements_per_chunk}")
+        n_elements = int(np.prod(self.shape, dtype=np.int64))
+        chunks: list[Callable[[], np.ndarray]] = []
+        for element_start in range(0, n_elements, elements_per_chunk):
+            n_elements_chunk = min(elements_per_chunk, n_elements - element_start)
+
+            def load_chunk(start: int = element_start, count: int = n_elements_chunk) -> np.ndarray:
+                return np.memmap(
+                    self.tensor.data_range.filename,
+                    mode="r",
+                    offset=self.tensor.data_range.offset + start * self.dtype.itemsize,
+                    dtype=self.dtype,
+                    shape=(count,),
+                )
+
+            chunks.append(load_chunk)
+        return gguf.LazyChunkedTensor(chunks, self.shape, self.dtype)
+
+
 class GGMLChunkQuantizer:
     """Thin checked binding to ggml_quantize_chunk()."""
 
@@ -288,5 +341,64 @@ class FP8ScaledTensor:
                 return quantizer.quantize_rows(self._load_float_rows(start, end), qtype)
 
             chunks.append(load_chunk)
+
+        return gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8)
+
+
+class FP8ExpertTensor:
+    """Stream a GGUF expert tensor from individual FP8 safetensors experts.
+
+    Standard conversion assembles an entire ``[n_expert, rows, cols]`` tensor
+    with ``torch.stack``.  This class preserves that exact outer ordering but
+    gives the writer one native-quantized row chunk at a time.
+    """
+
+    def __init__(self, experts: list[FP8ScaledTensor]) -> None:
+        if not experts:
+            raise DirectQuantError("direct FP8 expert tensor has no experts")
+        shape = experts[0].shape
+        if any(expert.shape != shape for expert in experts[1:]):
+            shapes = sorted({expert.shape for expert in experts})
+            raise DirectQuantError(f"direct FP8 experts have inconsistent shapes: {shapes}")
+        self.experts = experts
+        self.expert_shape = shape
+
+    @property
+    def shape(self) -> tuple[int, int, int]:
+        return (len(self.experts), *self.expert_shape)
+
+    def lazy_quantized(
+        self,
+        quantizer: GGMLChunkQuantizer,
+        qtype: gguf.GGMLQuantizationType,
+        *,
+        rows_per_chunk: int = 128,
+    ) -> gguf.LazyChunkedTensor:
+        try:
+            byte_shape = gguf.quant_shape_to_byte_shape(self.shape, qtype)
+        except ValueError as exc:
+            raise DirectQuantError(
+                f"cannot directly quantize FP8 expert tensor shape {self.shape} as {qtype.name}: {exc}") from exc
+
+        block_rows = self.experts[0].block_shape[0]
+        if rows_per_chunk <= 0:
+            raise DirectQuantError(f"direct FP8 rows_per_chunk must be positive, got {rows_per_chunk}")
+        rows_per_chunk = max(block_rows, rows_per_chunk - rows_per_chunk % block_rows)
+        rows, _ = self.expert_shape
+        chunks: list[Callable[[], np.ndarray]] = []
+
+        # The order is exactly torch.stack([expert_0, expert_1, ...], dim=0).
+        for expert in self.experts:
+            for row_start in range(0, rows, rows_per_chunk):
+                row_end = min(rows, row_start + rows_per_chunk)
+
+                def load_chunk(
+                    source: FP8ScaledTensor = expert,
+                    start: int = row_start,
+                    end: int = row_end,
+                ) -> np.ndarray:
+                    return quantizer.quantize_rows(source._load_float_rows(start, end), qtype)
+
+                chunks.append(load_chunk)
 
         return gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8)

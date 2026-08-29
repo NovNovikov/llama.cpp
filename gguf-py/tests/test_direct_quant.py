@@ -30,6 +30,21 @@ def local_tensor(path: Path, dtype: str, shape: tuple[int, ...], offset: int, si
 
 
 class TestFP8ScaledTensor(unittest.TestCase):
+    def test_storage_tensor_preserves_bf16_bytes(self):
+        direct_quant = load_direct_quant_module()
+        bits = np.array([[0x3F80, 0x4000], [0x4040, 0x4080]], dtype=np.uint16)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.bin"
+            source_path.write_bytes(bits.tobytes())
+            storage = direct_quant.DirectStorageTensor(
+                local_tensor(source_path, "BF16", bits.shape, 0, bits.nbytes))
+            lazy = storage.lazy_storage(elements_per_chunk=3)
+            restored = np.concatenate([chunk() for chunk in lazy._chunks])
+
+            self.assertEqual(storage.ggml_type, direct_quant.gguf.GGMLQuantizationType.BF16)
+            self.assertEqual(lazy.shape, bits.shape)
+            self.assertTrue(np.array_equal(restored, bits.reshape(-1)))
+
     def test_expands_glm_e8m0_grid(self):
         direct_quant = load_direct_quant_module()
         weights = np.full((4, 256), 56, dtype=np.uint8)  # E4M3FN value 1.0
@@ -58,3 +73,36 @@ class TestFP8ScaledTensor(unittest.TestCase):
                     local_tensor(source_path, "F8_E4M3FN", (4, 256), 0, 4 * 256),
                     local_tensor(source_path, "F8_E8M0", (1, 1), 4 * 256, 1),
                 )
+
+    def test_expert_tensor_keeps_stack_order(self):
+        direct_quant = load_direct_quant_module()
+        weights = np.full((4, 256), 56, dtype=np.uint8)  # E4M3FN value 1.0
+        scales = np.array([[127, 128]], dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.bin"
+            source_path.write_bytes(weights.tobytes() + scales.tobytes())
+            weight = local_tensor(source_path, "F8_E4M3FN", weights.shape, 0, weights.nbytes)
+            scale = local_tensor(source_path, "F8_E8M0", scales.shape, weights.nbytes, scales.nbytes)
+            first = direct_quant.FP8ScaledTensor(weight, scale)
+            second = direct_quant.FP8ScaledTensor(weight, scale)
+            experts = direct_quant.FP8ExpertTensor([first, second])
+
+            class RecordingQuantizer:
+                def __init__(self):
+                    self.rows = []
+
+                def quantize_rows(self, rows, qtype):
+                    del qtype
+                    self.rows.append(rows.copy())
+                    return np.zeros((rows.shape[0], 84), dtype=np.uint8)
+
+            quantizer = RecordingQuantizer()
+            encoded = experts.lazy_quantized(quantizer, direct_quant.gguf.GGMLQuantizationType.Q2_K)
+            for chunk in encoded._chunks:
+                chunk()
+
+            self.assertEqual(experts.shape, (2, 4, 256))
+            self.assertEqual(len(quantizer.rows), 2)
+            for decoded in quantizer.rows:
+                self.assertTrue(np.all(decoded[:, :128] == 1.0))
+                self.assertTrue(np.all(decoded[:, 128:] == 2.0))
