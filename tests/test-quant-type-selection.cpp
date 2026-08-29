@@ -486,9 +486,6 @@ static bool run_direct_recipe_regression() {
         { nullptr,                     GGML_TYPE_COUNT },
     };
 
-    llama_model_quantize_params params = llama_model_quantize_default_params();
-    params.tt_overrides = overrides;
-
     const llama_quant_direct_tensor tensors[] = {
         { "blk.0.ffn_gate_exps.weight", GGML_TYPE_Q8_0, 3, { 4096, 32, 288, 1 } },
         { "blk.0.ffn_up_exps.weight",   GGML_TYPE_Q8_0, 3, { 4096, 32, 288, 1 } },
@@ -499,7 +496,7 @@ static bool run_direct_recipe_regression() {
 
     bool pass = true;
 
-    if (llama_quant_plan_direct(&desc, &params, tensors, result_types, std::size(tensors)) != 0) {
+    if (llama_quant_plan_direct_from_overrides(&desc, overrides, tensors, result_types, std::size(tensors)) != 0) {
         printf("  FAIL  direct quantization planner rejected valid recipe\n");
         return false;
     }
@@ -521,7 +518,7 @@ static bool run_direct_recipe_regression() {
     llama_quant_direct_tensor incompatible = tensors[0];
     incompatible.ne[0] = 4000;
     ggml_type incompatible_result = GGML_TYPE_COUNT;
-    if (llama_quant_plan_direct(&desc, &params, &incompatible, &incompatible_result, 1) == 0) {
+    if (llama_quant_plan_direct_from_overrides(&desc, overrides, &incompatible, &incompatible_result, 1) == 0) {
         printf("  FAIL  direct quantization planner accepted incompatible Q2_K row size\n");
         pass = false;
     }

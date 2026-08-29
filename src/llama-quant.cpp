@@ -1601,3 +1601,15 @@ uint32_t llama_quant_plan_direct(
     llama_model_free(model);
     return 0;
 }
+
+extern "C" uint32_t llama_quant_plan_direct_from_overrides(
+        const llama_quant_model_desc * model_desc,
+        const llama_model_tensor_override * overrides,
+        const llama_quant_direct_tensor * tensors,
+        ggml_type * result_types,
+        size_t n_tensors) {
+    llama_model_quantize_params params = llama_model_quantize_default_params();
+    params.tt_overrides = overrides;
+
+    return llama_quant_plan_direct(model_desc, &params, tensors, result_types, n_tensors);
+}

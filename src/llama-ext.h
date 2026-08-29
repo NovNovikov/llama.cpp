@@ -82,6 +82,16 @@ LLAMA_API uint32_t llama_quant_plan_direct(
         ggml_type * result_types,
         size_t n_tensors);
 
+// C ABI adapter for direct converters.  It applies the same final-GGUF-name
+// tensor overrides used by llama-quantize, without exposing the full parameter
+// struct to a foreign-language caller.  The override array is null-terminated.
+extern "C" LLAMA_API uint32_t llama_quant_plan_direct_from_overrides(
+        const llama_quant_model_desc * model_desc,
+        const llama_model_tensor_override * overrides,
+        const llama_quant_direct_tensor * tensors,
+        ggml_type * result_types,
+        size_t n_tensors);
+
 //
 // device memory querying
 //
