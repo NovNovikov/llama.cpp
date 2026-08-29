@@ -40,6 +40,17 @@ struct llama_quant_model_desc {
     uint32_t n_embd_head_v;
 };
 
+// A tensor description for the direct HF -> GGUF quantization path.  source_type
+// is the type to preserve when no recipe override matches.  FP8 source tensors
+// are represented by their direct GGUF baseline (currently Q8_0), because GGML
+// does not store the HF FP8 code + scale layout.
+struct llama_quant_direct_tensor {
+    const char * name;
+    ggml_type    source_type;
+    uint32_t     n_dims;
+    int64_t      ne[GGML_MAX_DIMS];
+};
+
 // Create a mock model from a metadata descriptor (for testing).
 // The returned model must be freed with llama_model_free().
 LLAMA_API llama_model * llama_quant_model_from_metadata(const llama_quant_model_desc * desc);
@@ -56,6 +67,18 @@ LLAMA_API void llama_quant_compute_types(
         quantize_state_impl * qs,
         llama_ftype ftype,
         ggml_tensor ** tensors,
+        ggml_type * result_types,
+        size_t n_tensors);
+
+// Resolve an opt-in direct-conversion recipe without loading model weights.
+// The existing --tensor-type overrides in params are matched against final GGUF
+// tensor names.  Unmatched tensors retain source_type.  Matching an incompatible
+// quantized type is an error; this path deliberately has no silent fallback.
+// Returns 0 on success and 1 on malformed metadata or an invalid recipe.
+LLAMA_API uint32_t llama_quant_plan_direct(
+        const llama_quant_model_desc * model_desc,
+        const llama_model_quantize_params * params,
+        const llama_quant_direct_tensor * tensors,
         ggml_type * result_types,
         size_t n_tensors);
 

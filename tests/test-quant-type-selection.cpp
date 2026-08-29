@@ -7,6 +7,7 @@
 #include <cstdio>
 #include <cstring>
 #include <fstream>
+#include <iterator>
 #include <map>
 #include <sstream>
 #include <string>
@@ -468,12 +469,75 @@ static bool run_integer_tensor_regression() {
     return pass;
 }
 
+static bool run_direct_recipe_regression() {
+    llama_quant_model_desc desc = {};
+    desc.architecture           = "glm5next";
+    desc.n_embd                 = 4096;
+    desc.n_ff                   = 16384;
+    desc.n_layer                = 2;
+    desc.n_head                 = 32;
+    desc.n_head_kv              = 4;
+    desc.n_expert               = 288;
+
+    const llama_model_tensor_override overrides[] = {
+        { "ffn_gate_exps\\.weight", GGML_TYPE_Q2_K },
+        { "ffn_up_exps\\.weight",   GGML_TYPE_Q2_K },
+        { "ffn_down_exps\\.weight", GGML_TYPE_Q3_K },
+        { nullptr,                     GGML_TYPE_COUNT },
+    };
+
+    llama_model_quantize_params params = llama_model_quantize_default_params();
+    params.tt_overrides = overrides;
+
+    const llama_quant_direct_tensor tensors[] = {
+        { "blk.0.ffn_gate_exps.weight", GGML_TYPE_Q8_0, 3, { 4096, 32, 288, 1 } },
+        { "blk.0.ffn_up_exps.weight",   GGML_TYPE_Q8_0, 3, { 4096, 32, 288, 1 } },
+        { "blk.0.ffn_down_exps.weight", GGML_TYPE_Q8_0, 3, { 4096, 32, 288, 1 } },
+        { "blk.0.attn_q.weight",        GGML_TYPE_BF16, 2, { 4096, 4096, 1, 1 } },
+    };
+    ggml_type result_types[std::size(tensors)] = {};
+
+    bool pass = true;
+
+    if (llama_quant_plan_direct(&desc, &params, tensors, result_types, std::size(tensors)) != 0) {
+        printf("  FAIL  direct quantization planner rejected valid recipe\n");
+        return false;
+    }
+
+    const ggml_type expected[] = {
+        GGML_TYPE_Q2_K,
+        GGML_TYPE_Q2_K,
+        GGML_TYPE_Q3_K,
+        GGML_TYPE_BF16,
+    };
+    for (size_t i = 0; i < std::size(tensors); ++i) {
+        if (result_types[i] != expected[i]) {
+            printf("  FAIL  direct recipe type for %s: expected %s, got %s\n",
+                   tensors[i].name, ggml_type_name(expected[i]), ggml_type_name(result_types[i]));
+            pass = false;
+        }
+    }
+
+    llama_quant_direct_tensor incompatible = tensors[0];
+    incompatible.ne[0] = 4000;
+    ggml_type incompatible_result = GGML_TYPE_COUNT;
+    if (llama_quant_plan_direct(&desc, &params, &incompatible, &incompatible_result, 1) == 0) {
+        printf("  FAIL  direct quantization planner accepted incompatible Q2_K row size\n");
+        pass = false;
+    }
+
+    return pass;
+}
+
 static int run_remote_tests(const std::string & snapshot_dir, const char * argv0) {
     int total_pass = 0;
     int total_fail = 0;
     int total_skip = 0;
 
     if (!run_integer_tensor_regression()) {
+        return 1;
+    }
+    if (!run_direct_recipe_regression()) {
         return 1;
     }
 

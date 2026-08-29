@@ -707,6 +707,20 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
     return new_type;
 }
 
+static bool llama_tensor_get_manual_type(
+        const quantize_state_impl & qs,
+        const char * tensor_name,
+        ggml_type & result) {
+    for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
+        if (std::regex_search(tensor_name, pattern)) {
+            result = qtype;
+            return true;
+        }
+    }
+
+    return false;
+}
+
 // outer wrapper: determine the ggml_type that this tensor should be quantized to
 static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_model_quantize_params * params, const ggml_tensor * tensor, ggml_type default_type, const tensor_metadata & tm) {
     if (!tensor_allows_quantization(params, qs.model.arch, tensor)) {
@@ -717,13 +731,8 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
         // separate table, so let an explicit --tensor-type name it
         bool named = false;
         if (std::strcmp(tensor->name, "per_layer_token_embd.weight") == 0) {
-            const std::string tensor_name(tensor->name);
-            for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
-                if (std::regex_search(tensor_name, pattern)) {
-                    named = true;
-                    break;
-                }
-            }
+            ggml_type unused_type = GGML_TYPE_COUNT;
+            named = llama_tensor_get_manual_type(qs, tensor->name, unused_type);
         }
         if (!named) {
             return params->token_embedding_type;
@@ -739,19 +748,14 @@ static ggml_type llama_tensor_get_type(quantize_state_impl & qs, const llama_mod
     if (ggml_is_quantized(default_type)) {
         // if the user provided tensor types - use those
         bool manual = false;
-        if (!qs.tensor_type_patterns.empty()) {
-            const std::string tensor_name(tensor->name);
-            for (const auto & [pattern, qtype] : qs.tensor_type_patterns) {
-                if (std::regex_search(tensor_name, pattern)) {
-                    if (qtype != new_type) {
-                        LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
-                                       __func__, tensor_name.c_str(), ggml_type_name(new_type), ggml_type_name(qtype));
-                        new_type = qtype;
-                    }
-                    manual = true;
-                    break;
-                }
+        ggml_type manual_type = GGML_TYPE_COUNT;
+        if (llama_tensor_get_manual_type(qs, tensor->name, manual_type)) {
+            if (manual_type != new_type) {
+                LLAMA_LOG_WARN("%s: %-36s - applying manual override: %s -> %s\n",
+                               __func__, tensor->name, ggml_type_name(new_type), ggml_type_name(manual_type));
+                new_type = manual_type;
             }
+            manual = true;
         }
 
         // if not manual - use the standard logic for choosing the quantization type based on the selected mixture
@@ -1495,4 +1499,105 @@ void llama_quant_compute_types(
     for (size_t i = 0; i < n_tensors; i++) {
         result_types[i] = llama_tensor_get_type(*qs, &local_params, tensors[i], default_type, metadata[i]);
     }
+}
+
+uint32_t llama_quant_plan_direct(
+        const llama_quant_model_desc * model_desc,
+        const llama_model_quantize_params * params,
+        const llama_quant_direct_tensor * tensors,
+        ggml_type * result_types,
+        size_t n_tensors) {
+    if (model_desc == nullptr || params == nullptr || (n_tensors > 0 && (tensors == nullptr || result_types == nullptr))) {
+        LLAMA_LOG_ERROR("%s: invalid direct quantization plan arguments\n", __func__);
+        return 1;
+    }
+
+    llama_model * model = nullptr;
+    ggml_context * ctx = nullptr;
+
+    try {
+        model = llama_quant_model_from_metadata(model_desc);
+        if (model == nullptr) {
+            throw std::runtime_error("failed to create quantization model from metadata");
+        }
+
+        quantize_state_impl qs(*model, params);
+
+        const size_t tensor_count = std::max<size_t>(n_tensors, 1);
+        const ggml_init_params ctx_params = {
+            /*.mem_size   = */ tensor_count * ggml_tensor_overhead(),
+            /*.mem_buffer = */ nullptr,
+            /*.no_alloc   = */ true,
+        };
+        ctx = ggml_init(ctx_params);
+        if (ctx == nullptr) {
+            throw std::runtime_error("failed to create direct quantization planning context");
+        }
+
+        for (size_t i = 0; i < n_tensors; ++i) {
+            const auto & desc = tensors[i];
+
+            if (desc.name == nullptr || desc.n_dims == 0 || desc.n_dims > GGML_MAX_DIMS ||
+                    desc.source_type < GGML_TYPE_F32 || desc.source_type >= GGML_TYPE_COUNT) {
+                throw std::runtime_error(format("invalid direct quantization tensor descriptor at index %zu", i));
+            }
+
+            for (uint32_t d = 0; d < desc.n_dims; ++d) {
+                if (desc.ne[d] <= 0) {
+                    throw std::runtime_error(format("invalid dimension %u for direct quantization tensor %s", d, desc.name));
+                }
+            }
+
+            // The planner needs only the final GGUF name and dimensions.  Keep
+            // this mock tensor F32 so an FP8 -> Q8 baseline can be planned even
+            // for a row shape that would later be rejected by the writer.
+            ggml_tensor * tensor = ggml_new_tensor(ctx, GGML_TYPE_F32, desc.n_dims, desc.ne);
+            ggml_set_name(tensor, desc.name);
+
+            result_types[i] = desc.source_type;
+
+            ggml_type manual_type = GGML_TYPE_COUNT;
+            if (!llama_tensor_get_manual_type(qs, desc.name, manual_type)) {
+                continue;
+            }
+
+            if (!tensor_allows_quantization(params, model->arch, tensor)) {
+                throw std::runtime_error(format("direct quantization override is not allowed for tensor %s", desc.name));
+            }
+
+            if (manual_type < GGML_TYPE_F32 || manual_type >= GGML_TYPE_COUNT) {
+                throw std::runtime_error(format("direct quantization override has invalid type for tensor %s", desc.name));
+            }
+
+            if (ggml_is_quantized(manual_type)) {
+                const int64_t block_size = ggml_blck_size(manual_type);
+                if (tensor->ne[0] % block_size != 0) {
+                    throw std::runtime_error(format(
+                            "direct quantization override for tensor %s requires row size %" PRId64 " to be divisible by %" PRId64 " (%s)",
+                            desc.name, tensor->ne[0], block_size, ggml_type_name(manual_type)));
+                }
+
+                if (ggml_quantize_requires_imatrix(manual_type)) {
+                    throw std::runtime_error(format(
+                            "direct quantization override for tensor %s uses %s, which requires an importance matrix",
+                            desc.name, ggml_type_name(manual_type)));
+                }
+            }
+
+            result_types[i] = manual_type;
+        }
+    } catch (const std::exception & err) {
+        LLAMA_LOG_ERROR("%s: failed to plan direct quantization: %s\n", __func__, err.what());
+        if (ctx != nullptr) {
+            ggml_free(ctx);
+        }
+        if (model != nullptr) {
+            llama_model_free(model);
+        }
+        return 1;
+    }
+
+    ggml_free(ctx);
+    llama_model_free(model);
+    return 0;
 }
