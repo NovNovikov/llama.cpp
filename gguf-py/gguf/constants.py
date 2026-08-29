@@ -672,6 +672,7 @@ class MODEL_TENSOR(IntEnum):
     ATTN_V               = auto()
     ATTN_QKV             = auto()
     ATTN_OUT             = auto()
+    ATTN_R               = auto()
     ATTN_NORM            = auto()
     ATTN_NORM_2          = auto()
     ATTN_OUT_NORM        = auto()
@@ -878,6 +879,12 @@ class MODEL_TENSOR(IntEnum):
     SHORTCONV_CONV       = auto()
     SHORTCONV_INPROJ     = auto()
     SHORTCONV_OUTPROJ    = auto()
+    ATTN_REL_PROJ        = auto()
+    SHORTCONV_K          = auto()
+    SHORTCONV_V          = auto()
+    SHORTCONV_ATTN       = auto()
+    SHORTCONV_MLP        = auto()
+    FFN_GSCALE           = auto()
     VISEXP_ATTN_QKV      = auto()
     VISEXP_ATTN_OUT      = auto()
     VISEXP_GATE          = auto()
@@ -1424,6 +1431,7 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.ATTN_K:                    "blk.{bid}.attn_k",
     MODEL_TENSOR.ATTN_V:                    "blk.{bid}.attn_v",
     MODEL_TENSOR.ATTN_OUT:                  "blk.{bid}.attn_output",
+    MODEL_TENSOR.ATTN_R:                    "blk.{bid}.attn_r",
     MODEL_TENSOR.ATTN_ROT_EMBD:             "blk.{bid}.attn_rot_embd",
     MODEL_TENSOR.ATTN_SINKS:                "blk.{bid}.attn_sinks",
     MODEL_TENSOR.ATTN_GATE:                 "blk.{bid}.attn_gate",
@@ -1628,6 +1636,12 @@ TENSOR_NAMES: dict[MODEL_TENSOR, str] = {
     MODEL_TENSOR.SHORTCONV_CONV:            "blk.{bid}.shortconv.conv",
     MODEL_TENSOR.SHORTCONV_INPROJ:          "blk.{bid}.shortconv.in_proj",
     MODEL_TENSOR.SHORTCONV_OUTPROJ:         "blk.{bid}.shortconv.out_proj",
+    MODEL_TENSOR.ATTN_REL_PROJ:              "blk.{bid}.attn_rel_proj",
+    MODEL_TENSOR.SHORTCONV_K:                "blk.{bid}.shortconv_k",
+    MODEL_TENSOR.SHORTCONV_V:                "blk.{bid}.shortconv_v",
+    MODEL_TENSOR.SHORTCONV_ATTN:             "blk.{bid}.shortconv_attn",
+    MODEL_TENSOR.SHORTCONV_MLP:              "blk.{bid}.shortconv_mlp",
+    MODEL_TENSOR.FFN_GSCALE:                 "blk.{bid}.ffn_gscale",
     MODEL_TENSOR.VISEXP_ATTN_QKV:           "blk.{bid}.vis_attn_qkv",
     MODEL_TENSOR.VISEXP_ATTN_OUT:           "blk.{bid}.vis_attn_output",
     MODEL_TENSOR.VISEXP_GATE:               "blk.{bid}.vis_gate",
