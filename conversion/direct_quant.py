@@ -10,10 +10,14 @@ from __future__ import annotations
 import ctypes
 import os
 from pathlib import Path
+from typing import Callable, Iterator, TYPE_CHECKING
 
 import numpy as np
 
 import gguf
+
+if TYPE_CHECKING:
+    from gguf.utility import LocalTensor
 
 
 class DirectQuantError(RuntimeError):
@@ -105,3 +109,184 @@ class GGMLChunkQuantizer:
             raise DirectQuantError(f"ggml rejected the encoded {qtype.name} payload")
 
         return output
+
+
+class FP8ScaledTensor:
+    """A row-streaming FP8 safetensors matrix with a rectangular scale grid.
+
+    The source tensor remains on disk.  A chunk contains only a whole number of
+    scale-grid row blocks, so expanding its scales never requires the complete
+    expert matrix.  ``scale_dtype`` is intentionally explicit: GLM's E8M0
+    scale bytes are decoded locally, while conventional F16/F32 scales retain
+    their native storage semantics.
+    """
+
+    _FP8_TORCH_DTYPES = {
+        "F8_E4M3FN": "float8_e4m3fn",
+        "F8_E4M3FNUZ": "float8_e4m3fnuz",
+        "F8_E5M2": "float8_e5m2",
+        "F8_E5M2FNUZ": "float8_e5m2fnuz",
+    }
+    _SCALE_DTYPES = {
+        "F16": np.dtype("<f2"),
+        "F32": np.dtype("<f4"),
+        "I8": np.dtype("i1"),
+        "U8": np.dtype("u1"),
+    }
+
+    def __init__(
+        self,
+        weight: LocalTensor,
+        scale: LocalTensor,
+        *,
+        block_shape: tuple[int, int] = (128, 128),
+    ) -> None:
+        if len(weight.shape) != 2:
+            raise DirectQuantError(
+                f"direct FP8 tensor must be a matrix, got shape {weight.shape}")
+        if weight.dtype not in self._FP8_TORCH_DTYPES:
+            raise DirectQuantError(
+                f"direct FP8 tensor has unsupported safetensors dtype {weight.dtype}")
+        if len(scale.shape) != 2:
+            raise DirectQuantError(
+                f"direct FP8 scale must be a matrix, got shape {scale.shape}")
+        if block_shape[0] <= 0 or block_shape[1] <= 0:
+            raise DirectQuantError(f"invalid FP8 scale block shape {block_shape}")
+
+        rows, cols = weight.shape
+        expected_scale_shape = (
+            (rows + block_shape[0] - 1) // block_shape[0],
+            (cols + block_shape[1] - 1) // block_shape[1],
+        )
+        if scale.shape != expected_scale_shape:
+            raise DirectQuantError(
+                f"FP8 scale shape {scale.shape} does not match weight shape "
+                f"{weight.shape} and scale block {block_shape}; expected {expected_scale_shape}")
+        if weight.data_range.size != rows * cols:
+            raise DirectQuantError(
+                f"FP8 weight byte range has {weight.data_range.size} bytes, expected {rows * cols}")
+
+        self.weight = weight
+        self.scale = scale
+        self.block_shape = block_shape
+
+    @property
+    def shape(self) -> tuple[int, int]:
+        return self.weight.shape
+
+    @staticmethod
+    def _native_scale_dtype(dtype: str) -> np.dtype:
+        try:
+            return FP8ScaledTensor._SCALE_DTYPES[dtype]
+        except KeyError as exc:
+            raise DirectQuantError(f"unsupported direct FP8 scale dtype {dtype}") from exc
+
+    @staticmethod
+    def _decode_fp8(raw: np.ndarray, dtype: str) -> np.ndarray:
+        try:
+            import torch
+            torch_dtype = getattr(torch, FP8ScaledTensor._FP8_TORCH_DTYPES[dtype])
+        except (ImportError, AttributeError, KeyError) as exc:
+            raise DirectQuantError(
+                f"PyTorch cannot decode direct FP8 safetensors dtype {dtype}") from exc
+
+        # torch owns the FP8 bit-format conversion.  ``copy`` avoids retaining
+        # a memmap view for the lifetime of the temporary Torch tensor.
+        return torch.from_numpy(raw.copy()).view(torch_dtype).float().numpy()
+
+    @staticmethod
+    def _decode_scale(raw: np.ndarray, dtype: str) -> np.ndarray:
+        if dtype == "F8_E8M0":
+            return np.exp2(raw.astype(np.float32) - 127.0, dtype=np.float32)
+        if dtype == "BF16":
+            return (raw.astype(np.uint32) << 16).view(np.float32)
+        return raw.astype(np.float32, copy=False)
+
+    def _load_scale(self) -> np.ndarray:
+        if self.scale.dtype == "F8_E8M0":
+            dtype = np.dtype("u1")
+        elif self.scale.dtype == "BF16":
+            dtype = np.dtype("<u2")
+        else:
+            dtype = self._native_scale_dtype(self.scale.dtype)
+        expected_size = int(np.prod(self.scale.shape, dtype=np.int64)) * dtype.itemsize
+        if self.scale.data_range.size != expected_size:
+            raise DirectQuantError(
+                f"FP8 scale byte range has {self.scale.data_range.size} bytes, expected {expected_size}")
+        raw = np.memmap(
+            self.scale.data_range.filename,
+            mode="r",
+            offset=self.scale.data_range.offset,
+            dtype=dtype,
+            shape=self.scale.shape,
+        )
+        return self._decode_scale(raw, self.scale.dtype)
+
+    def _load_float_rows(self, row_start: int, row_end: int) -> np.ndarray:
+        rows, cols = self.shape
+        if row_start < 0 or row_start >= row_end or row_end > rows:
+            raise DirectQuantError(f"invalid direct FP8 row range [{row_start}, {row_end}) for {self.shape}")
+        block_rows, block_cols = self.block_shape
+        scales = self._load_scale()
+        raw = np.memmap(
+            self.weight.data_range.filename,
+            mode="r",
+            offset=self.weight.data_range.offset + row_start * cols,
+            dtype=np.dtype("u1"),
+            shape=(row_end - row_start, cols),
+        )
+        values = self._decode_fp8(raw, self.weight.dtype)
+        scale_rows = scales[row_start // block_rows:(row_end + block_rows - 1) // block_rows]
+        expanded = np.repeat(scale_rows, block_rows, axis=0)
+        expanded_start = row_start % block_rows
+        expanded = expanded[expanded_start:expanded_start + row_end - row_start]
+        expanded = np.repeat(expanded, block_cols, axis=1)[:, :cols]
+        return np.multiply(values, expanded, dtype=np.float32)
+
+    def iter_float_rows(self, *, rows_per_chunk: int) -> Iterator[np.ndarray]:
+        """Yield F32 rows, aligned to the source scale-grid rows."""
+        rows, _ = self.shape
+        block_rows, _ = self.block_shape
+        if rows_per_chunk <= 0:
+            raise DirectQuantError(f"direct FP8 rows_per_chunk must be positive, got {rows_per_chunk}")
+        rows_per_chunk = max(block_rows, rows_per_chunk - rows_per_chunk % block_rows)
+
+        for row_start in range(0, rows, rows_per_chunk):
+            row_end = min(rows, row_start + rows_per_chunk)
+            yield self._load_float_rows(row_start, row_end)
+
+    def lazy_quantized(
+        self,
+        quantizer: GGMLChunkQuantizer,
+        qtype: gguf.GGMLQuantizationType,
+        *,
+        rows_per_chunk: int = 128,
+    ) -> gguf.LazyChunkedTensor:
+        """Return raw native-quantized chunks suitable for ``GGUFWriter``.
+
+        The returned lazy tensor has the *encoded* byte shape.  Pass
+        ``raw_shape=self.shape`` and ``raw_dtype=qtype`` to ``add_tensor`` so
+        GGUF records the original matrix dimensions and requested GGML type.
+        """
+        try:
+            byte_shape = gguf.quant_shape_to_byte_shape(self.shape, qtype)
+        except ValueError as exc:
+            raise DirectQuantError(
+                f"cannot directly quantize FP8 tensor shape {self.shape} as {qtype.name}: {exc}") from exc
+
+        # Materialize neither the source weight nor its F32 form until the
+        # writer asks for a chunk.  Each closure creates an independent reader
+        # so GGUF can write it exactly once in ordinary tensor order.
+        chunks: list[Callable[[], np.ndarray]] = []
+        rows, _ = self.shape
+        block_rows, _ = self.block_shape
+        rows_per_chunk = max(block_rows, rows_per_chunk - rows_per_chunk % block_rows)
+        for row_start in range(0, rows, rows_per_chunk):
+            row_end = min(rows, row_start + rows_per_chunk)
+
+            def load_chunk(start: int = row_start, end: int = row_end) -> np.ndarray:
+                return quantizer.quantize_rows(self._load_float_rows(start, end), qtype)
+
+            chunks.append(load_chunk)
+
+        return gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8)
