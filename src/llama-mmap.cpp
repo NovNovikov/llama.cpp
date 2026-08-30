@@ -802,23 +802,6 @@ struct llama_mlock::impl {
         }
     }
 
-    void lock_range(size_t offset, size_t range_size) {
-        GGML_ASSERT(addr);
-        if (failed_already || range_size == 0) {
-            return;
-        }
-
-        const size_t granularity = lock_granularity();
-        const size_t first = offset & ~(granularity - 1);
-        const size_t last = (offset + range_size + granularity - 1) & ~(granularity - 1);
-
-        if (raw_lock((uint8_t *) addr + first, last - first)) {
-            size += last - first;
-        } else {
-            failed_already = true;
-        }
-    }
-
     void * addr;
     size_t size;
 
@@ -830,7 +813,6 @@ llama_mlock::~llama_mlock() = default;
 
 void llama_mlock::init(void * ptr) { pimpl->init(ptr); }
 void llama_mlock::grow_to(size_t target_size) { pimpl->grow_to(target_size); }
-void llama_mlock::lock_range(size_t offset, size_t size) { pimpl->lock_range(offset, size); }
 
 #if defined(_POSIX_MEMLOCK_RANGE) || defined(_WIN32)
 const bool llama_mlock::SUPPORTED = true;

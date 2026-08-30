@@ -68,7 +68,6 @@ struct llama_mlock {
 
     void init(void * ptr);
     void grow_to(size_t target_size);
-    void lock_range(size_t offset, size_t size);
 
     static const bool SUPPORTED;
 
