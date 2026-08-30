@@ -426,22 +426,40 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
             }
         }
 
-        // Build required arg sequence in definition order
-        common_peg_parser args_seq = p.eps();
-        for (size_t i = 0; i < required_parsers.size(); i++) {
-            if (i > 0) {
-                args_seq = args_seq + p.space();
-            }
-            args_seq = args_seq + required_parsers[i];
-        }
-
-        // Build optional args with flexible ordering
+        // Tagged tool arguments are object members: their order is not semantic.
+        //
+        // Keep required arguments structurally mandatory, but allow optional
+        // arguments before, between, or after them. The old parser required:
+        //
+        //     required... optional...
+        //
+        // which rejects valid GLM calls such as:
+        //
+        //     <arg_key>max_depth</arg_key>...   (optional)
+        //     <arg_key>path</arg_key>...        (required)
+        //
+        // Required arguments are permuted exactly once each. Optional arguments
+        // retain the previous behavior (a flexible run), but that run is now
+        // allowed at every boundary around required arguments.
+        common_peg_parser optional_run = p.space();
         if (!optional_parsers.empty()) {
             common_peg_parser any_opt = p.choice();
             for (const auto & opt : optional_parsers) {
                 any_opt |= opt;
             }
-            args_seq = args_seq + p.repeat(p.space() + any_opt, 0, -1);
+            optional_run = p.zero_or_more(p.space() + any_opt) + p.space();
+        }
+
+        common_peg_parser args_seq = optional_run;
+        if (!required_parsers.empty()) {
+            std::vector<common_peg_parser> required_with_optional_tail;
+            required_with_optional_tail.reserve(required_parsers.size());
+            for (const auto & req : required_parsers) {
+                required_with_optional_tail.push_back(req + optional_run);
+            }
+            args_seq = args_seq + p.permute(
+                "tool-" + name + "-required",
+                required_with_optional_tail);
         }
 
         if (!arguments.start.empty()) {
