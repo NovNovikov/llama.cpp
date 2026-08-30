@@ -81,6 +81,33 @@ def bf16_as_f32(
     return gguf.LazyChunkedTensor(chunks, tuple(reversed(tuple(int(d) for d in tensor.shape))), np.float32)
 
 
+def raw_tensor_copy(
+    tensor: gguf.ReaderTensor,
+    source: Path,
+    *,
+    bytes_per_chunk: int = 16 << 20,
+) -> gguf.LazyChunkedTensor:
+    """Copy an unchanged tensor without retaining its source mmap pages."""
+    if bytes_per_chunk <= 0:
+        raise ValueError("bytes_per_chunk must be positive")
+
+    chunks = []
+    for start in range(0, tensor.n_bytes, bytes_per_chunk):
+        count = min(bytes_per_chunk, tensor.n_bytes - start)
+
+        def load_chunk(offset: int = start, length: int = count) -> np.ndarray:
+            with source.open("rb") as f:
+                f.seek(tensor.data_offset + offset)
+                data = f.read(length)
+            if len(data) != length:
+                raise ValueError(f"short read while copying {tensor.name}")
+            return np.frombuffer(data, dtype=np.uint8).copy()
+
+        chunks.append(load_chunk)
+
+    return gguf.LazyChunkedTensor(chunks, tuple(int(d) for d in tensor.data.shape), np.uint8)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", type=Path, help="existing direct-converted GLM GGUF")
@@ -142,7 +169,7 @@ def main() -> None:
         else:
             writer.add_tensor(
                 tensor.name,
-                tensor.data,
+                raw_tensor_copy(tensor, source),
                 raw_dtype=tensor.tensor_type,
                 tensor_endianess=reader.endianess,
             )
