@@ -870,6 +870,15 @@ static constexpr uint32_t SLOT_META_VERSION_MEDIA_NODE = 4u;
 // must remain permanently ineligible for automatic restore.
 static constexpr uint32_t SLOT_META_VERSION_SAFE_NODE = 5u;
 static constexpr uint32_t SLOT_META_VERSION_SAFE_MEDIA_NODE = 6u;
+// v7-v10 add the auto-snapshot state ABI.  A state file's payload layout is not
+// self-describing, so an incompatible reader must reject it before attempting a
+// load rather than treating an EOF as a corrupt checkpoint.
+static constexpr uint32_t SLOT_META_VERSION_STATE_ABI = 7u;
+static constexpr uint32_t SLOT_META_VERSION_STATE_ABI_MEDIA = 8u;
+static constexpr uint32_t SLOT_META_VERSION_STATE_ABI_SAFE_NODE = 9u;
+static constexpr uint32_t SLOT_META_VERSION_STATE_ABI_SAFE_MEDIA_NODE = 10u;
+// Bump whenever the serialized llama state consumed by automatic snapshots changes.
+static constexpr uint32_t AUTO_SNAPSHOT_STATE_ABI = 1u;
 static constexpr uint32_t SLOT_META_MEDIA_MAX = 4096u;
 static constexpr uint32_t SLOT_META_ID_MAX    = 256u;
 
@@ -915,6 +924,9 @@ struct model_fp {
     // Projector identity is persisted only by v2 media sidecars. Text-only v1/v3 units remain
     // projector-independent and therefore keep their frozen layout.
     uint64_t fp_mmproj          = 0;
+    // Serialized llama-state layout used by automatic snapshots. Zero is legacy metadata that
+    // predates an explicit ABI and must never match a current snapshot.
+    uint32_t fp_state_abi       = 0;
 
     // exact field-by-field equality (C++17: no defaulted operator==). Any difference REFUSES the
     // restore (invariant 3). Note: fp_block is intentionally part of identity — a snapshot hashed
@@ -930,6 +942,7 @@ struct model_fp {
                fp_yarn_attn == o.fp_yarn_attn && fp_yarn_beta_fast == o.fp_yarn_beta_fast &&
                fp_yarn_beta_slow == o.fp_yarn_beta_slow && fp_yarn_orig_ctx == o.fp_yarn_orig_ctx &&
                fp_lora == o.fp_lora && fp_mmproj_loaded == o.fp_mmproj_loaded &&
+               fp_state_abi == o.fp_state_abi &&
                // v1 text and v3 text-delta sidecars deliberately do not carry a
                // projector hash. Zero is therefore an "identity not applicable"
                // sentinel for those formats, not a hash mismatch. v2 media
@@ -1301,7 +1314,7 @@ static std::string slot_meta_sidecar_path(const std::string & state_filepath) {
 }
 
 // Best-effort atomic write of the .meta sidecar (LE, temp+rename — the exact idiom
-// of slot_logits_write). Layout: magic/version, fingerprint fields, tok_count,
+// of slot_logits_write). Layout: magic/version, fingerprint fields including state ABI, tok_count,
 // chain_hash, then int32 tokens[tok_count]. Returns true on success. Never throws.
 static bool slot_meta_write(const std::string & state_filepath,
                             const model_fp & fp,
@@ -1341,8 +1354,8 @@ static bool slot_meta_write(const std::string & state_filepath,
         put_u32((uint32_t)(v >> 32));
     };
     put_u32(SLOT_META_MAGIC);
-    put_u32(is_node ? (media.empty() ? SLOT_META_VERSION_SAFE_NODE : SLOT_META_VERSION_SAFE_MEDIA_NODE)
-                    : (media.empty() ? SLOT_META_VERSION      : SLOT_META_VERSION_MEDIA));
+    put_u32(is_node ? (media.empty() ? SLOT_META_VERSION_STATE_ABI_SAFE_NODE : SLOT_META_VERSION_STATE_ABI_SAFE_MEDIA_NODE)
+                    : (media.empty() ? SLOT_META_VERSION_STATE_ABI           : SLOT_META_VERSION_STATE_ABI_MEDIA));
     put_u64(fp.fp_model);
     put_u32(fp.fp_n_vocab);
     put_u32(fp.fp_n_ctx_train);
@@ -1365,13 +1378,14 @@ static bool slot_meta_write(const std::string & state_filepath,
     put_u64(fp.fp_lora);
     // mmproj deployment-shape bit — refuses cross-shape restores.
     put_u32(fp.fp_mmproj_loaded);
+    put_u32(fp.fp_state_abi);
     put_u32((uint32_t) toks.size());
     put_u64(chain_hash);
     // token IDs as raw LE int32 (llama_token == int32_t; llama.cpp's on-disk
     // contract is native-LE, matching slot_logits_write's float payload).
     f.write((const char *) toks.data(), (std::streamsize) toks.size() * sizeof(int32_t));
-    // v2/v4: media identity data needed to verify a future request and to rehydrate tracking after
-    // a disk restore. It follows the frozen v1 payload so text-only sidecars stay byte-identical.
+    // Media identity data needed to verify a future request and to rehydrate tracking after
+    // a disk restore. It follows the frozen common payload.
     if (!media.empty()) {
         put_u64(fp.fp_mmproj);
         put_u32((uint32_t) media.size());
@@ -1386,7 +1400,7 @@ static bool slot_meta_write(const std::string & state_filepath,
             f.write(record.id.data(), (std::streamsize) record.id.size());
         }
     }
-    // v3/v4 delta-node section: the KV .bin holds only cells [range_lo, range_hi); parent_id
+    // Delta-node section: the KV .bin holds only cells [range_lo, range_hi); parent_id
     // chains this node to the snapshot it extends (0 = root). It follows any v2 media tail.
     if (is_node) {
         put_u64(parent_id);
@@ -1456,7 +1470,9 @@ static bool slot_meta_read(const std::string & state_filepath,
     if (magic != SLOT_META_MAGIC ||
         (version != SLOT_META_VERSION && version != SLOT_META_VERSION_MEDIA &&
          version != SLOT_META_VERSION_NODE && version != SLOT_META_VERSION_MEDIA_NODE &&
-         version != SLOT_META_VERSION_SAFE_NODE && version != SLOT_META_VERSION_SAFE_MEDIA_NODE)) {
+         version != SLOT_META_VERSION_SAFE_NODE && version != SLOT_META_VERSION_SAFE_MEDIA_NODE &&
+         version != SLOT_META_VERSION_STATE_ABI && version != SLOT_META_VERSION_STATE_ABI_MEDIA &&
+         version != SLOT_META_VERSION_STATE_ABI_SAFE_NODE && version != SLOT_META_VERSION_STATE_ABI_SAFE_MEDIA_NODE)) {
         return false;
     }
     model_fp fp;
@@ -1471,6 +1487,7 @@ static bool slot_meta_read(const std::string & state_filepath,
         !get_u32(fp.fp_yarn_beta_fast)|| !get_u32(fp.fp_yarn_beta_slow)|| !get_u32(fp.fp_yarn_orig_ctx)||
         // mmproj deployment-shape bit — read in the same order slot_meta_write emits.
         !get_u64(fp.fp_lora)          || !get_u32(fp.fp_mmproj_loaded) ||
+        ((version >= SLOT_META_VERSION_STATE_ABI) && !get_u32(fp.fp_state_abi)) ||
         !get_u32(tok_count)           || !get_u64(chain_hash)) {
         return false;
     }
@@ -1486,10 +1503,11 @@ static bool slot_meta_read(const std::string & state_filepath,
         toks_out.clear();
         return false;
     }
-    // v1/v3 are text-only layouts. Reject NULL cells rather than letting a damaged or relabelled
+    // v1/v3/v5/v7/v9 are text-only layouts. Reject NULL cells rather than letting a damaged or relabelled
     // media sidecar bypass its projector and media-identity checks.
     if (version == SLOT_META_VERSION || version == SLOT_META_VERSION_NODE ||
-        version == SLOT_META_VERSION_SAFE_NODE) {
+        version == SLOT_META_VERSION_SAFE_NODE || version == SLOT_META_VERSION_STATE_ABI ||
+        version == SLOT_META_VERSION_STATE_ABI_SAFE_NODE) {
         for (const llama_token tok : toks_out) {
             if (tok == LLAMA_TOKEN_NULL) {
                 toks_out.clear();
@@ -1499,7 +1517,8 @@ static bool slot_meta_read(const std::string & state_filepath,
     }
     std::vector<server_media_record> media;
     if (version == SLOT_META_VERSION_MEDIA || version == SLOT_META_VERSION_MEDIA_NODE ||
-        version == SLOT_META_VERSION_SAFE_MEDIA_NODE) {
+        version == SLOT_META_VERSION_SAFE_MEDIA_NODE || version == SLOT_META_VERSION_STATE_ABI_MEDIA ||
+        version == SLOT_META_VERSION_STATE_ABI_SAFE_MEDIA_NODE) {
         uint32_t n_media = 0;
         if (!get_u64(fp.fp_mmproj) || !get_u32(n_media) || n_media == 0 || n_media > SLOT_META_MEDIA_MAX) {
             toks_out.clear();
@@ -1549,7 +1568,8 @@ static bool slot_meta_read(const std::string & state_filepath,
     uint32_t range_lo  = 0;
     uint32_t range_hi  = tok_count;
     if (version == SLOT_META_VERSION_NODE || version == SLOT_META_VERSION_MEDIA_NODE ||
-        version == SLOT_META_VERSION_SAFE_NODE || version == SLOT_META_VERSION_SAFE_MEDIA_NODE) {
+        version == SLOT_META_VERSION_SAFE_NODE || version == SLOT_META_VERSION_SAFE_MEDIA_NODE ||
+        version == SLOT_META_VERSION_STATE_ABI_SAFE_NODE || version == SLOT_META_VERSION_STATE_ABI_SAFE_MEDIA_NODE) {
         if (!get_u64(parent_id) || !get_u32(range_lo) || !get_u32(range_hi)) {
             toks_out.clear();
             return false;
@@ -2835,6 +2855,8 @@ private:
                 params_base.control_vector_layer_end,
                 llama_model_n_layer(model_tgt)));
         h = auto_hash_mix64(h, auto_kv_overrides_hash(params_base.kv_overrides));
+        fp.fp_state_abi = AUTO_SNAPSHOT_STATE_ABI;
+        h = auto_hash_mix64(h, fp.fp_state_abi);
 
         fp.fp_model       = h;
         fp.fp_n_vocab     = (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
@@ -2903,7 +2925,8 @@ private:
     }
 
     static bool slot_meta_is_safe_delta(uint32_t version) {
-        return version == SLOT_META_VERSION_SAFE_NODE || version == SLOT_META_VERSION_SAFE_MEDIA_NODE;
+        return version == SLOT_META_VERSION_STATE_ABI_SAFE_NODE ||
+               version == SLOT_META_VERSION_STATE_ABI_SAFE_MEDIA_NODE;
     }
 
     // Insert a snapshot at a boundary it reaches. Multiple snapshots are RETAINED per boundary
@@ -3474,7 +3497,7 @@ private:
         SLT_INF(slot, "auto-restore: disk candidate kind=%s, tokens=%zu, file=%s\n",
                 disk_kind, disk_toks.size(), cand.state_path.c_str());
         // v3/v4 deltas predate DSV4's real range serializer and can contain a second
-        // complete raw KV. They remain cache misses forever; v5/v6 is the safe format.
+        // complete raw KV. They remain cache misses forever; v9/v10 is the current safe format.
         if (disk_is_delta && !slot_meta_is_safe_delta(disk_meta_version)) {
             SLT_WRN(slot, "auto-restore: unsafe legacy disk delta snapshot skipped, file=%s\n",
                     cand.state_path.c_str());
@@ -3780,7 +3803,7 @@ private:
         uint64_t parent_id   = 0;
         uint32_t parent_hi   = 0;
         // DSV4 now serializes only the raw-KV range in a delta (its bounded
-        // compressor state is deliberately carried by the tip). New nodes are v5/v6
+        // compressor state is deliberately carried by the tip). New nodes are v9/v10
         // and restore only against an explicit safe-format gate above.
         const bool incremental_state_restore_safe = true;
         if (incremental_state_restore_safe && params_base.slot_save_incremental) {
