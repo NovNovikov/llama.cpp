@@ -85,7 +85,7 @@ def raw_tensor_copy(
     tensor: gguf.ReaderTensor,
     source: Path,
     *,
-    bytes_per_chunk: int = 16 << 20,
+    bytes_per_chunk: int = 256 << 20,
 ) -> gguf.LazyChunkedTensor:
     """Copy an unchanged tensor without retaining its source mmap pages."""
     if bytes_per_chunk <= 0:
