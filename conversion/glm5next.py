@@ -251,6 +251,88 @@ class Glm5NextModel(GlmMoeDsaModel):
             if expert_pattern.match(normalized) is not None:
                 continue
 
+            # Canonical MLA kv_b split: HF kv_b_proj [n_head*(qk_nope+v_head), kv_lora_rank]
+            # -> GGUF k_b [qk_nope, kv_lora_rank, n_head] and v_b [kv_lora_rank, v_head, n_head]
+            # Must be numerically equivalent to DeepseekV2Model.modify_tensors() for direct path.
+            if normalized.endswith(".self_attn.kv_b_proj.weight"):
+                # Use effective hparams after text_config merge
+                n_head = int(self.hparams.get("num_attention_heads", self.hparams.get("n_head", 64)))
+                # For MLA, num_key_value_heads may be in text_config; fallback to n_head
+                n_head_kv = int(self.hparams.get("num_key_value_heads", n_head))
+                # qk_nope and v_head are required for MLA
+                qk_nope = int(self.hparams.get("qk_nope_head_dim", self.hparams.get("qk_nope_head_dim", 0)) or 0)
+                v_head = int(self.hparams.get("v_head_dim", 0) or 0)
+                # Fallback to GGUF MLA lengths if direct hparams missing (nope-only 256)
+                if qk_nope == 0:
+                    qk_nope = int(self.hparams.get("qk_nope_head_dim", 256))
+                if v_head == 0:
+                    v_head = int(self.hparams.get("v_head_dim", 256))
+                # If still 0, try to infer from tensor shape (HF shape [n_head*(qk+v), kv_lora])
+                # Effective n_head for kv_b is num_attention_heads (64 for GLM-5.3)
+                if qk_nope == 0 or v_head == 0:
+                    # infer from shape: assume qk_nope==v_head==256 for GLM5Next
+                    qk_nope = 256
+                    v_head = 256
+                # Validate shape
+                expected_rows = n_head * (qk_nope + v_head)
+                if local_tensor.shape[0] != expected_rows:
+                    # Try n_head_kv fallback (for some configs n_head_kv is used)
+                    if n_head_kv * (qk_nope + v_head) == local_tensor.shape[0]:
+                        n_head = n_head_kv
+                    else:
+                        raise DirectQuantError(
+                            f"kv_b_proj shape {local_tensor.shape} does not match n_head {n_head}*(qk_nope {qk_nope}+v_head {v_head})={n_head*(qk_nope+v_head)}")
+                data = LazyTorchTensor.to_eager(self.model_tensors[source_name]())
+                # Canonical transform identical to DeepseekV2Model
+                kv_b = data.view(n_head, qk_nope + v_head, data.shape[-1]) if data.shape[0] == n_head * (qk_nope + v_head) else data.view(n_head_kv, qk_nope + v_head, data.shape[-1])
+                # Fallback view for [32768,512] case
+                if kv_b.shape[0] * kv_b.shape[1] * kv_b.shape[2] != data.numel():
+                    kv_b = data.view(n_head, qk_nope + v_head, -1)
+                k_b, v_b = torch.split(kv_b, [qk_nope, v_head], dim=1)
+                k_b = k_b.transpose(1, 2).contiguous()
+                v_b = v_b.contiguous()
+                # GGUF names
+                base = normalized.removesuffix(".self_attn.kv_b_proj.weight")
+                # Use direct output name helper for each
+                k_name = self._direct_output_name(base + ".self_attn.kv_b_proj.weight").replace("attn_kv_b", "attn_k_b")
+                v_name = self._direct_output_name(base + ".self_attn.kv_b_proj.weight").replace("attn_kv_b", "attn_v_b")
+                # More robust: directly construct blk.N names
+                # Fallback to explicit blk naming if replace fails
+                if "attn_kv_b" in k_name:
+                    # already correct
+                    pass
+                else:
+                    # Try to map via known pattern: for GLM5Next, kv_b -> k_b/v_b
+                    # Use regex to extract bid
+                    import re as _re
+
+                    m = _re.search(r"\.layers\.(\d+)\.", normalized)
+                    if m:
+                        bid = int(m.group(1))
+                        k_name = f"blk.{bid}.attn_k_b.weight"
+                        v_name = f"blk.{bid}.attn_v_b.weight"
+                # The split outputs are BF16 and must preserve their source bits.
+                k_np = k_b.contiguous().view(torch.uint16).numpy()
+                v_np = v_b.contiguous().view(torch.uint16).numpy()
+                records.append({
+                    "name": k_name,
+                    "source_dtype": local_tensor.dtype,
+                    "source_type": gguf.GGMLQuantizationType.BF16,
+                    "shape": tuple(k_b.shape),
+                    "kind": "eager_bf16",
+                    "data": k_np,
+                })
+                records.append({
+                    "name": v_name,
+                    "source_dtype": local_tensor.dtype,
+                    "source_type": gguf.GGMLQuantizationType.BF16,
+                    "shape": tuple(v_b.shape),
+                    "kind": "eager_bf16",
+                    "data": v_np,
+                })
+                consumed.add(normalized)
+                continue
+
             output_name = self._direct_output_name(normalized)
             if local_tensor.dtype in fp8_types:
                 source = fp8_source(normalized)
@@ -314,6 +396,12 @@ class Glm5NextModel(GlmMoeDsaModel):
                         f"recipe changes non-FP8 tensor {plan.name} from {record['source_type'].name} "
                         f"to {plan.target_type.name}; direct re-quantization of F16/BF16/F32 is not implemented")
                 self.gguf_writer.add_tensor(plan.name, record["data"].lazy_storage(), raw_dtype=plan.target_type)
+            elif record["kind"] == "eager_bf16":
+                if plan.target_type != record["source_type"]:
+                    raise DirectQuantError(
+                        f"recipe changes eager BF16 tensor {plan.name} from {record['source_type'].name} "
+                        f"to {plan.target_type.name}")
+                self.gguf_writer.add_tensor(plan.name, record["data"], raw_dtype=plan.target_type)
             elif record["kind"] == "transformed":
                 if plan.target_type != gguf.GGMLQuantizationType.F32:
                     raise DirectQuantError(
