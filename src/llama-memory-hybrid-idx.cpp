@@ -343,6 +343,45 @@ void llama_memory_hybrid_idx::state_write(llama_io_write_i & io, llama_seq_id se
     }
 }
 
+void llama_memory_hybrid_idx::state_write_range(
+        llama_io_write_i & io,
+        llama_seq_id seq_id,
+        llama_pos p0,
+        llama_pos p1,
+        llama_state_seq_flags flags) const {
+    llama_memory_hybrid::state_write_range(io, seq_id, p0, p1, flags);
+
+    // The indexer mirrors attention KV and therefore follows the same range.
+    // QSA history is a summary of the complete prefix, so the tip delta carries
+    // it whole and state_read() replaces the previous history with it.
+    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+        if (mem_idx) {
+            mem_idx->state_write_range(io, seq_id, p0, p1, flags);
+        }
+
+        uint32_t n_histories = 0;
+        if (seq_id < 0) {
+            n_histories = (uint32_t) qsa_histories.size();
+        } else if (qsa_histories.count(seq_id) != 0) {
+            n_histories = 1;
+        }
+        io.write(&n_histories, sizeof(n_histories));
+
+        for (const auto & item : qsa_histories) {
+            if (seq_id >= 0 && item.first != seq_id) {
+                continue;
+            }
+
+            io.write(&item.first, sizeof(item.first));
+            const uint64_t n_tokens = item.second.size();
+            io.write(&n_tokens, sizeof(n_tokens));
+            for (const auto & token : item.second) {
+                io.write(token.pos.data(), sizeof(token.pos));
+            }
+        }
+    }
+}
+
 void llama_memory_hybrid_idx::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
     // note: repeats llama_memory_hybrid::state_read
     // the indexer needs the attention cache's cells, and a half-failed restore must leave all three caches alike
