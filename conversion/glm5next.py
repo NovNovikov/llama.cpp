@@ -9,7 +9,14 @@ from torch import Tensor
 import gguf
 
 from .base import LazyTorchTensor, ModelBase, logger
-from .direct_quant import DirectQuantError, DirectStorageTensor, FP8ExpertTensor, FP8ScaledTensor, GGMLChunkQuantizer
+from .direct_quant import (
+    DirectQuantError,
+    DirectStorageExpertTensor,
+    DirectStorageTensor,
+    FP8ExpertTensor,
+    FP8ScaledTensor,
+    GGMLChunkQuantizer,
+)
 from .direct_recipe import (
     DirectModelDescriptor,
     DirectQuantRecipe,
@@ -211,18 +218,31 @@ class Glm5NextModel(GlmMoeDsaModel):
                     f"direct FP8 experts for layer {bid} {projection} are incomplete; "
                     f"expected {n_experts}, found {sorted(entries)}")
             ordered_names = [entries[eid] for eid in range(n_experts)]
-            if any(by_normalized[name][1].dtype not in fp8_types for name in ordered_names):
-                raise DirectQuantError(
-                    f"direct expert layer {bid} {projection} mixes non-FP8 source weights")
+            dtypes = {by_normalized[name][1].dtype for name in ordered_names}
             merged_name = f"model.layers.{bid}.mlp.experts.{projection}.weight"
-            records.append({
-                "name": self._direct_output_name(merged_name),
-                "source_dtype": "FP8",
-                "source_type": gguf.GGMLQuantizationType.Q8_0,
-                "shape": (n_experts, *fp8_source(ordered_names[0]).shape),
-                "kind": "experts",
-                "data": FP8ExpertTensor([fp8_source(name) for name in ordered_names]),
-            })
+            if dtypes <= set(fp8_types):
+                records.append({
+                    "name": self._direct_output_name(merged_name),
+                    "source_dtype": "FP8",
+                    "source_type": gguf.GGMLQuantizationType.Q8_0,
+                    "shape": (n_experts, *fp8_source(ordered_names[0]).shape),
+                    "kind": "experts",
+                    "data": FP8ExpertTensor([fp8_source(name) for name in ordered_names]),
+                })
+            elif len(dtypes) == 1 and next(iter(dtypes)) in DirectStorageTensor._DTYPES:
+                storage_experts = [DirectStorageTensor(by_normalized[name][1]) for name in ordered_names]
+                expert_tensor = DirectStorageExpertTensor(storage_experts)
+                records.append({
+                    "name": self._direct_output_name(merged_name),
+                    "source_dtype": next(iter(dtypes)),
+                    "source_type": expert_tensor.ggml_type,
+                    "shape": expert_tensor.shape,
+                    "kind": "storage_experts",
+                    "data": expert_tensor,
+                })
+            else:
+                raise DirectQuantError(
+                    f"direct expert layer {bid} {projection} has inconsistent source dtypes {sorted(dtypes)}")
             consumed.update(ordered_names)
 
         for normalized, (source_name, local_tensor) in by_normalized.items():

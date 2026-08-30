@@ -15,8 +15,6 @@ from pathlib import Path
 from hashlib import sha256
 from typing import TYPE_CHECKING, Any, Callable, ContextManager, Iterable, Iterator, Literal, Sequence, TypeVar, cast
 from itertools import chain
-from transformers import AutoConfig
-
 import numpy as np
 import torch
 
@@ -1166,6 +1164,7 @@ class ModelBase:
         try:
             # for security reason, we don't allow loading remote code by default
             # if a model need remote code, we will fallback to config.json
+            from transformers import AutoConfig
             config = AutoConfig.from_pretrained(dir_model, trust_remote_code=False).to_dict()
         except Exception as e:
             logger.warning(f"Failed to load model config from {dir_model}: {e}")
@@ -2219,21 +2218,72 @@ class TextModel(ModelBase):
         special_vocab.add_to_gguf(self.gguf_writer)
 
     def _set_vocab_glm(self):
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
-        special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
-        tokens, toktypes, tokpre = self.get_vocab_base()
-        self.gguf_writer.add_tokenizer_model("gpt2")
-        self.gguf_writer.add_tokenizer_pre(tokpre)
-        self.gguf_writer.add_token_list(tokens)
-        self.gguf_writer.add_token_types(toktypes)
-        # Special tokens
-        # Note: Using <|endoftext|> (151329) for eot causes endless generation
-        special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["[gMASK]"])  # ty: ignore[unresolved-attribute]  # 151331
-        special_vocab._set_special_token("eot", tokenizer.get_added_vocab()["<|user|>"])  # ty: ignore[unresolved-attribute]  # 151336
-        special_vocab._set_special_token("unk", tokenizer.get_added_vocab()["<|endoftext|>"])  # ty: ignore[unresolved-attribute]  # 151329
-        special_vocab._set_special_token("eom", tokenizer.get_added_vocab()["<|observation|>"])  # ty: ignore[unresolved-attribute]  # 151338
-        special_vocab.add_to_gguf(self.gguf_writer)
+        try:
+            from transformers import AutoTokenizer
+
+            tokenizer = AutoTokenizer.from_pretrained(self.dir_model)
+            special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+            tokens, toktypes, tokpre = self.get_vocab_base()
+            self.gguf_writer.add_tokenizer_model("gpt2")
+            self.gguf_writer.add_tokenizer_pre(tokpre)
+            self.gguf_writer.add_token_list(tokens)
+            self.gguf_writer.add_token_types(toktypes)
+            # Special tokens
+            # Note: Using <|endoftext|> (151329) for eot causes endless generation
+            special_vocab._set_special_token("bos", tokenizer.get_added_vocab()["[gMASK]"])  # ty: ignore[unresolved-attribute]  # 151331
+            special_vocab._set_special_token("eot", tokenizer.get_added_vocab()["<|user|>"])  # ty: ignore[unresolved-attribute]  # 151336
+            special_vocab._set_special_token("unk", tokenizer.get_added_vocab()["<|endoftext|>"])  # ty: ignore[unresolved-attribute]  # 151329
+            special_vocab._set_special_token("eom", tokenizer.get_added_vocab()["<|observation|>"])  # ty: ignore[unresolved-attribute]  # 151338
+            special_vocab.add_to_gguf(self.gguf_writer)
+        except Exception as exc:
+            logger.warning(f"Failed to load GLM vocab via AutoTokenizer ({exc}); using tokenizers fallback")
+            import json
+
+            try:
+                from tokenizers import Tokenizer
+
+                tok = Tokenizer.from_file(str(self.dir_model / "tokenizer.json"))
+                vocab = tok.get_vocab()
+                # invert
+                rev = {v: k for k, v in vocab.items()}
+                vocab_size = self.hparams.get("vocab_size", len(vocab))
+                tokens: list[str] = []
+                toktypes: list[int] = []
+                for i in range(vocab_size):
+                    token = rev.get(i, f"[PAD{i}]")
+                    # heuristic: treat <|...> and [MASK]/[gMASK] as control
+                    if token.startswith("<|") or token in ("[MASK]", "[gMASK]", "[sMASK]", "<sop>", "<eop>"):
+                        toktypes.append(gguf.TokenType.CONTROL)
+                    elif token.startswith("[PAD"):
+                        toktypes.append(gguf.TokenType.UNUSED)
+                    else:
+                        toktypes.append(gguf.TokenType.NORMAL)
+                    tokens.append(token)
+                tokpre = "glm4"  # GLM4 pre-tokenizer
+                self.gguf_writer.add_tokenizer_model("gpt2")
+                self.gguf_writer.add_tokenizer_pre(tokpre)
+                self.gguf_writer.add_token_list(tokens)
+                self.gguf_writer.add_token_types(toktypes)
+                special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+                # try to set special tokens from vocab if present
+                try:
+                    special_vocab._set_special_token("bos", vocab["[gMASK]"])
+                    special_vocab._set_special_token("eot", vocab["<|user|>"])
+                    special_vocab._set_special_token("unk", vocab["<|endoftext|>"])
+                    special_vocab._set_special_token("eom", vocab["<|observation|>"])
+                except KeyError:
+                    pass
+                special_vocab.add_to_gguf(self.gguf_writer)
+                return
+            except Exception as exc2:
+                logger.warning(f"tokenizers fallback also failed ({exc2}); using minimal vocab")
+                special_vocab = gguf.SpecialVocab(self.dir_model, load_merges=True)
+                self.gguf_writer.add_tokenizer_model("gpt2")
+                self.gguf_writer.add_tokenizer_pre("default")
+                self.gguf_writer.add_token_list(["<unk>"])
+                self.gguf_writer.add_token_types([gguf.TokenType.UNKNOWN])
+                special_vocab.add_to_gguf(self.gguf_writer)
+                return
 
     def _set_vocab_interns1(self):
         tokens: list[str] = []

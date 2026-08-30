@@ -76,6 +76,50 @@ class DirectStorageTensor:
             chunks.append(load_chunk)
         return gguf.LazyChunkedTensor(chunks, self.shape, self.dtype)
 
+    def _load_float_rows(self, row_start: int, row_end: int) -> np.ndarray:
+        if len(self.shape) != 2:
+            raise DirectQuantError(
+                f"direct native quantization requires a matrix, got shape {self.shape}")
+        rows, cols = self.shape
+        if row_start < 0 or row_start >= row_end or row_end > rows:
+            raise DirectQuantError(f"invalid direct tensor row range [{row_start}, {row_end}) for {self.shape}")
+        raw = np.memmap(
+            self.tensor.data_range.filename,
+            mode="r",
+            offset=self.tensor.data_range.offset + row_start * cols * self.dtype.itemsize,
+            dtype=self.dtype,
+            shape=(row_end - row_start, cols),
+        )
+        if self.ggml_type == gguf.GGMLQuantizationType.BF16:
+            return (raw.astype(np.uint32) << 16).view(np.float32)
+        return raw.astype(np.float32)
+
+    def lazy_quantized(
+        self,
+        quantizer: GGMLChunkQuantizer,
+        qtype: gguf.GGMLQuantizationType,
+        *,
+        rows_per_chunk: int = 128,
+    ) -> gguf.LazyChunkedTensor:
+        if len(self.shape) != 2:
+            raise DirectQuantError(
+                f"direct native quantization requires a matrix, got shape {self.shape}")
+        try:
+            byte_shape = gguf.quant_shape_to_byte_shape(self.shape, qtype)
+        except ValueError as exc:
+            raise DirectQuantError(
+                f"cannot directly quantize tensor shape {self.shape} as {qtype.name}: {exc}") from exc
+        rows, _ = self.shape
+        chunks: list[Callable[[], np.ndarray]] = []
+        for row_start in range(0, rows, rows_per_chunk):
+            row_end = min(rows, row_start + rows_per_chunk)
+
+            def load_chunk(start: int = row_start, end: int = row_end) -> np.ndarray:
+                return quantizer.quantize_rows(self._load_float_rows(start, end), qtype)
+
+            chunks.append(load_chunk)
+        return gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8)
+
 
 class GGMLChunkQuantizer:
     """Thin checked binding to ggml_quantize_chunk()."""
@@ -175,6 +219,7 @@ class FP8ScaledTensor:
     """
 
     _FP8_TORCH_DTYPES = {
+        "F8_E4M3": "float8_e4m3fn",
         "F8_E4M3FN": "float8_e4m3fn",
         "F8_E4M3FNUZ": "float8_e4m3fnuz",
         "F8_E5M2": "float8_e5m2",
@@ -401,4 +446,60 @@ class FP8ExpertTensor:
 
                 chunks.append(load_chunk)
 
+        return gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8)
+
+
+class DirectStorageExpertTensor:
+    """Stack local F16/BF16/F32 experts without materializing the 3D tensor."""
+
+    def __init__(self, experts: list[DirectStorageTensor]) -> None:
+        if not experts:
+            raise DirectQuantError("direct storage expert tensor has no experts")
+        shape = experts[0].shape
+        ggml_type = experts[0].ggml_type
+        if any(expert.shape != shape or expert.ggml_type != ggml_type for expert in experts[1:]):
+            raise DirectQuantError("direct storage experts have inconsistent shapes or source types")
+        self.experts = experts
+        self.expert_shape = shape
+        self.ggml_type = ggml_type
+
+    @property
+    def shape(self) -> tuple[int, ...]:
+        return (len(self.experts), *self.expert_shape)
+
+    def lazy_storage(self) -> gguf.LazyChunkedTensor:
+        chunks: list[Callable[[], np.ndarray]] = []
+        for expert in self.experts:
+            chunks.extend(expert.lazy_storage()._chunks)
+        return gguf.LazyChunkedTensor(chunks, self.shape, self.experts[0].dtype)
+
+    def lazy_quantized(
+        self,
+        quantizer: GGMLChunkQuantizer,
+        qtype: gguf.GGMLQuantizationType,
+        *,
+        rows_per_chunk: int = 128,
+    ) -> gguf.LazyChunkedTensor:
+        if len(self.expert_shape) != 2:
+            raise DirectQuantError(
+                f"direct native expert quantization requires matrices, got shape {self.expert_shape}")
+        try:
+            byte_shape = gguf.quant_shape_to_byte_shape(self.shape, qtype)
+        except ValueError as exc:
+            raise DirectQuantError(
+                f"cannot directly quantize expert tensor shape {self.shape} as {qtype.name}: {exc}") from exc
+        rows, _ = self.expert_shape
+        chunks: list[Callable[[], np.ndarray]] = []
+        for expert in self.experts:
+            for row_start in range(0, rows, rows_per_chunk):
+                row_end = min(rows, row_start + rows_per_chunk)
+
+                def load_chunk(
+                    source: DirectStorageTensor = expert,
+                    start: int = row_start,
+                    end: int = row_end,
+                ) -> np.ndarray:
+                    return quantizer.quantize_rows(source._load_float_rows(start, end), qtype)
+
+                chunks.append(load_chunk)
         return gguf.LazyChunkedTensor(chunks, byte_shape, np.uint8)
