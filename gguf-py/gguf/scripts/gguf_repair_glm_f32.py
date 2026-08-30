@@ -91,6 +91,7 @@ def raw_tensor_copy(
     if bytes_per_chunk <= 0:
         raise ValueError("bytes_per_chunk must be positive")
 
+    source_dtype = tensor.data.dtype
     chunks = []
     for start in range(0, tensor.n_bytes, bytes_per_chunk):
         count = min(bytes_per_chunk, tensor.n_bytes - start)
@@ -101,11 +102,11 @@ def raw_tensor_copy(
                 data = f.read(length)
             if len(data) != length:
                 raise ValueError(f"short read while copying {tensor.name}")
-            return np.frombuffer(data, dtype=np.uint8).copy()
+            return np.frombuffer(data, dtype=source_dtype).copy()
 
         chunks.append(load_chunk)
 
-    return gguf.LazyChunkedTensor(chunks, tuple(int(d) for d in tensor.data.shape), np.uint8)
+    return gguf.LazyChunkedTensor(chunks, tuple(int(d) for d in tensor.data.shape), source_dtype)
 
 
 def main() -> None:
