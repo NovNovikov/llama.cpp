@@ -507,7 +507,42 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
 
     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
-    return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
+
+    // GLM-4.7/5.x may transition directly from reasoning to a native
+    // <tool_call> without first emitting </think>. Treat the tool marker as an
+    // implicit reasoning terminator only for the GLM tagged-argument wire format.
+    auto reasoning_parser = ctx.reasoning_parser;
+    const bool is_glm47_tagged =
+        ctx.extracting_reasoning &&
+        ctx.reasoning != nullptr &&
+        (ctx.reasoning->mode == reasoning_mode::TAG_BASED ||
+         ctx.reasoning->mode == reasoning_mode::TOOLS_ONLY) &&
+        trim_whitespace(ctx.reasoning->end) == "</think>" &&
+        trigger_marker == "<tool_call>" &&
+        arguments.name_prefix == "<arg_key>" &&
+        arguments.name_suffix == "</arg_key>" &&
+        arguments.value_prefix == "<arg_value>" &&
+        arguments.value_suffix == "</arg_value>";
+
+    if (is_glm47_tagged) {
+        const std::string reasoning_start = trim_whitespace(ctx.reasoning->start);
+        const std::string reasoning_end   = trim_whitespace(ctx.reasoning->end);
+
+        auto reasoning_body =
+            p.reasoning(p.until_one_of({ reasoning_end, trigger_marker }));
+        auto reasoning_close =
+            p.optspace(reasoning_end) | p.peek(p.literal(trigger_marker));
+
+        if (!reasoning_start.empty()) {
+            reasoning_parser =
+                p.optional(p.optspace(reasoning_start) + reasoning_body + reasoning_close);
+        } else {
+            reasoning_parser =
+                p.optional(reasoning_body + reasoning_close);
+        }
+    }
+
+    return reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
 }
 
 }  // namespace autoparser
