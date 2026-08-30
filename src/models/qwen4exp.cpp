@@ -527,7 +527,7 @@ public:
     const uint32_t block_topk;
 };
 
-ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
+llama_model_qwen4exp::graph::qsa_selection llama_model_qwen4exp::graph::build_qsa_selection(
         const llama_memory_hybrid_idx_context * mctx_hyb,
         ggml_tensor *                           cur,
         ggml_tensor *                           inp_pos,
@@ -590,7 +590,9 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
 
     const ggml_type activation_type = mctx_idx->type_k();
     std::vector<ggml_tensor *> selected_streams;
+    std::vector<ggml_tensor *> selected_cells_streams;
     selected_streams.reserve(n_stream);
+    selected_cells_streams.reserve(n_stream);
 
     for (int64_t is = 0; is < n_stream; ++is) {
         ggml_tensor * cache = ggml_view_2d(ctx0, k_all, idx_dim, n_kv,
@@ -659,6 +661,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
         ggml_tensor * selected_stream = ggml_clamp(
                 ctx0, ggml_add(ctx0, base_selected, selected_top), 0.0f, 1.0f);
         selected_streams.push_back(ggml_reshape_2d(ctx0, selected_stream, n_kv, n_tps));
+
+        // The host input marks only the incomplete tail.  The top blocks come from the
+        // indexer, and top_k supplies harmless padding indices when the tail is shorter.
+        if (r > 1) {
+            ggml_tensor * tail_cells = ggml_top_k(
+                    ctx0, ggml_reshape_2d(ctx0, base_selected, n_kv, n_tps), r - 1);
+            selected_cells_streams.push_back(ggml_concat(ctx0, top_cells, tail_cells, 0));
+        } else {
+            selected_cells_streams.push_back(top_cells);
+        }
     }
 
     ggml_tensor * selected = selected_streams[0];
@@ -676,7 +688,84 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_mask(
         mask = ggml_cast(ctx0, mask, GGML_TYPE_F16);
     }
     cb(mask, "qsa_mask", il);
-    return mask;
+
+    ggml_tensor * selected_cells = selected_cells_streams[0];
+    for (int64_t is = 1; is < n_stream; ++is) {
+        selected_cells = ggml_concat(ctx0, selected_cells, selected_cells_streams[is], 1);
+    }
+    selected_cells = ggml_reshape_4d(ctx0, selected_cells, r*block_topk + r - 1, n_tps, 1, n_stream);
+    cb(selected_cells, "qsa_cells", il);
+
+    return { mask, selected_cells };
+}
+
+ggml_tensor * llama_model_qwen4exp::graph::build_attn_qsa_gather(
+        llm_graph_input_attn_kv * inp,
+                    ggml_tensor * q_cur,
+                    ggml_tensor * k_cur,
+                    ggml_tensor * v_cur,
+                    ggml_tensor * selected_cells,
+                    ggml_tensor * selected_mask,
+                          float   kq_scale,
+                            int   il) {
+    if (inp->self_k_rot) {
+        q_cur = llama_mul_mat_hadamard(ctx0, q_cur, inp->self_k_rot);
+        k_cur = llama_mul_mat_hadamard(ctx0, k_cur, inp->self_k_rot);
+    }
+
+    if (inp->self_v_rot) {
+        v_cur = llama_mul_mat_hadamard(ctx0, v_cur, inp->self_v_rot);
+    }
+
+    // Keep these nodes adjacent, as the normal cached-attention path does.
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+    ggml_build_forward_expand(gf, mctx_cur->cpy_v(ctx0, v_cur, inp->get_v_idxs(), il));
+
+    const int64_t width    = selected_cells->ne[0];
+    const int64_t n_tps    = selected_cells->ne[1];
+    const int64_t n_stream = selected_cells->ne[3];
+    const int64_t n_q      = n_tps*n_stream;
+
+    ggml_tensor * k_all = mctx_cur->get_k(ctx0, il);
+    ggml_tensor * v_all = mctx_cur->get_v(ctx0, il);
+    const int64_t n_kv = k_all->ne[2];
+
+    // One gather row is all heads of one cache cell.  Each query gets its own window.
+    ggml_tensor * k_cells = ggml_view_3d(ctx0, k_all, k_all->ne[0]*k_all->ne[1], n_kv, n_stream,
+            k_all->nb[2], k_all->nb[3], 0);
+    ggml_tensor * v_cells = ggml_view_3d(ctx0, v_all, v_all->ne[0]*v_all->ne[1], n_kv, n_stream,
+            v_all->nb[2], v_all->nb[3], 0);
+    ggml_tensor * idx_stream = ggml_reshape_2d(ctx0, selected_cells, width*n_tps, n_stream);
+
+    ggml_tensor * k_sel = ggml_get_rows(ctx0, k_cells, idx_stream);
+    ggml_tensor * v_sel = ggml_get_rows(ctx0, v_cells, idx_stream);
+    k_sel = ggml_reshape_4d(ctx0, k_sel, k_all->ne[0], k_all->ne[1], width, n_q);
+    v_sel = ggml_reshape_4d(ctx0, v_sel, v_all->ne[0], v_all->ne[1], width, n_q);
+    cb(k_sel, "qsa_k_sel", il);
+    cb(v_sel, "qsa_v_sel", il);
+
+    // selected_mask already combines the causal/reach mask with the QSA selection.  Gathering
+    // it preserves those semantics and makes tail padding remain unreachable.
+    ggml_tensor * mask_cells = ggml_view_3d(ctx0, selected_mask, 1, n_kv, n_q,
+            selected_mask->nb[0], selected_mask->nb[1], 0);
+    ggml_tensor * idx_query = ggml_reshape_3d(ctx0, selected_cells, width, n_q, 1);
+    ggml_tensor * mask = ggml_get_rows(ctx0, mask_cells, idx_query);
+    mask = ggml_cast(ctx0, ggml_reshape_4d(ctx0, mask, width, 1, 1, n_q), GGML_TYPE_F16);
+    cb(mask, "qsa_mask_sel", il);
+
+    ggml_tensor * cur = build_attn_mha(q_cur, k_sel, v_sel, nullptr, mask, nullptr, nullptr, kq_scale, il);
+    cb(cur, "kqv_out", il);
+
+    if (inp->self_v_rot) {
+        cur = llama_mul_mat_hadamard(ctx0, cur, inp->self_v_rot);
+    }
+
+    return cur;
 }
 
 ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
@@ -700,9 +789,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
     const int64_t ratio = hparams.dsv4_compress_ratios[il];
     const bool qsa = mctx_idx && ratio > 0 &&
             mctx_idx->get_n_kv() > (int64_t) hparams.indexer_top_k + ratio - 1;
+    qsa_selection selection = {};
     if (qsa) {
-        inp->self_kq_mask_cnv = build_qsa_mask(
-                mctx_hyb, cur, inp_pos, inp->self_kq_mask, sections, il);
+        selection = build_qsa_selection(mctx_hyb, cur, inp_pos, inp->self_kq_mask, sections, il);
+        inp->self_kq_mask_cnv = selection.mask;
     } else {
         inp->self_kq_mask_cnv = inp->self_kq_mask;
     }
@@ -757,9 +847,16 @@ ggml_tensor * llama_model_qwen4exp::graph::build_layer_attn(
 
     const float kq_scale = hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
 
-    cur = build_attn(inp,
-                nullptr, nullptr, nullptr,
-                Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    const int64_t qsa_width = qsa ? selection.cells->ne[0] : 0;
+    const int64_t qsa_tps   = qsa ? selection.cells->ne[1] : 0;
+    if (qsa && cparams.flash_attn && 4*qsa_tps*qsa_width < mctx_idx->get_n_kv()) {
+        cur = build_attn_qsa_gather(inp, Qcur, Kcur, Vcur,
+                selection.cells, selection.mask, kq_scale, il);
+    } else {
+        cur = build_attn(inp,
+                    nullptr, nullptr, nullptr,
+                    Qcur, Kcur, Vcur, nullptr, nullptr, nullptr, kq_scale, il);
+    }
     cb(cur, "attn_pregate", il);
 
     ggml_tensor * gate_sigmoid = ggml_sigmoid(ctx0, gate);

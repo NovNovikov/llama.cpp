@@ -560,7 +560,9 @@ void llama_memory_hybrid_idx::set_input_qsa(
             }
         }
 
-        const size_t selected_start = n_complete <= block_topk ? 0 : n_complete*ratio;
+        // The graph always obtains complete blocks from the indexer.  Keep this input solely
+        // for the incomplete tail, so the gather path can append it without duplicating rows.
+        const size_t selected_start = n_complete*ratio;
         for (size_t iv = selected_start; iv < visible.size(); ++iv) {
             selected_data[iq*n_kv + visible[iv].second] = 1.0f;
         }
