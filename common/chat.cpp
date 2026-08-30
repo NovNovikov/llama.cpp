@@ -1171,6 +1171,172 @@ static common_chat_params common_chat_params_init_ministral_3(const common_chat_
     return data;
 }
 
+// GLM-4.5/4.6/4.7/5.x native tagged tool-call format:
+//   <tool_call>function_name
+//   <arg_key>key</arg_key><arg_value>value</arg_value>
+//   </tool_call>
+//
+// Keep this specialized instead of routing it through the generic Jinja
+// autoparser. llama.cpp used a dedicated GLM parser before the generic
+// autoparser migration; the native format has a forced-open <think> and the
+// model may transition directly from reasoning into <tool_call>.
+static common_chat_params common_chat_params_init_glm_tagged(const common_chat_template &          tmpl,
+                                                             const autoparser::generation_params & inputs) {
+    common_chat_params data;
+
+    const std::string GEN_PREFIX      = "<|assistant|>";
+    const std::string THINK_START     = "<think>";
+    const std::string THINK_END       = "</think>";
+    const std::string TOOL_START      = "<tool_call>";
+    const std::string TOOL_END        = "</tool_call>";
+    const std::string ARG_KEY_START   = "<arg_key>";
+    const std::string ARG_KEY_END     = "</arg_key>";
+    const std::string ARG_VALUE_START = "<arg_value>";
+    const std::string ARG_VALUE_END   = "</arg_value>";
+
+    data.prompt            = common_chat_template_direct_apply_impl(tmpl, inputs);
+    data.generation_prompt = common_chat_template_generation_prompt_impl(tmpl, inputs);
+    data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
+    data.supports_thinking = true;
+
+    data.thinking_start_tag = THINK_START;
+    data.thinking_end_tags  = { THINK_END, TOOL_START };
+
+    data.preserved_tokens = {
+        THINK_START, THINK_END,
+        TOOL_START, TOOL_END,
+        ARG_KEY_START, ARG_KEY_END,
+        ARG_VALUE_START, ARG_VALUE_END,
+    };
+
+    data.additional_stops = {
+        "<|user|>",
+        "<|observation|>",
+    };
+
+    data.message_delimiters = {
+        { COMMON_CHAT_ROLE_ASSISTANT, GEN_PREFIX        },
+        { COMMON_CHAT_ROLE_USER,      "<|user|>"        },
+        { COMMON_CHAT_ROLE_SYSTEM,    "<|system|>"      },
+        { COMMON_CHAT_ROLE_TOOL,      "<|observation|>" },
+    };
+
+    const bool has_tools         = inputs.tools.is_array() && !inputs.tools.empty();
+    const bool extract_reasoning = inputs.reasoning_format != COMMON_REASONING_FORMAT_NONE;
+    const bool include_grammar   = has_tools && inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+
+    if (inputs.has_continuation()) {
+        const auto & msg = inputs.continue_msg;
+
+        data.generation_prompt = GEN_PREFIX + THINK_START + msg.reasoning_content;
+        if (inputs.continue_final_message == COMMON_CHAT_CONTINUATION_CONTENT) {
+            data.generation_prompt += THINK_END + msg.render_content();
+        }
+        data.prompt += data.generation_prompt;
+    }
+
+    auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
+        auto generation_prompt = p.literal(GEN_PREFIX);
+        auto end               = p.end();
+
+        auto reasoning = p.eps();
+        if (extract_reasoning) {
+            reasoning = p.optional(
+                p.optional(p.literal(THINK_START)) +
+                p.reasoning(p.until_one_of({ THINK_END, TOOL_START })) +
+                (p.literal(THINK_END) | p.peek(p.literal(TOOL_START))));
+        }
+
+        if (!has_tools || inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_NONE) {
+            return generation_prompt + reasoning + p.content(p.rest()) + end;
+        }
+
+        auto tool_choice = p.choice();
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const auto & function = tool.at("function");
+            const std::string name = function.at("name");
+            auto parameters = function.contains("parameters") ? function.at("parameters") : json::object();
+
+            auto schema_info = common_schema_info();
+            schema_info.resolve_refs(parameters);
+
+            std::vector<common_peg_parser> required_args;
+            std::vector<common_peg_parser> optional_args;
+
+            foreach_parameter(function, [&](const std::string & param_name, const json & param_schema, bool is_required) {
+                const std::string rule_name = "glm-tool-" + name + "-arg-" + param_name;
+
+                auto arg_close = p.tool_arg_close(p.literal(ARG_VALUE_END));
+                auto arg_value = schema_info.resolves_to_string(param_schema)
+                    ? p.ac(p.tool_arg_string_value(p.until(ARG_VALUE_END)) + arg_close, ARG_VALUE_END)
+                    : p.tool_arg_json_value(
+                          p.schema(p.json(), rule_name + "-schema", param_schema, false)) + arg_close;
+
+                auto arg = p.rule(
+                    rule_name,
+                    p.space() +
+                    p.tool_arg(
+                        p.tool_arg_open(
+                            p.literal(ARG_KEY_START) +
+                            p.tool_arg_name(p.literal(param_name)) +
+                            p.literal(ARG_KEY_END) +
+                            p.space() +
+                            p.literal(ARG_VALUE_START)) +
+                        arg_value));
+
+                (is_required ? required_args : optional_args).push_back(arg);
+            });
+
+            auto args = p.permute("glm-tool-" + name + "-args", required_args);
+            if (!optional_args.empty()) {
+                args = args + p.zero_or_more(p.choice(optional_args));
+            }
+
+            auto call = p.tool(
+                p.tool_open(
+                    p.literal(TOOL_START) +
+                    p.space() +
+                    p.tool_name(p.literal(name))) +
+                p.tool_args(args) +
+                p.space() +
+                p.tool_close(p.literal(TOOL_END)));
+
+            tool_choice |= p.rule("glm-tool-" + name, call);
+        });
+
+        const int min_calls = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED ? 1 : 0;
+        const int max_calls = inputs.parallel_tool_calls ? -1 : 1;
+        auto tool_calls = p.trigger_rule(
+            "glm-tool-call",
+            p.repeat(tool_choice + p.space(), min_calls, max_calls));
+
+        auto content_before_tools = p.content(p.until(TOOL_START));
+        return generation_prompt + reasoning + content_before_tools + tool_calls + end;
+    });
+
+    data.parser = parser.save();
+
+    if (include_grammar) {
+        data.grammar_lazy = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_AUTO;
+        data.grammar = build_grammar([&](const common_grammar_builder & builder) {
+            foreach_function(inputs.tools, [&](const json & tool) {
+                const auto & function = tool.at("function");
+                auto schema = function.contains("parameters") ? function.at("parameters") : json::object();
+                builder.resolve_refs(schema);
+            });
+            parser.build_grammar(builder, data.grammar_lazy);
+        });
+
+        if (data.grammar_lazy) {
+            data.grammar_triggers = {
+                { COMMON_GRAMMAR_TRIGGER_TYPE_WORD, TOOL_START },
+            };
+        }
+    }
+
+    return data;
+}
+
 static common_chat_params common_chat_params_init_qwen3_coder(const common_chat_template &          tmpl,
                                                               const autoparser::generation_params & inputs) {
     common_chat_params data;
@@ -3815,6 +3981,14 @@ std::optional<common_chat_params> common_chat_try_specialized_template(
         src.find("<|tool_arg:value|>") != std::string::npos) {
         LOG_DBG("Using specialized template: Solar Open 2\n");
         return common_chat_params_init_solar_open2(tmpl, params);
+    }
+
+    if (src.find("[gMASK]<sop>") != std::string::npos &&
+        src.find("<tool_call>") != std::string::npos &&
+        src.find("<arg_key>") != std::string::npos &&
+        src.find("<arg_value>") != std::string::npos) {
+        LOG_DBG("Using specialized template: GLM tagged tools\n");
+        return common_chat_params_init_glm_tagged(tmpl, params);
     }
 
     // Qwen3-Coder XML tool calls, also used by Nemotron Nano 3, Qwen3.5 and StepFun-3.5-Flash
