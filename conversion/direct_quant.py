@@ -76,6 +76,40 @@ class DirectStorageTensor:
             chunks.append(load_chunk)
         return gguf.LazyChunkedTensor(chunks, self.shape, self.dtype)
 
+    def lazy_float32(self, *, elements_per_chunk: int = 1 << 20) -> gguf.LazyChunkedTensor:
+        """Stream a storage tensor as F32 without materializing it as a whole.
+
+        Some GGUF runtime operations require F32 even when their source
+        safetensors weights use BF16 or F16.  The normal converter performs
+        that promotion before writing.  Direct conversion must do the same
+        while retaining its bounded-memory behavior.
+        """
+        if self.ggml_type == gguf.GGMLQuantizationType.F32:
+            return self.lazy_storage(elements_per_chunk=elements_per_chunk)
+        if elements_per_chunk <= 0:
+            raise DirectQuantError(
+                f"direct tensor elements_per_chunk must be positive, got {elements_per_chunk}")
+
+        n_elements = int(np.prod(self.shape, dtype=np.int64))
+        chunks: list[Callable[[], np.ndarray]] = []
+        for element_start in range(0, n_elements, elements_per_chunk):
+            n_elements_chunk = min(elements_per_chunk, n_elements - element_start)
+
+            def load_chunk(start: int = element_start, count: int = n_elements_chunk) -> np.ndarray:
+                raw = np.memmap(
+                    self.tensor.data_range.filename,
+                    mode="r",
+                    offset=self.tensor.data_range.offset + start * self.dtype.itemsize,
+                    dtype=self.dtype,
+                    shape=(count,),
+                )
+                if self.ggml_type == gguf.GGMLQuantizationType.BF16:
+                    return (raw.astype(np.uint32) << 16).view(np.float32)
+                return raw.astype(np.float32)
+
+            chunks.append(load_chunk)
+        return gguf.LazyChunkedTensor(chunks, self.shape, np.dtype("<f4"))
+
     def _load_float_rows(self, row_start: int, row_end: int) -> np.ndarray:
         if len(self.shape) != 2:
             raise DirectQuantError(

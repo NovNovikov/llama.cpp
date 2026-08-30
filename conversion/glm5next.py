@@ -141,6 +141,21 @@ class Glm5NextModel(GlmMoeDsaModel):
             name = "token_embd.weight"
         return self.map_tensor_name(name)
 
+    @staticmethod
+    def _direct_requires_f32(name: str, shape: tuple[int, ...]) -> bool:
+        """Mirror ModelBase's mandatory F32 policy for GLM-5.3 runtime ops."""
+        if len(shape) <= 1 or name.endswith("_norm.weight"):
+            return True
+        return (
+            name.endswith(".ffn_gate_inp.weight")
+            or name.endswith(".ffn_gate_inp_shexp.weight")
+            or name.endswith(".ssm_conv1d.weight")
+            or name.endswith(".ssm_conv1d_q.weight")
+            or name.endswith(".ssm_conv1d_k.weight")
+            or name.endswith(".ssm_conv1d_v.weight")
+            or name.endswith(".indexer.proj.weight")
+        )
+
     def _direct_model_descriptor(self) -> DirectModelDescriptor:
         hparams = self.hparams
         head_dim = int(hparams.get("head_dim", hparams["hidden_size"] // hparams["num_attention_heads"]))
@@ -361,12 +376,13 @@ class Glm5NextModel(GlmMoeDsaModel):
                 continue
 
             storage = DirectStorageTensor(local_tensor)
+            requires_f32 = self._direct_requires_f32(output_name, storage.shape)
             records.append({
                 "name": output_name,
                 "source_dtype": local_tensor.dtype,
-                "source_type": storage.ggml_type,
+                "source_type": gguf.GGMLQuantizationType.F32 if requires_f32 else storage.ggml_type,
                 "shape": storage.shape,
-                "kind": "storage",
+                "kind": "storage_f32" if requires_f32 else "storage",
                 "data": storage,
             })
             consumed.add(normalized)
@@ -390,12 +406,13 @@ class Glm5NextModel(GlmMoeDsaModel):
             logger.info("Direct quantization plan:\n%s", format_direct_plan(plans))
 
         for record, plan in zip(records, plans, strict=True):
-            if record["kind"] == "storage":
+            if record["kind"] in ("storage", "storage_f32"):
                 if plan.target_type != record["source_type"]:
                     raise DirectQuantError(
                         f"recipe changes non-FP8 tensor {plan.name} from {record['source_type'].name} "
                         f"to {plan.target_type.name}; direct re-quantization of F16/BF16/F32 is not implemented")
-                self.gguf_writer.add_tensor(plan.name, record["data"].lazy_storage(), raw_dtype=plan.target_type)
+                data = record["data"].lazy_float32() if record["kind"] == "storage_f32" else record["data"].lazy_storage()
+                self.gguf_writer.add_tensor(plan.name, data, raw_dtype=plan.target_type)
             elif record["kind"] == "eager_bf16":
                 if plan.target_type != record["source_type"]:
                     raise DirectQuantError(

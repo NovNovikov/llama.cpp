@@ -45,6 +45,20 @@ class TestFP8ScaledTensor(unittest.TestCase):
             self.assertEqual(lazy.shape, bits.shape)
             self.assertTrue(np.array_equal(restored, bits.reshape(-1)))
 
+    def test_storage_tensor_streams_bf16_as_float32(self):
+        direct_quant = load_direct_quant_module()
+        bits = np.array([[0x3F80, 0x4000], [0x4040, 0x4080]], dtype=np.uint16)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.bin"
+            source_path.write_bytes(bits.tobytes())
+            storage = direct_quant.DirectStorageTensor(
+                local_tensor(source_path, "BF16", bits.shape, 0, bits.nbytes))
+            lazy = storage.lazy_float32(elements_per_chunk=3)
+            restored = np.concatenate([chunk() for chunk in lazy._chunks])
+
+            self.assertEqual(lazy.dtype, np.dtype("<f4"))
+            self.assertTrue(np.array_equal(restored, np.array([1.0, 2.0, 3.0, 4.0], dtype=np.float32)))
+
     def test_writer_accepts_direct_encoded_shape(self):
         direct_quant = load_direct_quant_module()
         with tempfile.TemporaryDirectory() as directory:
