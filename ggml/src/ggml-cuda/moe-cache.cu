@@ -293,6 +293,7 @@ struct moe_cache_node {
 static std::mutex g_registry_mu;
 static std::unordered_set<moe_cache_session *> g_sessions;
 static std::atomic<int> g_session_count{0};
+static std::atomic<ggml_moe_cache_memory_report_callback> g_memory_report_callback = nullptr;
 struct moe_cache_physical_budget {
     int participants = 0;
     size_t reserve_bytes = 0;
@@ -338,6 +339,10 @@ static void moe_cache_bypass(
         moe_cache_atomic_max(g_scope_stats.max_bypass_ids, n_ids);
         moe_cache_atomic_max(g_scope_stats.max_bypass_tokens, n_tokens);
     }
+}
+
+static void moe_cache_set_memory_report_callback(ggml_moe_cache_memory_report_callback callback) {
+    g_memory_report_callback.store(callback, std::memory_order_release);
 }
 
 static size_t moe_cache_reclaim_session(
@@ -3046,6 +3051,12 @@ static size_t moe_cache_reclaim_session(
                 physical_device, reason ? reason : "unknown", before >> 20,
                 requested >> 20, released >> 20,
                 moe_cache_device_bytes(*selected) >> 20);
+        if (reason && strcmp(reason, "VRAM watchdog") == 0) {
+            const auto callback = g_memory_report_callback.load(std::memory_order_acquire);
+            if (callback) {
+                callback();
+            }
+        }
     }
     return released;
 }
@@ -3112,6 +3123,7 @@ void ggml_moe_cache_register(const void * owner) {
     ggml_moe_cache.collect = moe_cache_collect;
     ggml_moe_cache.end = moe_cache_end;
     ggml_moe_cache.bypass = moe_cache_bypass;
+    ggml_moe_cache.set_memory_report_callback = moe_cache_set_memory_report_callback;
     ggml_moe_cache.fused_begin = moe_cache_fused_begin;
     ggml_moe_cache.invalidate = moe_cache_invalidate;
 }

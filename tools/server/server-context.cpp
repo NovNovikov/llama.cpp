@@ -13,6 +13,7 @@
 #include "gguf.h"
 #include "llama-cpp.h"
 #include "../../src/llama-ext.h"
+#include "../../ggml/src/ggml-backend-moe-cache.h"
 #include "llama.h"
 #include "log.h"
 #include "sampling.h"
@@ -151,6 +152,26 @@ static void server_log_wddm_process_memory(uint64_t cuda_host_compute) {
         SRV_INF("memory: VRAM=%.2f MiB | RAM spill=%.2f MiB\n",
                 selected_local.CurrentUsage/MiB, ram_spill/MiB);
     }
+}
+
+static std::atomic<uint64_t> server_cuda_host_compute = 0;
+
+static void server_log_wddm_memory_report() {
+    server_log_wddm_process_memory(server_cuda_host_compute.load(std::memory_order_acquire));
+}
+
+static void server_log_runtime_memory_usage(
+        const llama_context * ctx_tgt,
+        const llama_context * ctx_dft) {
+    llama_memory_breakdown_data device;
+    llama_memory_breakdown_data host;
+    server_accumulate_runtime_memory_buffers(ctx_tgt, true, device, host);
+    if (ctx_dft) {
+        const bool shares_model = llama_get_model(ctx_dft) == llama_get_model(ctx_tgt);
+        server_accumulate_runtime_memory_buffers(ctx_dft, !shares_model, device, host);
+    }
+    server_cuda_host_compute.store(host.compute, std::memory_order_release);
+    server_log_wddm_memory_report();
 }
 #endif
 
@@ -2789,6 +2810,12 @@ private:
     }
 
     void destroy() {
+#if defined(_WIN32)
+        if (ggml_moe_cache.set_memory_report_callback) {
+            ggml_moe_cache.set_memory_report_callback(nullptr);
+        }
+        server_cuda_host_compute.store(0, std::memory_order_release);
+#endif
         spec.reset();
         spec_init.reset();
 
@@ -4787,15 +4814,11 @@ private:
             return false;
         }
 
-        llama_memory_breakdown_data device;
-        llama_memory_breakdown_data host;
-        server_accumulate_runtime_memory_buffers(ctx_tgt, true, device, host);
-        if (ctx_dft) {
-            const bool shares_model = llama_get_model(ctx_dft) == llama_get_model(ctx_tgt);
-            server_accumulate_runtime_memory_buffers(ctx_dft, !shares_model, device, host);
-        }
 #if defined(_WIN32)
-        server_log_wddm_process_memory(host.compute);
+        server_log_runtime_memory_usage(ctx_tgt, ctx_dft);
+        if (ggml_moe_cache.set_memory_report_callback) {
+            ggml_moe_cache.set_memory_report_callback(server_log_wddm_memory_report);
+        }
 #endif
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -4815,6 +4838,9 @@ private:
 
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
+#if defined(_WIN32)
+                server_log_runtime_memory_usage(ctx_tgt, ctx_dft);
+#endif
             };
 
             slot.callback_on_reset = [this](const server_slot & slot) {

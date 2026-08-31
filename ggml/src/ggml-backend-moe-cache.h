@@ -41,6 +41,8 @@ struct ggml_moe_cache_tensor_desc {
     int32_t type;
 };
 
+typedef void (*ggml_moe_cache_memory_report_callback)(void);
+
 enum ggml_moe_cache_mode {
     GGML_MOE_CACHE_MODE_UNSPECIFIED = -1,
     GGML_MOE_CACHE_MODE_OFF = 0,
@@ -95,6 +97,9 @@ struct ggml_moe_cache_api {
     // diagnostic-only and is not called from worker threads.
     void (*bypass)(enum ggml_moe_cache_bypass_reason reason,
                    int64_t n_ids, int64_t n_tokens);
+
+    // Invoked only after the VRAM watchdog actually releases cache memory.
+    void (*set_memory_report_callback)(ggml_moe_cache_memory_report_callback callback);
 
     // Dispatch one fused up * SwiGLU(gate) operation for rows whose two experts are resident.
     void * (*fused_begin)(const struct ggml_moe_cache_tensor_desc * up,
