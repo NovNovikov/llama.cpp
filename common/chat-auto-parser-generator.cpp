@@ -386,10 +386,12 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
     auto until_suffix = p.rule("until-suffix", p.until(arguments.value_suffix));
 
     common_peg_parser tool_choice = p.choice();
+    size_t            tagged_tool_index = 0;
 
     foreach_function(inputs.tools, [&](const json & tool) {
         const auto &          func       = tool.at("function");
         std::string           name       = func.at("name");
+        const std::string     args_rule_prefix = "tagged-tool-" + std::to_string(tagged_tool_index++);
         auto                  params     = func.contains("parameters") ? func.at("parameters") : json::object();
         const auto &          properties = params.contains("properties") ? params.at("properties") : json::object();
 
@@ -426,22 +428,71 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
             }
         }
 
-        // Build required arg sequence in definition order
-        common_peg_parser args_seq = p.eps();
-        for (size_t i = 0; i < required_parsers.size(); i++) {
-            if (i > 0) {
-                args_seq = args_seq + p.space();
-            }
-            args_seq = args_seq + required_parsers[i];
-        }
-
-        // Build optional args with flexible ordering
+        // Keep the original ordered parser as the runtime fast path. Most models follow the
+        // schema order, so normal calls pay essentially the pre-fix parsing cost.
+        common_peg_parser any_opt = p.eps();
         if (!optional_parsers.empty()) {
-            common_peg_parser any_opt = p.choice();
+            any_opt = p.choice();
             for (const auto & opt : optional_parsers) {
                 any_opt |= opt;
             }
-            args_seq = args_seq + p.repeat(p.space() + any_opt, 0, -1);
+        }
+
+        common_peg_parser ordered_args = p.eps();
+        for (size_t i = 0; i < required_parsers.size(); i++) {
+            if (i > 0) {
+                ordered_args = ordered_args + p.space();
+            }
+            ordered_args = ordered_args + required_parsers[i];
+        }
+        if (!optional_parsers.empty()) {
+            ordered_args = ordered_args + p.repeat(p.space() + any_opt, 0, -1);
+        }
+
+        common_peg_parser args_seq = ordered_args;
+
+        // Only build the relaxed parser when order can actually vary. It is a fallback for PEG
+        // parsing, while its compact named rule is also the sole GBNF representation. This avoids
+        // duplicating the ordered branch in the sampling grammar.
+        const bool needs_relaxed_order =
+            required_parsers.size() > 1 ||
+            (!required_parsers.empty() && !optional_parsers.empty());
+
+        if (needs_relaxed_order) {
+            common_peg_parser optional_run = p.space();
+
+            if (!optional_parsers.empty()) {
+                auto optional_choice = p.rule(args_rule_prefix + "-optional-arg", any_opt);
+                auto optional_run_impl =
+                    p.zero_or_more(p.space() + optional_choice) +
+                    p.space();
+
+                // This run is referenced from every required-argument permutation state. Naming it
+                // keeps the generated GBNF small instead of inlining the optional choice repeatedly.
+                optional_run = p.rule(args_rule_prefix + "-optional-run", optional_run_impl);
+            }
+
+            common_peg_parser relaxed_args = optional_run;
+            if (!required_parsers.empty()) {
+                std::vector<common_peg_parser> required_with_optional_tail;
+                required_with_optional_tail.reserve(required_parsers.size());
+                for (const auto & req : required_parsers) {
+                    required_with_optional_tail.push_back(req + optional_run);
+                }
+
+                relaxed_args = relaxed_args + p.permute(
+                    args_rule_prefix + "-required",
+                    required_with_optional_tail);
+            }
+
+            const std::string relaxed_rule_name = args_rule_prefix + "-args-any-order";
+            auto relaxed_rule = p.rule(relaxed_rule_name, relaxed_args);
+
+            // PEG: ordered branch first, relaxed fallback only on an actual order mismatch.
+            // GBNF: emit only the relaxed rule, which already contains the ordered case.
+            args_seq = p.gbnf(
+                p.choice({ ordered_args, relaxed_rule }),
+                relaxed_rule_name);
         }
 
         if (!arguments.start.empty()) {
@@ -507,6 +558,68 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
 
     std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
     auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
+
+    // A bare per-call marker can legitimately appear in ordinary model text (for example while
+    // discussing tool-call syntax). Keep the original until(marker) fast path and only do extra
+    // work when that exact marker is actually encountered.
+    //
+    // For the simple tagged layout used by GLM:
+    //
+    //   <tool_call>name<arg_key>...
+    //   <tool_call>name</tool_call>
+    //
+    // qualify the marker with a real tool name and the next structural tag. A false marker is
+    // consumed as content and scanning resumes at the next marker. No per-character lookahead is
+    // added: marker-free output still goes through the same common_peg_until_parser as before.
+    //
+    // Limit this to AUTO/lazy tool mode. In REQUIRED mode the parser root is also converted to
+    // non-lazy GBNF, where PEG lookahead is intentionally not represented.
+    const bool can_qualify_per_call_marker =
+        !require_tools &&
+        !trigger_marker.empty() &&
+        format.section_start.empty() &&
+        format.per_call_start == trigger_marker &&
+        function.name_prefix.empty() &&
+        function.name_suffix.empty() &&
+        function.args_separator.empty() &&
+        call_id.pos == call_id_position::NONE &&
+        arguments.start.empty() &&
+        arguments.end.empty() &&
+        !arguments.name_prefix.empty() &&
+        !format.per_call_end.empty();
+
+    if (can_qualify_per_call_marker) {
+        auto next_tag = p.choice({
+            p.literal(arguments.name_prefix),
+            p.literal(format.per_call_end),
+        });
+
+        auto valid_after_marker = p.choice();
+        foreach_function(inputs.tools, [&](const json & tool) {
+            const auto & func = tool.at("function");
+            const std::string name = func.at("name");
+            valid_after_marker |=
+                p.literal(name) +
+                p.space() +
+                p.peek(next_tag);
+        });
+
+        auto valid_tool_start =
+            p.literal(trigger_marker) +
+            p.space() +
+            valid_after_marker;
+
+        // At a real call, negate(valid_tool_start) fails without consuming the marker, leaving it
+        // for tool_calls. At a textual marker it succeeds, consumes only the marker, then returns
+        // immediately to the optimized until(marker) scanner.
+        auto false_marker = p.negate(valid_tool_start) + p.literal(trigger_marker);
+        auto content_chunk = p.until(trigger_marker);
+
+        content_before_tools =
+            content_chunk +
+            p.zero_or_more(false_marker + content_chunk);
+    }
+
     return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
 }
 
