@@ -82,6 +82,29 @@ static int32_t server_prompt_tail_batch_limit(int32_t remaining_tokens, int32_t 
     return n_batch;
 }
 
+static void server_log_runtime_memory_buffers(
+        const char * label,
+        const llama_context * ctx,
+        bool include_model) {
+    llama_memory_breakdown_data device;
+    llama_memory_breakdown_data host;
+
+    for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
+        auto & total = ggml_backend_buft_is_host(buft) ? host : device;
+        if (include_model) {
+            total.model += mb.model;
+        }
+        total.context += mb.context;
+        total.compute += mb.compute;
+    }
+
+    constexpr double MiB = 1024.0 * 1024.0;
+    SRV_INF("runtime known llama buffers [MiB] %s | device: model=%.2f context=%.2f compute=%.2f total=%.2f | host: model=%.2f context=%.2f compute=%.2f total=%.2f\n",
+            label,
+            device.model/MiB, device.context/MiB, device.compute/MiB, device.total()/MiB,
+            host.model/MiB, host.context/MiB, host.compute/MiB, host.total()/MiB);
+}
+
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
             (params.pooling_type != LLAMA_POOLING_TYPE_UNSPECIFIED && params.pooling_type != LLAMA_POOLING_TYPE_NONE)) {
@@ -1789,6 +1812,9 @@ struct server_slot {
 
         // note: callback_on_reset() must have run before this, see release()
         stats = {};
+        n_draft_total       = 0;
+        n_draft_accepted    = 0;
+        n_draft_verif_steps = 0;
         n_accepted_per_pos.clear();
 
         n_predict_max = -1;
@@ -4506,10 +4532,10 @@ private:
                 total_host_required += projected_extra_host_required;
 
                 // Match Task Manager's K (KiB) unit while retaining MiB for CLI readability.
-                SRV_INF("loaded server state requires %.0f K (%.2f MiB) of device memory (host excluded)\n",
+                SRV_INF("estimated known llama buffers use %.0f K (%.2f MiB) of device memory (excludes CUDA/WDDM overhead)\n",
                         total_gpu_required / 1024.0,
                         total_gpu_required / (1024.0 * 1024.0));
-                SRV_INF("loaded server state requires %.0f K (%.2f MiB) of host memory\n",
+                SRV_INF("estimated known llama buffers use %.0f K (%.2f MiB) of host memory\n",
                         total_host_required / 1024.0,
                         total_host_required / (1024.0 * 1024.0));
             } catch (const std::exception & e) {
@@ -4710,6 +4736,15 @@ private:
         if (!spec && params_base.speculative.has_synth()) {
             SRV_ERR("%s", "synthetic acceptance requires an initialized speculative decoding context\n");
             return false;
+        }
+
+        server_log_runtime_memory_buffers("target", ctx_tgt, true);
+        if (ctx_dft) {
+            const bool shares_model = llama_get_model(ctx_dft) == llama_get_model(ctx_tgt);
+            server_log_runtime_memory_buffers(
+                    shares_model ? "MTP incremental (shared model excluded)" : "draft",
+                    ctx_dft,
+                    !shares_model);
         }
 
         for (int i = 0; i < params_base.n_parallel; i++) {
@@ -6621,6 +6656,7 @@ private:
             auto & ckpt  = slot.spec_ckpt;
 
             slot.stats.n_draft_tokens += draft.size();
+            slot.n_draft_total       += draft.size();
 
             // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
             const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
@@ -7971,6 +8007,8 @@ private:
 
             slot.n_draft_accepted += n_accepted;
             slot.n_draft_verif_steps += 1;
+            slot.stats.n_draft_accepted    += n_accepted;
+            slot.stats.n_draft_verif_steps += 1;
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {
@@ -7999,6 +8037,17 @@ private:
                 // TODO: set result.probs
 
                 slot.stats.n_gen += 1;
+
+                if (slot.stats.n_gen == 1) {
+                    slot.stats.update_prompt_last();
+                    slot.t_print_last = t_now;
+                    slot.n_decoded_last = 0;
+                    slot.t_prompt_processing = (slot.t_start_generation - slot.t_start_process_prompt) / 1e3;
+                    slot.print_timings_pp();
+                    metrics.on_prompt_eval(slot);
+                }
+
+                slot.stats.update_gen_last();
 
                 if (!process_token(result, slot)) {
                     slot.print_timings();
