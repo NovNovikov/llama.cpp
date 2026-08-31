@@ -211,6 +211,133 @@ class Glm5NextModel(GlmMoeDsaModel):
             n_embd_head_v=int(hparams.get("v_head_dim", head_dim)),
         )
 
+    def _canonical_direct_manifest(
+        self,
+        by_normalized: dict[str, tuple[str, Any]],
+        fp8_types,
+        scale_for_weight: dict[str, str],
+    ) -> dict[str, tuple[tuple[str, ...], tuple[int, ...], gguf.GGMLQuantizationType]]:
+        """Describe ordinary GLM5Next transforms without loading tensor payloads.
+
+        This is deliberately separate from the direct writer records.  It is a
+        structural counterpart of the ordinary converter's expert merge, MLA
+        ``kv_b`` split, KDA rename/transform and final mandatory-F32 policy.
+        """
+        manifest: dict[str, tuple[tuple[str, ...], tuple[int, ...], gguf.GGMLQuantizationType]] = {}
+
+        def add(
+            output_name: str,
+            output_shape: tuple[int, ...],
+            source_type: gguf.GGMLQuantizationType,
+            source_names: tuple[str, ...],
+        ) -> None:
+            bid_match = re.search(r"\.layers\.(\d+)\.", source_names[0])
+            bid = int(bid_match.group(1)) if bid_match is not None else None
+            required_type = (
+                gguf.GGMLQuantizationType.F32
+                if self._direct_requires_f32(output_name, output_shape, bid)
+                else source_type
+            )
+            if output_name in manifest:
+                raise DirectQuantError(
+                    f"canonical GLM5Next manifest maps multiple sources to {output_name}: "
+                    f"{manifest[output_name][0]} and {source_names}")
+            manifest[output_name] = (source_names, output_shape, required_type)
+
+        expert_pattern = re.compile(
+            r"^model\.layers\.(\d+)\.mlp\.experts\.(\d+)\.(gate_proj|up_proj|down_proj)\.weight$")
+        experts: dict[tuple[int, str], dict[int, str]] = {}
+        for normalized in by_normalized:
+            match = expert_pattern.match(normalized)
+            if match is not None:
+                bid, eid, projection = int(match.group(1)), int(match.group(2)), match.group(3)
+                experts.setdefault((bid, projection), {})[eid] = normalized
+
+        consumed = set(scale_for_weight.values())
+        for (bid, projection), entries in sorted(experts.items()):
+            n_experts = int(self.hparams["n_routed_experts"])
+            expected = set(range(n_experts))
+            if set(entries) != expected:
+                raise DirectQuantError(
+                    f"canonical GLM5Next manifest has incomplete experts for layer {bid} {projection}: "
+                    f"expected {n_experts}, found {sorted(entries)}")
+            source_names = tuple(entries[eid] for eid in range(n_experts))
+            tensors = [by_normalized[name][1] for name in source_names]
+            shapes = {tuple(tensor.shape) for tensor in tensors}
+            dtypes = {tensor.dtype for tensor in tensors}
+            if len(shapes) != 1 or len(dtypes) != 1:
+                raise DirectQuantError(
+                    f"canonical GLM5Next manifest has inconsistent experts for layer {bid} {projection}")
+            source_type = (
+                gguf.GGMLQuantizationType.Q8_0
+                if dtypes <= set(fp8_types)
+                else DirectStorageTensor._GGML_TYPES.get(next(iter(dtypes)))
+            )
+            if source_type is None:
+                raise DirectQuantError(
+                    f"canonical GLM5Next manifest has unsupported expert dtype {next(iter(dtypes))}")
+            merged_name = f"model.layers.{bid}.mlp.experts.{projection}.weight"
+            add(
+                self._direct_output_name(merged_name),
+                (n_experts, *next(iter(shapes))),
+                source_type,
+                source_names,
+            )
+            consumed.update(source_names)
+
+        for normalized, (source_name, local_tensor) in by_normalized.items():
+            if normalized in consumed or expert_pattern.match(normalized) is not None:
+                continue
+
+            if normalized.endswith(".self_attn.kv_b_proj.weight"):
+                source_type = DirectStorageTensor._GGML_TYPES.get(local_tensor.dtype)
+                if source_type is None:
+                    raise DirectQuantError(
+                        f"canonical GLM5Next manifest has unsupported MLA dtype {local_tensor.dtype}")
+                for output_name, output_shape in self._direct_kv_b_outputs(source_name, local_tensor.shape):
+                    add(output_name, output_shape, source_type, (normalized,))
+                continue
+
+            source_type = (
+                gguf.GGMLQuantizationType.Q8_0
+                if local_tensor.dtype in fp8_types
+                else DirectStorageTensor._GGML_TYPES.get(local_tensor.dtype)
+            )
+            if source_type is None:
+                raise DirectQuantError(
+                    f"canonical GLM5Next manifest has unsupported tensor dtype {local_tensor.dtype} for {source_name}")
+            if normalized.endswith(".A_log"):
+                source_type = gguf.GGMLQuantizationType.F32
+            add(self._direct_output_name(normalized), tuple(local_tensor.shape), source_type, (normalized,))
+
+        return manifest
+
+    @staticmethod
+    def _validate_direct_structural_parity(canonical, records) -> None:
+        direct = {
+            record["name"]: (tuple(record["sources"]), record["shape"], record["source_type"])
+            for record in records
+        }
+        for output_name in sorted(set(canonical) | set(direct)):
+            expected = canonical.get(output_name)
+            actual = direct.get(output_name)
+            if expected == actual:
+                continue
+
+            expected_sources, expected_shape, expected_type = expected or (("<missing>",), ("<missing>",), "<missing>")
+            actual_sources, actual_shape, actual_type = actual or (("<missing>",), ("<missing>",), "<missing>")
+            expected_type_name = expected_type.name if expected is not None else expected_type
+            actual_type_name = actual_type.name if actual is not None else actual_type
+            raise DirectQuantError(
+                "direct structural parity failed\n"
+                f"source tensor(s): {', '.join(expected_sources if expected is not None else actual_sources)}\n"
+                f"canonical name: {output_name if expected is not None else '<missing>'}\n"
+                f"direct name: {output_name if actual is not None else '<missing>'}\n"
+                f"canonical shape: {expected_shape}\n"
+                f"direct shape: {actual_shape}\n"
+                f"canonical required storage: {expected_type_name}\n"
+                f"direct planned storage: {actual_type_name}")
+
     def _direct_set_file_type(self, plans) -> None:
         """Describe a direct recipe by its predominant supported storage type.
 
@@ -421,6 +548,9 @@ class Glm5NextModel(GlmMoeDsaModel):
         duplicates = sorted(name for name, count in Counter(output_names).items() if count > 1)
         if duplicates:
             raise DirectQuantError(f"direct quantization maps multiple sources to {duplicates}")
+
+        canonical = self._canonical_direct_manifest(by_normalized, fp8_types, scale_for_weight)
+        self._validate_direct_structural_parity(canonical, records)
 
         descriptors = tuple(
             DirectTensorDescriptor(

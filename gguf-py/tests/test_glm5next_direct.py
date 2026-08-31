@@ -44,6 +44,27 @@ class TestGlm5NextDirectManifest(unittest.TestCase):
             ("blk.3.attn_v_b.weight", (64, 256, 512)),
         ))
 
+    def test_canonical_manifest_contains_both_kv_b_outputs(self):
+        model = self.make_model()
+        manifest = model._canonical_direct_manifest({
+            "model.layers.3.self_attn.kv_b_proj.weight": (
+                "model.language_model.layers.3.self_attn.kv_b_proj.weight",
+                SimpleNamespace(dtype="BF16", shape=(32768, 512)),
+            ),
+        }, set(), {})
+        self.assertEqual(manifest, {
+            "blk.3.attn_k_b.weight": (
+                ("model.layers.3.self_attn.kv_b_proj.weight",),
+                (64, 512, 256),
+                gguf.GGMLQuantizationType.BF16,
+            ),
+            "blk.3.attn_v_b.weight": (
+                ("model.layers.3.self_attn.kv_b_proj.weight",),
+                (64, 256, 512),
+                gguf.GGMLQuantizationType.BF16,
+            ),
+        })
+
     def test_kv_b_manifest_rejects_shape_mismatch(self):
         model = self.make_model()
         with self.assertRaisesRegex(DirectQuantError, "expected"):
