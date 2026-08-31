@@ -117,7 +117,7 @@ static void server_log_wddm_process_memory() {
 
     const auto create_factory = reinterpret_cast<create_dxgi_factory1_t>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
     IDXGIFactory1 * factory = nullptr;
-    if (create_factory == nullptr || FAILED(create_factory(IID_IDXGIFactory1, reinterpret_cast<void **>(&factory)))) {
+    if (create_factory == nullptr || FAILED(create_factory(__uuidof(IDXGIFactory1), reinterpret_cast<void **>(&factory)))) {
         FreeLibrary(dxgi);
         return;
     }
