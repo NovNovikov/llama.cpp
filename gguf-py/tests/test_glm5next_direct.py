@@ -1,10 +1,13 @@
 from pathlib import Path
 import sys
 import unittest
+from types import SimpleNamespace
 
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
+
+import gguf
 
 from conversion.direct_quant import DirectQuantError
 from conversion.glm5next import Glm5NextModel
@@ -62,6 +65,16 @@ class TestGlm5NextDirectManifest(unittest.TestCase):
         model = self.make_model()
         self.assertTrue(model._direct_requires_f32("blk.3.indexer.proj.weight", (10240, 4), 3))
         self.assertFalse(model._direct_requires_f32("blk.3.ffn_gate_exps.weight", (640, 2560, 512), 3))
+
+    def test_mixed_recipe_uses_predominant_supported_file_type(self):
+        model = self.make_model()
+        model.ftype = gguf.LlamaFileType.MOSTLY_BF16
+        model._direct_set_file_type((
+            SimpleNamespace(target_type=gguf.GGMLQuantizationType.BF16, parameter_count=20),
+            SimpleNamespace(target_type=gguf.GGMLQuantizationType.Q3_K, parameter_count=30),
+            SimpleNamespace(target_type=gguf.GGMLQuantizationType.Q2_K, parameter_count=60),
+        ))
+        self.assertEqual(model.ftype, gguf.LlamaFileType.MOSTLY_Q2_K)
 
 
 if __name__ == "__main__":

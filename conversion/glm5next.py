@@ -211,6 +211,35 @@ class Glm5NextModel(GlmMoeDsaModel):
             n_embd_head_v=int(hparams.get("v_head_dim", head_dim)),
         )
 
+    def _direct_set_file_type(self, plans) -> None:
+        """Describe a direct recipe by its predominant supported storage type.
+
+        GGUF has no file-type enum for an arbitrary mixed recipe.  Reuse a
+        standard ``MOSTLY_*`` value only when the largest parameter class has
+        an exact representation; otherwise retain the user-selected ftype.
+        """
+        ftype_for_qtype = {
+            gguf.GGMLQuantizationType.F32:  gguf.LlamaFileType.ALL_F32,
+            gguf.GGMLQuantizationType.F16:  gguf.LlamaFileType.MOSTLY_F16,
+            gguf.GGMLQuantizationType.BF16: gguf.LlamaFileType.MOSTLY_BF16,
+            gguf.GGMLQuantizationType.Q8_0: gguf.LlamaFileType.MOSTLY_Q8_0,
+            gguf.GGMLQuantizationType.Q2_K: gguf.LlamaFileType.MOSTLY_Q2_K,
+        }
+        parameter_counts = Counter()
+        for plan in plans:
+            parameter_counts[plan.target_type] += plan.parameter_count
+        if not parameter_counts:
+            return
+
+        predominant = max(parameter_counts, key=parameter_counts.__getitem__)
+        if (ftype := ftype_for_qtype.get(predominant)) is not None:
+            self.ftype = ftype
+            logger.info("direct quantization metadata: predominant parameter type is %s", predominant.name)
+        else:
+            logger.warning(
+                "direct quantization metadata: predominant parameter type %s has no exact "
+                "LlamaFileType; retaining %s", predominant.name, self.ftype.name)
+
     def _direct_prepare_tensors(self) -> None:
         if self.direct_quant_recipe is None or self.direct_quant_lib is None:
             raise AssertionError("direct quantization requires both recipe and native library directory")
@@ -416,6 +445,8 @@ class Glm5NextModel(GlmMoeDsaModel):
                 raise DirectQuantError(
                     f"direct structural parity failed for {record['sources']}: canonical "
                     f"{plan.name} uses {record['source_type'].name}, direct recipe selected {plan.target_type.name}")
+
+        self._direct_set_file_type(plans)
 
         if self.dry_run:
             logger.info("Direct quantization plan:\n%s", format_direct_plan(plans))
