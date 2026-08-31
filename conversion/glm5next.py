@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from collections import Counter
 import re
 from typing import Any, Iterable
 
+import numpy as np
 import torch
 from torch import Tensor
 
@@ -141,20 +143,58 @@ class Glm5NextModel(GlmMoeDsaModel):
             name = "token_embd.weight"
         return self.map_tensor_name(name)
 
-    @staticmethod
-    def _direct_requires_f32(name: str, shape: tuple[int, ...]) -> bool:
-        """Mirror ModelBase's mandatory F32 policy for GLM-5.3 runtime ops."""
-        if len(shape) <= 1 or name.endswith("_norm.weight"):
-            return True
+    def _direct_requires_f32(self, name: str, shape: tuple[int, ...], bid: int | None) -> bool:
+        """Use the ordinary converter's mandatory storage policy."""
+        return self.tensor_requires_f32(name, bid, len(shape))
+
+    def _direct_kv_b_outputs(
+        self,
+        source_name: str,
+        source_shape: tuple[int, ...],
+    ) -> tuple[tuple[str, tuple[int, ...]], tuple[str, tuple[int, ...]]]:
+        """Describe the canonical MLA ``kv_b_proj`` split without reading data."""
+        normalized = self._direct_normalize_name(source_name)
+        bid_match = re.search(r"\.layers\.(\d+)\.", normalized)
+        if bid_match is None:
+            raise DirectQuantError(f"direct MLA kv_b tensor has no layer index: {source_name}")
+        if len(source_shape) != 2:
+            raise DirectQuantError(
+                f"direct MLA kv_b tensor {source_name} must be a matrix, got {source_shape}")
+
+        try:
+            n_head_kv = int(self.hparams["num_key_value_heads"])
+            qk_nope_head_dim = int(self.hparams["qk_nope_head_dim"])
+            v_head_dim = int(self.hparams["v_head_dim"])
+        except KeyError as exc:
+            raise DirectQuantError(
+                f"direct MLA kv_b tensor {source_name} requires {exc.args[0]!r} in model hparams") from exc
+        if n_head_kv <= 0 or qk_nope_head_dim <= 0 or v_head_dim <= 0:
+            raise DirectQuantError(
+                f"direct MLA kv_b tensor {source_name} has invalid hparams: "
+                f"num_key_value_heads={n_head_kv}, qk_nope_head_dim={qk_nope_head_dim}, "
+                f"v_head_dim={v_head_dim}")
+
+        expected_rows = n_head_kv * (qk_nope_head_dim + v_head_dim)
+        if source_shape[0] != expected_rows:
+            raise DirectQuantError(
+                f"direct MLA kv_b tensor {source_name} has shape {source_shape}; expected "
+                f"[{n_head_kv} * ({qk_nope_head_dim} + {v_head_dim}), rank]")
+
+        rank = source_shape[1]
+        name_k = self._direct_output_name(normalized.replace("kv_b_proj", "k_b_proj"))
+        name_v = self._direct_output_name(normalized.replace("kv_b_proj", "v_b_proj"))
         return (
-            name.endswith(".ffn_gate_inp.weight")
-            or name.endswith(".ffn_gate_inp_shexp.weight")
-            or name.endswith(".ssm_conv1d.weight")
-            or name.endswith(".ssm_conv1d_q.weight")
-            or name.endswith(".ssm_conv1d_k.weight")
-            or name.endswith(".ssm_conv1d_v.weight")
-            or name.endswith(".indexer.proj.weight")
+            (name_k, (n_head_kv, rank, qk_nope_head_dim)),
+            (name_v, (n_head_kv, v_head_dim, rank)),
         )
+
+    @staticmethod
+    def _direct_numpy_dtype(qtype: gguf.GGMLQuantizationType) -> np.dtype:
+        if qtype == gguf.GGMLQuantizationType.F32:
+            return np.dtype(np.float32)
+        if qtype in (gguf.GGMLQuantizationType.F16, gguf.GGMLQuantizationType.BF16):
+            return np.dtype(np.uint16)
+        return np.dtype(np.uint8)
 
     def _direct_model_descriptor(self) -> DirectModelDescriptor:
         hparams = self.hparams
@@ -235,24 +275,34 @@ class Glm5NextModel(GlmMoeDsaModel):
             ordered_names = [entries[eid] for eid in range(n_experts)]
             dtypes = {by_normalized[name][1].dtype for name in ordered_names}
             merged_name = f"model.layers.{bid}.mlp.experts.{projection}.weight"
+            output_name = self._direct_output_name(merged_name)
+            requires_f32 = self._direct_requires_f32(
+                output_name,
+                (n_experts, *by_normalized[ordered_names[0]][1].shape),
+                bid,
+            )
             if dtypes <= set(fp8_types):
                 records.append({
-                    "name": self._direct_output_name(merged_name),
+                    "name": output_name,
+                    "sources": tuple(ordered_names),
                     "source_dtype": "FP8",
-                    "source_type": gguf.GGMLQuantizationType.Q8_0,
+                    "source_type": gguf.GGMLQuantizationType.F32 if requires_f32 else gguf.GGMLQuantizationType.Q8_0,
                     "shape": (n_experts, *fp8_source(ordered_names[0]).shape),
-                    "kind": "experts",
+                    "kind": "experts_f32" if requires_f32 else "experts",
+                    "requires_f32": requires_f32,
                     "data": FP8ExpertTensor([fp8_source(name) for name in ordered_names]),
                 })
             elif len(dtypes) == 1 and next(iter(dtypes)) in DirectStorageTensor._DTYPES:
                 storage_experts = [DirectStorageTensor(by_normalized[name][1]) for name in ordered_names]
                 expert_tensor = DirectStorageExpertTensor(storage_experts)
                 records.append({
-                    "name": self._direct_output_name(merged_name),
+                    "name": output_name,
+                    "sources": tuple(ordered_names),
                     "source_dtype": next(iter(dtypes)),
-                    "source_type": expert_tensor.ggml_type,
+                    "source_type": gguf.GGMLQuantizationType.F32 if requires_f32 else expert_tensor.ggml_type,
                     "shape": expert_tensor.shape,
-                    "kind": "storage_experts",
+                    "kind": "storage_experts_f32" if requires_f32 else "storage_experts",
+                    "requires_f32": requires_f32,
                     "data": expert_tensor,
                 })
             else:
@@ -266,129 +316,80 @@ class Glm5NextModel(GlmMoeDsaModel):
             if expert_pattern.match(normalized) is not None:
                 continue
 
-            # Canonical MLA kv_b split: HF kv_b_proj [n_head*(qk_nope+v_head), kv_lora_rank]
-            # -> GGUF k_b [qk_nope, kv_lora_rank, n_head] and v_b [kv_lora_rank, v_head, n_head]
-            # Must be numerically equivalent to DeepseekV2Model.modify_tensors() for direct path.
             if normalized.endswith(".self_attn.kv_b_proj.weight"):
-                # Use effective hparams after text_config merge
-                n_head = int(self.hparams.get("num_attention_heads", self.hparams.get("n_head", 64)))
-                # For MLA, num_key_value_heads may be in text_config; fallback to n_head
-                n_head_kv = int(self.hparams.get("num_key_value_heads", n_head))
-                # qk_nope and v_head are required for MLA
-                qk_nope = int(self.hparams.get("qk_nope_head_dim", self.hparams.get("qk_nope_head_dim", 0)) or 0)
-                v_head = int(self.hparams.get("v_head_dim", 0) or 0)
-                # Fallback to GGUF MLA lengths if direct hparams missing (nope-only 256)
-                if qk_nope == 0:
-                    qk_nope = int(self.hparams.get("qk_nope_head_dim", 256))
-                if v_head == 0:
-                    v_head = int(self.hparams.get("v_head_dim", 256))
-                # If still 0, try to infer from tensor shape (HF shape [n_head*(qk+v), kv_lora])
-                # Effective n_head for kv_b is num_attention_heads (64 for GLM-5.3)
-                if qk_nope == 0 or v_head == 0:
-                    # infer from shape: assume qk_nope==v_head==256 for GLM5Next
-                    qk_nope = 256
-                    v_head = 256
-                # Validate shape
-                expected_rows = n_head * (qk_nope + v_head)
-                if local_tensor.shape[0] != expected_rows:
-                    # Try n_head_kv fallback (for some configs n_head_kv is used)
-                    if n_head_kv * (qk_nope + v_head) == local_tensor.shape[0]:
-                        n_head = n_head_kv
-                    else:
-                        raise DirectQuantError(
-                            f"kv_b_proj shape {local_tensor.shape} does not match n_head {n_head}*(qk_nope {qk_nope}+v_head {v_head})={n_head*(qk_nope+v_head)}")
-                data = LazyTorchTensor.to_eager(self.model_tensors[source_name]())
-                # Canonical transform identical to DeepseekV2Model
-                kv_b = data.view(n_head, qk_nope + v_head, data.shape[-1]) if data.shape[0] == n_head * (qk_nope + v_head) else data.view(n_head_kv, qk_nope + v_head, data.shape[-1])
-                # Fallback view for [32768,512] case
-                if kv_b.shape[0] * kv_b.shape[1] * kv_b.shape[2] != data.numel():
-                    kv_b = data.view(n_head, qk_nope + v_head, -1)
-                k_b, v_b = torch.split(kv_b, [qk_nope, v_head], dim=1)
-                k_b = k_b.transpose(1, 2).contiguous()
-                v_b = v_b.contiguous()
-                # GGUF names
-                base = normalized.removesuffix(".self_attn.kv_b_proj.weight")
-                # Use direct output name helper for each
-                k_name = self._direct_output_name(base + ".self_attn.kv_b_proj.weight").replace("attn_kv_b", "attn_k_b")
-                v_name = self._direct_output_name(base + ".self_attn.kv_b_proj.weight").replace("attn_kv_b", "attn_v_b")
-                # More robust: directly construct blk.N names
-                # Fallback to explicit blk naming if replace fails
-                if "attn_kv_b" in k_name:
-                    # already correct
-                    pass
-                else:
-                    # Try to map via known pattern: for GLM5Next, kv_b -> k_b/v_b
-                    # Use regex to extract bid
-                    import re as _re
-
-                    m = _re.search(r"\.layers\.(\d+)\.", normalized)
-                    if m:
-                        bid = int(m.group(1))
-                        k_name = f"blk.{bid}.attn_k_b.weight"
-                        v_name = f"blk.{bid}.attn_v_b.weight"
-                # The split outputs are BF16 and must preserve their source bits.
-                k_np = k_b.contiguous().view(torch.uint16).numpy()
-                v_np = v_b.contiguous().view(torch.uint16).numpy()
-                records.append({
-                    "name": k_name,
-                    "source_dtype": local_tensor.dtype,
-                    "source_type": gguf.GGMLQuantizationType.BF16,
-                    "shape": tuple(k_b.shape),
-                    "kind": "eager_bf16",
-                    "data": k_np,
-                })
-                records.append({
-                    "name": v_name,
-                    "source_dtype": local_tensor.dtype,
-                    "source_type": gguf.GGMLQuantizationType.BF16,
-                    "shape": tuple(v_b.shape),
-                    "kind": "eager_bf16",
-                    "data": v_np,
-                })
+                (k_name, k_shape), (v_name, v_shape) = self._direct_kv_b_outputs(source_name, local_tensor.shape)
+                bid = int(re.search(r"\.layers\.(\d+)\.", normalized).group(1))
+                source_type = DirectStorageTensor._GGML_TYPES.get(local_tensor.dtype)
+                if source_type is None:
+                    raise DirectQuantError(
+                        f"direct MLA kv_b tensor {source_name} has unsupported safetensors dtype {local_tensor.dtype}")
+                for output_name, output_shape, projection in (
+                    (k_name, k_shape, "k"),
+                    (v_name, v_shape, "v"),
+                ):
+                    requires_f32 = self._direct_requires_f32(output_name, output_shape, bid)
+                    records.append({
+                        "name": output_name,
+                        "sources": (normalized,),
+                        "source_dtype": local_tensor.dtype,
+                        "source_type": gguf.GGMLQuantizationType.F32 if requires_f32 else source_type,
+                        "shape": output_shape,
+                        "kind": "kv_b",
+                        "requires_f32": requires_f32,
+                        "data": (source_name, projection),
+                    })
                 consumed.add(normalized)
                 continue
 
             output_name = self._direct_output_name(normalized)
+            bid_match = re.search(r"\.layers\.(\d+)\.", normalized)
+            bid = int(bid_match.group(1)) if bid_match is not None else None
+            requires_f32 = self._direct_requires_f32(output_name, local_tensor.shape, bid)
             if local_tensor.dtype in fp8_types:
                 source = fp8_source(normalized)
                 records.append({
                     "name": output_name,
+                    "sources": (normalized,),
                     "source_dtype": local_tensor.dtype,
-                    "source_type": gguf.GGMLQuantizationType.Q8_0,
+                    "source_type": gguf.GGMLQuantizationType.F32 if requires_f32 else gguf.GGMLQuantizationType.Q8_0,
                     "shape": source.shape,
-                    "kind": "fp8",
+                    "kind": "fp8_f32" if requires_f32 else "fp8",
+                    "requires_f32": requires_f32,
                     "data": source,
                 })
                 consumed.add(normalized)
                 continue
 
             if normalized.endswith(".A_log"):
-                data = LazyTorchTensor.to_eager(self.model_tensors[source_name]())
                 records.append({
                     "name": output_name,
+                    "sources": (normalized,),
                     "source_dtype": local_tensor.dtype,
                     "source_type": gguf.GGMLQuantizationType.F32,
-                    "shape": tuple(data.shape),
+                    "shape": local_tensor.shape,
                     "kind": "transformed",
-                    "data": -torch.exp(data.float()).numpy(),
+                    "requires_f32": True,
+                    "data": source_name,
                 })
                 consumed.add(normalized)
                 continue
 
             storage = DirectStorageTensor(local_tensor)
-            requires_f32 = self._direct_requires_f32(output_name, storage.shape)
+            requires_f32 = self._direct_requires_f32(output_name, storage.shape, bid)
             records.append({
                 "name": output_name,
+                "sources": (normalized,),
                 "source_dtype": local_tensor.dtype,
                 "source_type": gguf.GGMLQuantizationType.F32 if requires_f32 else storage.ggml_type,
                 "shape": storage.shape,
                 "kind": "storage_f32" if requires_f32 else "storage",
+                "requires_f32": requires_f32,
                 "data": storage,
             })
             consumed.add(normalized)
 
         output_names = [record["name"] for record in records]
-        duplicates = sorted({name for name in output_names if output_names.count(name) > 1})
+        duplicates = sorted(name for name, count in Counter(output_names).items() if count > 1)
         if duplicates:
             raise DirectQuantError(f"direct quantization maps multiple sources to {duplicates}")
 
@@ -402,28 +403,66 @@ class Glm5NextModel(GlmMoeDsaModel):
             for record in records
         )
         plans = planner.plan(self._direct_model_descriptor(), recipe, descriptors)
+        for record, plan in zip(records, plans, strict=True):
+            if plan.name != record["name"] or plan.shape != record["shape"]:
+                raise DirectQuantError(
+                    f"direct structural parity failed for {record['sources']}: canonical "
+                    f"{record['name']} {record['shape']}, direct {plan.name} {plan.shape}")
+            if record["requires_f32"] and plan.target_type != gguf.GGMLQuantizationType.F32:
+                raise DirectQuantError(
+                    f"direct structural parity failed for {record['sources']}: canonical "
+                    f"{plan.name} requires F32, direct recipe selected {plan.target_type.name}")
+            if record["kind"] not in ("fp8", "experts") and plan.target_type != record["source_type"]:
+                raise DirectQuantError(
+                    f"direct structural parity failed for {record['sources']}: canonical "
+                    f"{plan.name} uses {record['source_type'].name}, direct recipe selected {plan.target_type.name}")
+
         if self.dry_run:
             logger.info("Direct quantization plan:\n%s", format_direct_plan(plans))
+            for plan in plans:
+                self.gguf_writer.add_tensor_info(
+                    plan.name,
+                    plan.shape,
+                    self._direct_numpy_dtype(plan.target_type),
+                    plan.payload_bytes,
+                    raw_dtype=plan.target_type,
+                    tensor_shape_is_raw=True,
+                )
+            return
+
+        def materialize_kv_b(source_name: str, projection: str, target_type: gguf.GGMLQuantizationType) -> np.ndarray:
+            data = LazyTorchTensor.to_eager(self.model_tensors[source_name]())
+            n_head_kv = int(self.hparams["num_key_value_heads"])
+            qk_nope_head_dim = int(self.hparams["qk_nope_head_dim"])
+            v_head_dim = int(self.hparams["v_head_dim"])
+            kv_b = data.view(n_head_kv, qk_nope_head_dim + v_head_dim, data.shape[-1])
+            k_b, v_b = torch.split(kv_b, [qk_nope_head_dim, v_head_dim], dim=1)
+            output = k_b.transpose(1, 2).contiguous() if projection == "k" else v_b.contiguous()
+            if target_type == gguf.GGMLQuantizationType.F32:
+                return output.float().numpy()
+            if target_type == gguf.GGMLQuantizationType.BF16:
+                return output.view(torch.uint16).numpy()
+            return output.numpy()
 
         for record, plan in zip(records, plans, strict=True):
             if record["kind"] in ("storage", "storage_f32"):
-                if plan.target_type != record["source_type"]:
-                    raise DirectQuantError(
-                        f"recipe changes non-FP8 tensor {plan.name} from {record['source_type'].name} "
-                        f"to {plan.target_type.name}; direct re-quantization of F16/BF16/F32 is not implemented")
                 data = record["data"].lazy_float32() if record["kind"] == "storage_f32" else record["data"].lazy_storage()
                 self.gguf_writer.add_tensor(plan.name, data, raw_dtype=plan.target_type)
-            elif record["kind"] == "eager_bf16":
-                if plan.target_type != record["source_type"]:
-                    raise DirectQuantError(
-                        f"recipe changes eager BF16 tensor {plan.name} from {record['source_type'].name} "
-                        f"to {plan.target_type.name}")
-                self.gguf_writer.add_tensor(plan.name, record["data"], raw_dtype=plan.target_type)
+            elif record["kind"] in ("storage_experts", "storage_experts_f32"):
+                data = record["data"].lazy_float32() if record["kind"] == "storage_experts_f32" else record["data"].lazy_storage()
+                self.gguf_writer.add_tensor(plan.name, data, raw_dtype=plan.target_type)
+            elif record["kind"] == "kv_b":
+                source_name, projection = record["data"]
+                self.gguf_writer.add_tensor(
+                    plan.name,
+                    materialize_kv_b(source_name, projection, plan.target_type),
+                    raw_dtype=plan.target_type,
+                )
             elif record["kind"] == "transformed":
-                if plan.target_type != gguf.GGMLQuantizationType.F32:
-                    raise DirectQuantError(
-                        f"recipe changes transformed tensor {plan.name}; direct transformed-tensor quantization is not implemented")
-                self.gguf_writer.add_tensor(plan.name, record["data"], raw_dtype=plan.target_type)
+                data = LazyTorchTensor.to_eager(self.model_tensors[record["data"]]())
+                self.gguf_writer.add_tensor(plan.name, -torch.exp(data.float()).numpy(), raw_dtype=plan.target_type)
+            elif record["kind"] in ("fp8_f32", "experts_f32"):
+                self.gguf_writer.add_tensor(plan.name, record["data"].lazy_float32(), raw_dtype=plan.target_type)
             else:
                 if not plan.target_type.name.startswith(("Q", "TQ")):
                     raise DirectQuantError(

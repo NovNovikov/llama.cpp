@@ -387,6 +387,24 @@ class FP8ScaledTensor:
             row_end = min(rows, row_start + rows_per_chunk)
             yield self._load_float_rows(row_start, row_end)
 
+    def lazy_float32(self, *, rows_per_chunk: int = 128) -> gguf.LazyChunkedTensor:
+        """Stream the dequantized source as F32 for mandatory runtime tensors."""
+        rows, _ = self.shape
+        block_rows, _ = self.block_shape
+        if rows_per_chunk <= 0:
+            raise DirectQuantError(f"direct FP8 rows_per_chunk must be positive, got {rows_per_chunk}")
+        rows_per_chunk = max(block_rows, rows_per_chunk - rows_per_chunk % block_rows)
+
+        chunks: list[Callable[[], np.ndarray]] = []
+        for row_start in range(0, rows, rows_per_chunk):
+            row_end = min(rows, row_start + rows_per_chunk)
+
+            def load_chunk(start: int = row_start, end: int = row_end) -> np.ndarray:
+                return self._load_float_rows(start, end)
+
+            chunks.append(load_chunk)
+        return gguf.LazyChunkedTensor(chunks, self.shape, np.float32)
+
     def lazy_quantized(
         self,
         quantizer: GGMLChunkQuantizer,
@@ -445,6 +463,12 @@ class FP8ExpertTensor:
     @property
     def shape(self) -> tuple[int, int, int]:
         return (len(self.experts), *self.expert_shape)
+
+    def lazy_float32(self) -> gguf.LazyChunkedTensor:
+        chunks: list[Callable[[], np.ndarray]] = []
+        for expert in self.experts:
+            chunks.extend(expert.lazy_float32()._chunks)
+        return gguf.LazyChunkedTensor(chunks, self.shape, np.float32)
 
     def lazy_quantized(
         self,
@@ -506,6 +530,12 @@ class DirectStorageExpertTensor:
         for expert in self.experts:
             chunks.extend(expert.lazy_storage()._chunks)
         return gguf.LazyChunkedTensor(chunks, self.shape, self.experts[0].dtype)
+
+    def lazy_float32(self) -> gguf.LazyChunkedTensor:
+        chunks: list[Callable[[], np.ndarray]] = []
+        for expert in self.experts:
+            chunks.extend(expert.lazy_float32()._chunks)
+        return gguf.LazyChunkedTensor(chunks, self.shape, np.float32)
 
     def lazy_quantized(
         self,

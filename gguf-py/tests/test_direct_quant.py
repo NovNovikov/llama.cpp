@@ -102,6 +102,24 @@ class TestFP8ScaledTensor(unittest.TestCase):
             self.assertTrue(np.all(decoded[:, :128] == 1.0))
             self.assertTrue(np.all(decoded[:, 128:] == 2.0))
 
+    def test_streams_fp8_as_float32(self):
+        direct_quant = load_direct_quant_module()
+        weights = np.full((4, 256), 56, dtype=np.uint8)  # E4M3FN value 1.0
+        scales = np.array([[127, 128]], dtype=np.uint8)
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "source.bin"
+            source_path.write_bytes(weights.tobytes() + scales.tobytes())
+            source = direct_quant.FP8ScaledTensor(
+                local_tensor(source_path, "F8_E4M3FN", weights.shape, 0, weights.nbytes),
+                local_tensor(source_path, "F8_E8M0", scales.shape, weights.nbytes, scales.nbytes),
+            )
+            lazy = source.lazy_float32()
+            decoded = np.concatenate([chunk() for chunk in lazy._chunks]).reshape(weights.shape)
+
+            self.assertEqual(lazy.dtype, np.dtype(np.float32))
+            self.assertTrue(np.all(decoded[:, :128] == 1.0))
+            self.assertTrue(np.all(decoded[:, 128:] == 2.0))
+
     def test_rejects_incompatible_scale_grid(self):
         direct_quant = load_direct_quant_module()
         with tempfile.TemporaryDirectory() as directory:

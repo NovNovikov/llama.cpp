@@ -695,6 +695,48 @@ class ModelBase:
             return gguf.GGMLQuantizationType.Q8_0
         return False
 
+    def tensor_requires_f32(self, new_name: str, bid: int | None, n_dims: int) -> bool:
+        """Return whether the runtime requires this mapped tensor to be F32.
+
+        Keep this policy shared by ordinary conversion and direct conversion.
+        It must take precedence over source precision and user quantization
+        requests: these tensors participate in runtime operations that do not
+        accept a quantized or reduced-precision representation.
+        """
+        if n_dims <= 1 or new_name.endswith("_norm.weight"):
+            return True
+
+        return (
+            any(
+                self.match_model_tensor_name(new_name, key, bid)
+                for key in (
+                    gguf.MODEL_TENSOR.FFN_GATE_INP,
+                    gguf.MODEL_TENSOR.FFN_GATE_INP_SHEXP,
+                    gguf.MODEL_TENSOR.POS_EMBD,
+                    gguf.MODEL_TENSOR.TOKEN_TYPES,
+                    gguf.MODEL_TENSOR.SSM_CONV1D,
+                    gguf.MODEL_TENSOR.SHORTCONV_CONV,
+                    gguf.MODEL_TENSOR.TIME_MIX_FIRST,
+                    gguf.MODEL_TENSOR.TIME_MIX_W1,
+                    gguf.MODEL_TENSOR.TIME_MIX_W2,
+                    gguf.MODEL_TENSOR.TIME_MIX_DECAY_W1,
+                    gguf.MODEL_TENSOR.TIME_MIX_DECAY_W2,
+                    gguf.MODEL_TENSOR.TIME_MIX_LERP_FUSED,
+                    gguf.MODEL_TENSOR.POSNET_NORM1,
+                    gguf.MODEL_TENSOR.POSNET_NORM2,
+                    gguf.MODEL_TENSOR.V_ENC_EMBD_POS,
+                    gguf.MODEL_TENSOR.A_ENC_EMBD_POS,
+                    gguf.MODEL_TENSOR.ALTUP_CORRECT_COEF,
+                    gguf.MODEL_TENSOR.ALTUP_PREDICT_COEF,
+                    gguf.MODEL_TENSOR.SSM_CONV1D_Q,
+                    gguf.MODEL_TENSOR.SSM_CONV1D_K,
+                    gguf.MODEL_TENSOR.SSM_CONV1D_V,
+                    gguf.MODEL_TENSOR.INDEXER_PROJ,
+                )
+            )
+            or new_name[-7:] not in (".weight", ".lora_a", ".lora_b")
+        )
+
     # some models need extra generated tensors (like rope_freqs)
     def generate_extra_tensors(self) -> Iterable[tuple[str, Tensor]]:
         return ()
@@ -972,44 +1014,9 @@ class ModelBase:
                 n_dims = len(data.shape)
                 data_qtype: gguf.GGMLQuantizationType | bool = self.tensor_force_quant(name, new_name, bid, n_dims)
 
-                # Most of the codebase that takes in 1D tensors or norms only handles F32 tensors
-                if n_dims <= 1 or new_name.endswith("_norm.weight"):
-                    data_qtype = gguf.GGMLQuantizationType.F32
-
-                # Conditions should closely match those in llama_model_quantize_internal in llama.cpp
-                # Some tensor types are always in float32
-                if data_qtype is False and (
-                    any(
-                        self.match_model_tensor_name(new_name, key, bid)
-                        for key in (
-                            gguf.MODEL_TENSOR.FFN_GATE_INP,
-                            gguf.MODEL_TENSOR.FFN_GATE_INP_SHEXP,
-                            gguf.MODEL_TENSOR.POS_EMBD,
-                            gguf.MODEL_TENSOR.TOKEN_TYPES,
-                            gguf.MODEL_TENSOR.SSM_CONV1D,
-                            gguf.MODEL_TENSOR.SHORTCONV_CONV,
-                            gguf.MODEL_TENSOR.TIME_MIX_FIRST,
-                            gguf.MODEL_TENSOR.TIME_MIX_W1,
-                            gguf.MODEL_TENSOR.TIME_MIX_W2,
-                            gguf.MODEL_TENSOR.TIME_MIX_DECAY_W1,
-                            gguf.MODEL_TENSOR.TIME_MIX_DECAY_W2,
-                            gguf.MODEL_TENSOR.TIME_MIX_LERP_FUSED,
-                            gguf.MODEL_TENSOR.POSNET_NORM1,
-                            gguf.MODEL_TENSOR.POSNET_NORM2,
-                            gguf.MODEL_TENSOR.V_ENC_EMBD_POS,
-                            gguf.MODEL_TENSOR.A_ENC_EMBD_POS,
-                            gguf.MODEL_TENSOR.ALTUP_CORRECT_COEF,
-                            gguf.MODEL_TENSOR.ALTUP_PREDICT_COEF,
-                            # Kimi KDA conv weights should be F32
-                            gguf.MODEL_TENSOR.SSM_CONV1D_Q,
-                            gguf.MODEL_TENSOR.SSM_CONV1D_K,
-                            gguf.MODEL_TENSOR.SSM_CONV1D_V,
-                            # DSA indexer weights should be F32
-                            gguf.MODEL_TENSOR.INDEXER_PROJ,
-                        )
-                    )
-                    or new_name[-7:] not in (".weight", ".lora_a", ".lora_b")
-                ):
+                # Conditions closely match llama_model_quantize_internal in llama.cpp.
+                # Mandatory F32 wins over every source or user-requested type.
+                if self.tensor_requires_f32(new_name, bid, n_dims):
                     data_qtype = gguf.GGMLQuantizationType.F32
 
                 if data_qtype is False and any(
