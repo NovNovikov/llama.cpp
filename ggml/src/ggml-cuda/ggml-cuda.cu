@@ -1876,12 +1876,12 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     if (cc <= GGML_CUDA_CC_PASCAL) {
         return false;
     }
-    //we only support fusion for ncols_dst = 1
+    // MUL_MAT_ID has a dedicated multi-token fused kernel.
     if (tensor->op == GGML_OP_MUL_MAT && dst->ne[1] != 1) {
         return false;
     }
 
-    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] != 1) {
+    if (tensor->op == GGML_OP_MUL_MAT_ID && dst->ne[2] > get_mmvq_mmid_max_batch(src0->type, cc)) {
         return false;
     }
 
