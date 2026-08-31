@@ -374,73 +374,8 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
         tool_calls = p.optional(tool_calls);
     }
 
-    std::string trigger_marker = !format.section_start.empty() ? format.section_start : format.per_call_start;
-
-    // A bare tool marker is not sufficient to prove that ordinary assistant
-    // text has ended. Tagged models can legitimately discuss their own tool
-    // syntax, for example:
-    //
-    //     "the log contains <tool_call> 121 times"
-    //
-    // The old p.until(trigger_marker) stopped at the first such occurrence and
-    // the final PEG parse then tried to interpret the following prose as a tool
-    // name. Only stop content at a marker that is followed by a declared tool
-    // name and by syntax that can actually continue a tagged tool call.
-    common_peg_parser content_before_tools = p.eps();
-    if (!trigger_marker.empty()) {
-        auto valid_tool_start = p.choice();
-
-        foreach_function(inputs.tools, [&](const json & tool) {
-            const auto & func = tool.at("function");
-            const std::string name = func.at("name");
-
-            auto start = p.literal(trigger_marker) + p.space();
-
-            // Formats may wrap a sequence of calls in a section marker and
-            // each individual call in a second marker.
-            if (!format.section_start.empty() && !format.per_call_start.empty()) {
-                start = start + p.literal(format.per_call_start) + p.space();
-            }
-
-            start = start + p.literal(function.name_prefix) +
-                    p.literal(name) + p.literal(function.name_suffix) + p.space();
-
-            auto continuation = p.choice();
-            bool have_continuation = false;
-
-            if (!function.args_separator.empty()) {
-                continuation |= p.literal(function.args_separator);
-                have_continuation = true;
-            } else {
-                if (!arguments.start.empty()) {
-                    continuation |= p.literal(arguments.start);
-                    have_continuation = true;
-                }
-                if (!arguments.name_prefix.empty()) {
-                    continuation |= p.literal(arguments.name_prefix);
-                    have_continuation = true;
-                }
-            }
-
-            // Zero-argument calls may close immediately after the function
-            // name, so their real closing marker is also a valid continuation.
-            if (!function.close.empty()) {
-                continuation |= p.literal(function.close);
-                have_continuation = true;
-            } else if (!format.per_call_end.empty()) {
-                continuation |= p.literal(format.per_call_end);
-                have_continuation = true;
-            } else if (!format.section_end.empty()) {
-                continuation |= p.literal(format.section_end);
-                have_continuation = true;
-            }
-
-            valid_tool_start |= have_continuation ? start + continuation : start;
-        });
-
-        content_before_tools = p.zero_or_more(p.negate(valid_tool_start) + p.any());
-    }
-
+    std::string trigger_marker       = !format.section_start.empty() ? format.section_start : format.per_call_start;
+    auto        content_before_tools = trigger_marker.empty() ? p.eps() : p.until(trigger_marker);
     return ctx.reasoning_parser + p.optional(p.content(content_before_tools)) + tool_calls + p.end();
 }
 
