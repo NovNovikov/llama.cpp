@@ -83,12 +83,11 @@ static int32_t server_prompt_tail_batch_limit(int32_t remaining_tokens, int32_t 
     return n_batch;
 }
 
-static void server_log_runtime_memory_buffers(
-        const char * label,
+static void server_accumulate_runtime_memory_buffers(
         const llama_context * ctx,
-        bool include_model) {
-    llama_memory_breakdown_data device;
-    llama_memory_breakdown_data host;
+        bool include_model,
+        llama_memory_breakdown_data & device,
+        llama_memory_breakdown_data & host) {
 
     for (const auto & [buft, mb] : llama_get_memory_breakdown(ctx)) {
         auto & total = ggml_backend_buft_is_host(buft) ? host : device;
@@ -99,15 +98,10 @@ static void server_log_runtime_memory_buffers(
         total.compute += mb.compute;
     }
 
-    constexpr double MiB = 1024.0 * 1024.0;
-    SRV_INF("runtime known llama buffers [MiB] %s | device: model=%.2f context=%.2f compute=%.2f total=%.2f | host: model=%.2f context=%.2f compute=%.2f total=%.2f\n",
-            label,
-            device.model/MiB, device.context/MiB, device.compute/MiB, device.total()/MiB,
-            host.model/MiB, host.context/MiB, host.compute/MiB, host.total()/MiB);
 }
 
 #if defined(_WIN32)
-static void server_log_wddm_process_memory() {
+static void server_log_wddm_process_memory(uint64_t cuda_host_compute) {
     using create_dxgi_factory1_t = HRESULT (WINAPI *)(REFIID riid, void ** pp_factory);
 
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
@@ -122,7 +116,8 @@ static void server_log_wddm_process_memory() {
         return;
     }
 
-    constexpr double MiB = 1024.0 * 1024.0;
+    DXGI_QUERY_VIDEO_MEMORY_INFO selected_local = {};
+    DXGI_QUERY_VIDEO_MEMORY_INFO selected_shared = {};
     for (UINT i = 0;; ++i) {
         IDXGIAdapter1 * adapter = nullptr;
         const HRESULT hr = factory->EnumAdapters1(i, &adapter);
@@ -136,9 +131,9 @@ static void server_log_wddm_process_memory() {
             DXGI_QUERY_VIDEO_MEMORY_INFO shared = {};
             if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
                     SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)) &&
-                    (local.CurrentUsage > 0 || shared.CurrentUsage > 0)) {
-                SRV_INF("WDDM current process memory [MiB] adapter=%u | dedicated=%.2f / budget=%.2f | shared=%.2f / budget=%.2f\n",
-                        i, local.CurrentUsage/MiB, local.Budget/MiB, shared.CurrentUsage/MiB, shared.Budget/MiB);
+                    local.CurrentUsage > selected_local.CurrentUsage) {
+                selected_local = local;
+                selected_shared = shared;
             }
             adapter3->Release();
         }
@@ -147,6 +142,15 @@ static void server_log_wddm_process_memory() {
 
     factory->Release();
     FreeLibrary(dxgi);
+
+    if (selected_local.CurrentUsage > 0 || selected_shared.CurrentUsage > 0) {
+        constexpr double MiB = 1024.0 * 1024.0;
+        const uint64_t ram_spill = selected_shared.CurrentUsage > cuda_host_compute
+                ? selected_shared.CurrentUsage - cuda_host_compute
+                : 0;
+        SRV_INF("memory: VRAM=%.2f MiB | RAM spill=%.2f MiB\n",
+                selected_local.CurrentUsage/MiB, ram_spill/MiB);
+    }
 }
 #endif
 
@@ -4783,16 +4787,15 @@ private:
             return false;
         }
 
-        server_log_runtime_memory_buffers("target", ctx_tgt, true);
+        llama_memory_breakdown_data device;
+        llama_memory_breakdown_data host;
+        server_accumulate_runtime_memory_buffers(ctx_tgt, true, device, host);
         if (ctx_dft) {
             const bool shares_model = llama_get_model(ctx_dft) == llama_get_model(ctx_tgt);
-            server_log_runtime_memory_buffers(
-                    shares_model ? "MTP incremental (shared model excluded)" : "draft",
-                    ctx_dft,
-                    !shares_model);
+            server_accumulate_runtime_memory_buffers(ctx_dft, !shares_model, device, host);
         }
 #if defined(_WIN32)
-        server_log_wddm_process_memory();
+        server_log_wddm_process_memory(host.compute);
 #endif
 
         for (int i = 0; i < params_base.n_parallel; i++) {
