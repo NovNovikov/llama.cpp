@@ -61,6 +61,7 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#include <dxgi1_4.h>
 #endif
 
 constexpr int HTTP_POLLING_SECONDS = 1;
@@ -104,6 +105,50 @@ static void server_log_runtime_memory_buffers(
             device.model/MiB, device.context/MiB, device.compute/MiB, device.total()/MiB,
             host.model/MiB, host.context/MiB, host.compute/MiB, host.total()/MiB);
 }
+
+#if defined(_WIN32)
+static void server_log_wddm_process_memory() {
+    using create_dxgi_factory1_t = HRESULT (WINAPI *)(REFIID riid, void ** pp_factory);
+
+    HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
+    if (dxgi == nullptr) {
+        return;
+    }
+
+    const auto create_factory = reinterpret_cast<create_dxgi_factory1_t>(GetProcAddress(dxgi, "CreateDXGIFactory1"));
+    IDXGIFactory1 * factory = nullptr;
+    if (create_factory == nullptr || FAILED(create_factory(IID_IDXGIFactory1, reinterpret_cast<void **>(&factory)))) {
+        FreeLibrary(dxgi);
+        return;
+    }
+
+    constexpr double MiB = 1024.0 * 1024.0;
+    for (UINT i = 0;; ++i) {
+        IDXGIAdapter1 * adapter = nullptr;
+        const HRESULT hr = factory->EnumAdapters1(i, &adapter);
+        if (hr == DXGI_ERROR_NOT_FOUND || FAILED(hr) || adapter == nullptr) {
+            break;
+        }
+
+        IDXGIAdapter3 * adapter3 = nullptr;
+        if (SUCCEEDED(adapter->QueryInterface(__uuidof(IDXGIAdapter3), reinterpret_cast<void **>(&adapter3)))) {
+            DXGI_QUERY_VIDEO_MEMORY_INFO local = {};
+            DXGI_QUERY_VIDEO_MEMORY_INFO shared = {};
+            if (SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL, &local)) &&
+                    SUCCEEDED(adapter3->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_NON_LOCAL, &shared)) &&
+                    (local.CurrentUsage > 0 || shared.CurrentUsage > 0)) {
+                SRV_INF("WDDM current process memory [MiB] adapter=%u | dedicated=%.2f / budget=%.2f | shared=%.2f / budget=%.2f\n",
+                        i, local.CurrentUsage/MiB, local.Budget/MiB, shared.CurrentUsage/MiB, shared.Budget/MiB);
+            }
+            adapter3->Release();
+        }
+        adapter->Release();
+    }
+
+    factory->Release();
+    FreeLibrary(dxgi);
+}
+#endif
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -4746,6 +4791,9 @@ private:
                     ctx_dft,
                     !shares_model);
         }
+#if defined(_WIN32)
+        server_log_wddm_process_memory();
+#endif
 
         for (int i = 0; i < params_base.n_parallel; i++) {
             server_slot & slot = slots[i];
