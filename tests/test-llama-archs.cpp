@@ -1141,6 +1141,12 @@ static int test_mtp(const size_t seed, const ggml_log_level log_level) {
             throw std::runtime_error("MTP rollback test produced no draft");
         }
 
+        // Drafting advanced the separate MTP context.  The server restores its
+        // checkpoint before feeding the target verification batch through the
+        // process hook, so that catch-up starts at the same boundary.
+        ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
+
         llama_tokens verify = { id_last };
         verify.insert(verify.end(), draft.begin(), draft.end());
         llama_batch batch_verify = decode(ctx_tgt, verify, n_prompt);
