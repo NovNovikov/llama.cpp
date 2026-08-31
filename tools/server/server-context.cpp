@@ -146,7 +146,12 @@ static void server_log_wddm_process_memory(uint64_t cuda_host_compute) {
 
     if (selected_local.CurrentUsage > 0 || selected_shared.CurrentUsage > 0) {
         constexpr double MiB = 1024.0 * 1024.0;
-        const uint64_t ram_spill = selected_shared.CurrentUsage > cuda_host_compute
+        // DXGI non-local usage includes intentional CUDA_Host mappings and driver
+        // bookkeeping. It can only be treated as overflow once the local WDDM
+        // budget is exhausted.
+        const bool local_budget_exhausted =
+                selected_local.Budget > 0 && selected_local.CurrentUsage >= selected_local.Budget;
+        const uint64_t ram_spill = local_budget_exhausted && selected_shared.CurrentUsage > cuda_host_compute
                 ? selected_shared.CurrentUsage - cuda_host_compute
                 : 0;
         SRV_INF("memory: VRAM=%.2f MiB | RAM spill=%.2f MiB\n",
