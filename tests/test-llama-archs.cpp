@@ -1,4 +1,5 @@
 #include "common.h"
+#include "speculative.h"
 #include "log.h"
 #include "ggml-backend.h"
 #include "ggml.h"
@@ -1052,11 +1053,164 @@ static int test_mtp(const size_t seed, const ggml_log_level log_level) {
         return std::vector<float>(logits, logits + n_vocab);
     };
 
+    // Exercise the server's partial-acceptance recovery path.  The target, MTP
+    // draft context and the MTP carry-over row must all return to the same
+    // prompt boundary before a rejected draft is retried.
+    auto run_mtp_reject_rollback = [&](llama_model * model, llama_context * ctx_tgt) {
+        const int32_t n_prompt = 8;
+        const llama_seq_id seq_id = 0;
+        llama_tokens prompt(tokens.begin(), tokens.begin() + n_prompt);
+        const llama_token id_last = tokens[n_prompt];
+
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx           = 0;
+        ctx_params.n_threads       = 4;
+        ctx_params.n_threads_batch = 4;
+        ctx_params.n_ubatch        = 64;
+        llama_context_ptr ctx_ref(llama_init_from_model(model, ctx_params));
+        if (!ctx_ref) {
+            throw std::runtime_error("failed to create target-only rollback reference context");
+        }
+
+        ctx_params.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
+        llama_context_ptr ctx_dft(llama_init_from_model(model, ctx_params));
+        if (!ctx_dft) {
+            throw std::runtime_error("failed to create MTP rollback draft context");
+        }
+
+        common_params_speculative params;
+        params.types = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+        params.draft.n_max = 2;
+        params.draft.n_min = 1;
+        params.draft.p_min = 0.0f;
+        params.draft.backend_sampling = false;
+        params.draft.ctx_tgt = ctx_tgt;
+        params.draft.ctx_dft = ctx_dft.get();
+        common_speculative_ptr spec(common_speculative_init(params, 1));
+        if (!spec) {
+            throw std::runtime_error("failed to create MTP speculative context");
+        }
+
+        auto decode = [&](llama_context * ctx, const llama_tokens & ids, llama_pos pos) {
+            llama_batch batch = llama_batch_init((int32_t) ids.size(), 0, 1);
+            for (size_t i = 0; i < ids.size(); ++i) {
+                common_batch_add(batch, ids[i], pos + (llama_pos) i, { seq_id }, true);
+            }
+            const int32_t rc = llama_decode(ctx, batch);
+            if (rc != 0) {
+                llama_batch_free(batch);
+                throw std::runtime_error("failed to decode MTP rollback batch");
+            }
+            return batch;
+        };
+
+        llama_batch batch_prompt = decode(ctx_tgt, prompt, 0);
+        if (!common_speculative_process(spec.get(), batch_prompt)) {
+            llama_batch_free(batch_prompt);
+            throw std::runtime_error("failed to sync MTP rollback prompt");
+        }
+        llama_batch_free(batch_prompt);
+
+        llama_batch batch_ref_prompt = decode(ctx_ref.get(), prompt, 0);
+        llama_batch_free(batch_ref_prompt);
+        common_speculative_begin(spec.get(), seq_id, prompt);
+
+        common_prompt_checkpoint ckpt;
+        ckpt.update_pos(prompt.size(),
+                llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), seq_id),
+                llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), seq_id));
+        ckpt.update_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        ckpt.update_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+
+        std::vector<uint8_t> spec_state;
+        if (!common_speculative_get_state(spec.get(), seq_id, spec_state) || spec_state.empty()) {
+            throw std::runtime_error("failed to save MTP speculative state");
+        }
+
+        llama_tokens draft;
+        common_speculative_get_draft_params(spec.get(), seq_id) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ params.draft.n_max,
+            /* .n_past   = */ n_prompt,
+            /* .id_last  = */ id_last,
+            /* .prompt   = */ &prompt,
+            /* .result   = */ &draft,
+        };
+        common_speculative_draft(spec.get());
+        if (draft.empty()) {
+            throw std::runtime_error("MTP rollback test produced no draft");
+        }
+
+        llama_tokens verify = { id_last };
+        verify.insert(verify.end(), draft.begin(), draft.end());
+        llama_batch batch_verify = decode(ctx_tgt, verify, n_prompt);
+        if (!common_speculative_process(spec.get(), batch_verify)) {
+            llama_batch_free(batch_verify);
+            throw std::runtime_error("failed to process MTP verification batch");
+        }
+        llama_batch_free(batch_verify);
+
+        // Force zero draft-token acceptance: this is the same rollback boundary
+        // the server takes when the target rejects the first proposed token.
+        ckpt.load_tgt(ctx_tgt, seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        ckpt.load_dft(ctx_dft.get(), seq_id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        llama_memory_seq_rm(llama_get_memory(ctx_tgt), seq_id, ckpt.pos_max + 1, -1);
+        llama_memory_seq_rm(llama_get_memory(ctx_dft.get()), seq_id, ckpt.pos_max + 1, -1);
+        common_speculative_set_state(spec.get(), seq_id, spec_state);
+
+        std::vector<uint8_t> restored_spec_state;
+        if (!common_speculative_get_state(spec.get(), seq_id, restored_spec_state) || restored_spec_state != spec_state) {
+            throw std::runtime_error("MTP speculative state did not survive rollback");
+        }
+
+        llama_batch batch_retry = decode(ctx_tgt, { id_last }, n_prompt);
+        const float * logits_retry = llama_get_logits_ith(ctx_tgt, 0);
+        if (!logits_retry || !common_speculative_process(spec.get(), batch_retry)) {
+            llama_batch_free(batch_retry);
+            throw std::runtime_error("failed to resume MTP after rollback");
+        }
+        const uint32_t n_vocab = llama_vocab_n_tokens(llama_model_get_vocab(model));
+        const std::vector<float> logits_after_rollback(logits_retry, logits_retry + n_vocab);
+        llama_batch_free(batch_retry);
+        common_speculative_accept(spec.get(), seq_id, 0);
+
+        llama_batch batch_ref_retry = decode(ctx_ref.get(), { id_last }, n_prompt);
+        const float * logits_ref = llama_get_logits_ith(ctx_ref.get(), 0);
+        if (!logits_ref) {
+            llama_batch_free(batch_ref_retry);
+            throw std::runtime_error("target-only rollback reference produced no logits");
+        }
+        const std::vector<float> logits_target_only(logits_ref, logits_ref + n_vocab);
+        llama_batch_free(batch_ref_retry);
+
+        if (logits_after_rollback != logits_target_only) {
+            throw std::runtime_error("MTP rollback changed target logits");
+        }
+
+        llama_tokens draft_after_rollback;
+        common_speculative_get_draft_params(spec.get(), seq_id) = {
+            /* .drafting = */ true,
+            /* .n_max    = */ params.draft.n_max,
+            /* .n_past   = */ n_prompt + 1,
+            /* .id_last  = */ tokens[n_prompt + 1],
+            /* .prompt   = */ &prompt,
+            /* .result   = */ &draft_after_rollback,
+        };
+        common_speculative_draft(spec.get());
+        if (draft_after_rollback.empty()) {
+            throw std::runtime_error("MTP draft did not resume after forced rejection");
+        }
+    };
+
     for (const auto & dc : dev_configs) {
         auto model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.first,
             LLAMA_SPLIT_MODE_LAYER, false, nullptr, nullptr, /*load_mtp =*/ true);
 
         const std::vector<float> logits = run_mtp(model_and_ctx.first.get(), model_and_ctx.second.get());
+
+        auto rollback_model_and_ctx = get_model_and_ctx(gguf_ctx.get(), nullptr, seed, dc.first,
+            LLAMA_SPLIT_MODE_LAYER, false, nullptr, nullptr, /*load_mtp =*/ true);
+        run_mtp_reject_rollback(rollback_model_and_ctx.first.get(), rollback_model_and_ctx.second.get());
 
         bool ok = true;
         for (size_t i = 0; ok && i < logits.size(); i++) {
