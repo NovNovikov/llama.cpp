@@ -10209,6 +10209,21 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // The broad fusion matrix does not include Q2_K/Q3_K. Cover the Ada-relevant
+    // multi-token MUL_MAT_ID path explicitly at every supported specdec width,
+    // including GLM5Next's SWIGLU_CLAMP and SWIGLU_OAI, neither of which is
+    // present in the broad GLU-op matrix.
+    for (ggml_type type : {GGML_TYPE_Q2_K, GGML_TYPE_Q3_K}) {
+        for (int64_t m_batch : {2, 3, 4, 5, 6, 7, 8}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU, m_batch, 32, 256,
+                true, 16, 8, false, false, true, false, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU_OAI, m_batch, 32, 256,
+                true, 16, 8, false, true, true, false, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(type, GGML_GLU_OP_SWIGLU_CLAMP, m_batch, 32, 256,
+                true, 16, 8, false, false, true, false, {1, 1}));
+        }
+    }
+
     for (bool b : {false, true}) {
         test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_IQ2_S, GGML_GLU_OP_SWIGLU_CLAMP, 1, 32, 256,
             true, 16, 8, b, false, true, false));
@@ -10236,6 +10251,11 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+
+    // TOPK_MOE uses an 8-row CUDA block and synchronizes after reading logits.
+    // Exercise partial first blocks, where some row-warps exit before the barrier.
+    test_cases.emplace_back(new test_topk_moe({32, 3, 1, 1}, 8, false, false, GATING_FUNC_SOFTMAX, 0.0f));
+    test_cases.emplace_back(new test_topk_moe({32, 7, 1, 1}, 8, false, false, GATING_FUNC_SOFTMAX, 0.0f));
 
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 1, 1));
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 16, 1, 1));

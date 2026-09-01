@@ -3597,18 +3597,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     };
 
     auto get_bias_tensor = [](const ggml_tensor * bias_node, const ggml_tensor * mul_node, ggml_op op_bias) -> const ggml_tensor * {
+        const ggml_tensor * bias = nullptr;
+
         if (op_bias == GGML_OP_ADD) {
             if (bias_node->src[0] == mul_node) {
-                return bias_node->src[1];
+                bias = bias_node->src[1];
+            } else if (bias_node->src[1] == mul_node) {
+                bias = bias_node->src[0];
             }
-            if (bias_node->src[1] == mul_node) {
-                return bias_node->src[0];
-            }
+        } else {
+            GGML_ASSERT(op_bias == GGML_OP_ADD_ID);
+            GGML_ASSERT(bias_node->src[0] == mul_node);
+            bias = bias_node->src[1];
+        }
+
+        // The fused MMVQ kernels index expert biases with the output row/channel
+        // strides. Do not fuse a strided/view bias whose physical layout differs.
+        if (!bias || bias->type != GGML_TYPE_F32 || !ggml_is_contiguous(bias)) {
             return nullptr;
         }
-        GGML_ASSERT(op_bias == GGML_OP_ADD_ID);
-        GGML_ASSERT(bias_node->src[0] == mul_node);
-        return bias_node->src[1];
+
+        return bias;
     };
 
     // gate + glu + up, with optional scale/bias on both lanes.
