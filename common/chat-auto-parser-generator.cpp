@@ -563,14 +563,11 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
     // discussing tool-call syntax). Keep the original until(marker) fast path and only do extra
     // work when that exact marker is actually encountered.
     //
-    // For the simple tagged layout used by GLM:
-    //
-    //   <tool_call>name<arg_key>...
-    //   <tool_call>name</tool_call>
-    //
-    // qualify the marker with a real tool name and the next structural tag. A false marker is
-    // consumed as content and scanning resumes at the next marker. No per-character lookahead is
-    // added: marker-free output still goes through the same common_peg_until_parser as before.
+    // Treat marker + a registered tool name as a tool-call attempt immediately. Do not require
+    // the following argument/close tag to already be valid: malformed or partially generated tool
+    // calls must stay on the tool parser/grammar path instead of being reclassified as plain text.
+    // A marker not followed by any registered tool name is consumed as content and scanning resumes
+    // at the next marker. Marker-free output still uses the original common_peg_until_parser path.
     //
     // Limit this to AUTO/lazy tool mode. In REQUIRED mode the parser root is also converted to
     // non-lazy GBNF, where PEG lookahead is intentionally not represented.
@@ -589,29 +586,21 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         !format.per_call_end.empty();
 
     if (can_qualify_per_call_marker) {
-        auto next_tag = p.choice({
-            p.literal(arguments.name_prefix),
-            p.literal(format.per_call_end),
-        });
-
-        auto valid_after_marker = p.choice();
+        auto valid_tool_name = p.choice();
         foreach_function(inputs.tools, [&](const json & tool) {
             const auto & func = tool.at("function");
             const std::string name = func.at("name");
-            valid_after_marker |=
-                p.literal(name) +
-                p.space() +
-                p.peek(next_tag);
+            valid_tool_name |= p.literal(name);
         });
 
         auto valid_tool_start =
             p.literal(trigger_marker) +
             p.space() +
-            valid_after_marker;
+            valid_tool_name;
 
-        // At a real call, negate(valid_tool_start) fails without consuming the marker, leaving it
-        // for tool_calls. At a textual marker it succeeds, consumes only the marker, then returns
-        // immediately to the optimized until(marker) scanner.
+        // At a tool-call attempt, negate(valid_tool_start) fails without consuming the marker,
+        // leaving it for tool_calls (and therefore for grammar validation). At a textual marker it
+        // succeeds, consumes only the marker, then returns to the optimized until(marker) scanner.
         auto false_marker = p.negate(valid_tool_start) + p.literal(trigger_marker);
         auto content_chunk = p.until(trigger_marker);
 
