@@ -2,8 +2,6 @@
 
 #include "llama-memory-hybrid.h"
 
-#include <array>
-#include <map>
 #include <memory>
 #include <vector>
 
@@ -80,20 +78,23 @@ public:
 
     llama_kv_cache * get_mem_idx() const;   // nullptr when the model carries no indexer
 
-    void set_input_qsa(ggml_tensor * block_cells, ggml_tensor * block_pos,
-                       ggml_tensor * block_mask, ggml_tensor * selected,
-                       const ggml_tensor * kq_mask, const llama_ubatch * ubatch,
-                       uint32_t ratio, uint32_t block_topk) const;
+    // block-compressed sparse attention (qwen4exp QSA) over the cells of the indexer cache.
+    // Blocks cut the position line, not the cell array, so no caller assumes a contiguous layout:
+    //   cell_blk  I32 [n_kv, ns]           block each cell belongs to
+    //   blk_cells I32 [ratio*n_blocks, ns] cells making up each block
+    //   blk_pos   I32 [4*n_blocks*ns]      mrope position rows of each block's first token
+    //   bias      F32 [n_kv, n_tokens/ns, ns] -inf where invisible, large where always visible
+    // blk_bias asks for the bias per block instead: [n_blocks, n_tokens/ns, ns]
+    // the caller then adds the attention mask, the only part of the bias that varies within a block
+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       bool blk_bias) const;
 
-    void commit_qsa_tokens(const llama_ubatch & ubatch);
+    // k-pool selection for GLM5Next DSA.
+    void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_bias, ggml_tensor * tail_cells,
+                         const llama_ubatch * ubatch, uint32_t ratio) const;
 
 private:
-    struct qsa_token {
-        std::array<llama_pos, 4> pos;
-    };
-
-    using qsa_history = std::vector<qsa_token>;
-
     // forget seq_id (all of it if seq_id < 0) in every cache at once, so a failed restore cannot leave the caches out of step
     // seq_id < 0 drops the whole context, as the caches themselves do on a failed restore
     void state_drop(llama_seq_id seq_id);
@@ -103,8 +104,6 @@ private:
     llama_hparams hparams_idx;
 
     const std::unique_ptr<llama_kv_cache> mem_idx;
-
-    std::map<llama_seq_id, qsa_history> qsa_histories;
 };
 
 class llama_memory_hybrid_idx_context : public llama_memory_hybrid_context {
@@ -149,33 +148,19 @@ public:
     // streams in the current slot info, the `ns` of get_k/get_v; 1 if unified
     uint32_t get_n_stream() const;
 
-    // QSA blocks follow each sequence's token order, not physical cells or scalar positions.
-    void set_input_qsa(ggml_tensor * block_cells, ggml_tensor * block_pos,
-                       ggml_tensor * block_mask, ggml_tensor * selected,
-                       const ggml_tensor * kq_mask, const llama_ubatch * ubatch,
-                       uint32_t ratio, uint32_t block_topk) const;
-
-    // k-pool selection (glm5next DSA) over the same cells. Where set_input_qsa biases attention
-    // scores, this biases the top-k that picks the pools, so a pool is offered to a query only
-    // when it is complete and its last member is already visible:
-    //   pool_cells I32 [ratio*n_pools, ns]      cells making up each pool
-    //   pool_bias  F32 [n_pools, n_tokens/ns, ns] 0 where selectable, -inf otherwise
-    //   tail_cells I32 [ratio-1, n_tokens/ns, 1, ns] optional: the cells of each query's own
-    //     incomplete trailing pool, which has no pool key and so is expanded directly
-    void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_bias, ggml_tensor * tail_cells,
-                         const llama_ubatch * ubatch, uint32_t ratio) const;
+    void set_input_qsa(ggml_tensor * cell_blk, ggml_tensor * blk_cells, ggml_tensor * blk_pos,
+                       ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
+                       bool blk_bias) const;
 
 private:
-    llama_memory_hybrid_idx * mem = nullptr;
+    const llama_memory_hybrid_idx * mem = nullptr;
 
     // streams per ubatch, read from the slot infos before ctx_idx takes them
     // declared first, so it is initialised while sinfos_idx is still intact
     const std::vector<uint32_t> ns_ubatch;
 
-    // null unless the model has an indexer and this is a batch or full context
+    // null unless the model has an indexer
     const llama_memory_context_ptr ctx_idx;
-
-    const bool has_ubatches = false;
 
     // mirrors the base class's ubatch cursor, which is private there
     size_t i_cur = 0;
