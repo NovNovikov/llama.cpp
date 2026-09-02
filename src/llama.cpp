@@ -64,7 +64,7 @@ const char * llama_load_mode_name(enum llama_load_mode load_mode) {
     GGML_ABORT("fatal error");
 }
 
-enum llama_load_mode llama_load_mode_from_str(const char * str) {
+enum llama_load_mode llama_load_mode_from_str(const char * str) noexcept(false) {
     if (std::strcmp(str, "auto")       == 0) { return LLAMA_LOAD_MODE_AUTO;       }
     if (std::strcmp(str, "none")       == 0) { return LLAMA_LOAD_MODE_NONE;       }
     if (std::strcmp(str, "mmap")       == 0) { return LLAMA_LOAD_MODE_MMAP;       }
