@@ -976,7 +976,8 @@ static constexpr uint32_t SLOT_META_VERSION_STATE_ABI_MEDIA = 8u;
 static constexpr uint32_t SLOT_META_VERSION_STATE_ABI_SAFE_NODE = 9u;
 static constexpr uint32_t SLOT_META_VERSION_STATE_ABI_SAFE_MEDIA_NODE = 10u;
 // Bump whenever the serialized llama state consumed by automatic snapshots changes.
-static constexpr uint32_t AUTO_SNAPSHOT_STATE_ABI = 1u;
+// v2: Qwen4-Exp QSA state switched from the fork's serialized history to upstream's indexer KV layout.
+static constexpr uint32_t AUTO_SNAPSHOT_STATE_ABI = 2u;
 static constexpr uint32_t SLOT_META_MEDIA_MAX = 4096u;
 static constexpr uint32_t SLOT_META_ID_MAX    = 256u;
 
