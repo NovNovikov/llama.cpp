@@ -2359,11 +2359,6 @@ struct llama_model_qwen4exp : public llama_model_base {
     struct graph : public llm_build_delta_net_base {
         graph(const llama_model & model, const llm_graph_params & params);
     private:
-        struct qsa_selection {
-            ggml_tensor * mask;
-            ggml_tensor * cells;
-        };
-
         // HC replaces every layer norm: residual is [n_embd, hc, n_tokens]
         ggml_tensor * build_hc_mix(
                     ggml_tensor * x,
@@ -2392,23 +2387,22 @@ struct llama_model_qwen4exp : public llama_model_base {
         // so the layers sharing a ratio share one input set
         std::map<uint32_t, llm_graph_input_qsa *> qsa_inps;
 
-        // QSA mask and selected cells for this layer, or null tensors for dense attention
-        qsa_selection build_qsa_selection(
+        // QSA: token indices this layer's queries may attend to, or nullptr for dense
+        ggml_tensor * build_qsa_top_k(
   const llama_memory_hybrid_idx_context * mctx_hyb,
                     ggml_tensor * cur,
                     ggml_tensor * inp_pos,
                     ggml_tensor * kq_mask,
-                    int * sections,
-                    int   il);
+                            int * sections,
+                            int   il);
 
-        // attention over the selected QSA cells gathered into a window per query
-        ggml_tensor * build_attn_qsa_gather(
+        // dense self-attention restricted to the cells that top_k names
+        ggml_tensor * build_attn_qsa(
         llm_graph_input_attn_kv * inp,
                     ggml_tensor * q_cur,
                     ggml_tensor * k_cur,
                     ggml_tensor * v_cur,
-                    ggml_tensor * selected_cells,
-                    ggml_tensor * selected_mask,
+                    ggml_tensor * top_k,
                           float   kq_scale,
                             int   il);
 
