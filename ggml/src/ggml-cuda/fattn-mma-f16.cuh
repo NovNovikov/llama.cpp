@@ -5,12 +5,10 @@
 
 using namespace ggml_cuda_mma;
 
-// The banded F16 MMA path retains its dedicated score-bias implementation. Sparse F16 MMA uses
-// a different tile-loading ABI and therefore remains disabled for these instantiations.
 static constexpr __host__ __device__ bool ggml_cuda_flash_attn_ext_mma_f16_may_use_sparse(
         const int DKQ, const int DV, const int ncols1, const int ncols2) {
-    GGML_UNUSED_VARS(DKQ, DV, ncols1, ncols2);
-    return false;
+    return (DKQ == 512 && DV == 512 && ncols1 == 1 && ncols2 == 8) ||
+           (DKQ == 576 && DV == 512 && ncols1 == 1 && ncols2 == 16);
 }
 
 static __device__ __forceinline__ float fattn_direct_rel_bias(
