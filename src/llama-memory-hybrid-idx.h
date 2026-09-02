@@ -152,6 +152,9 @@ public:
                        ggml_tensor * bias, const llama_ubatch * ubatch, uint32_t ratio,
                        bool blk_bias) const;
 
+    void set_input_kpool(ggml_tensor * pool_cells, ggml_tensor * pool_bias, ggml_tensor * tail_cells,
+                         const llama_ubatch * ubatch, uint32_t ratio) const;
+
 private:
     const llama_memory_hybrid_idx * mem = nullptr;
 
