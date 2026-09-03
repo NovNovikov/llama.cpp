@@ -102,7 +102,10 @@ static void server_accumulate_runtime_memory_buffers(
 }
 
 #if defined(_WIN32)
-static void server_log_wddm_process_memory(uint64_t cuda_host_compute) {
+static void server_log_wddm_process_memory(
+        const char * stage,
+        uint64_t known_device,
+        uint64_t cuda_host_compute) {
     using create_dxgi_factory1_t = HRESULT (WINAPI *)(REFIID riid, void ** pp_factory);
 
     HMODULE dxgi = LoadLibraryW(L"dxgi.dll");
@@ -154,18 +157,48 @@ static void server_log_wddm_process_memory(uint64_t cuda_host_compute) {
         const uint64_t ram_spill = local_budget_exhausted && selected_shared.CurrentUsage > cuda_host_compute
                 ? selected_shared.CurrentUsage - cuda_host_compute
                 : 0;
-        SRV_INF("memory: VRAM=%.2f MiB | RAM spill=%.2f MiB\n",
-                selected_local.CurrentUsage/MiB, ram_spill/MiB);
+        const double local_usage = selected_local.CurrentUsage/MiB;
+        const double local_budget = selected_local.Budget/MiB;
+        const double local_headroom =
+                ((double) selected_local.Budget - (double) selected_local.CurrentUsage)/MiB;
+        const double known = known_device/MiB;
+        const double delta = ((double) selected_local.CurrentUsage - (double) known_device)/MiB;
+
+        SRV_INF(
+                "memory[%s]: local=%.2f MiB | budget=%.2f MiB | headroom=%+.2f MiB | "
+                "known=%.2f MiB | delta=%+.2f MiB | local-res=%.2f MiB | "
+                "avail-res=%.2f MiB | shared=%.2f MiB | RAM spill=%.2f MiB\n",
+                stage,
+                local_usage,
+                local_budget,
+                local_headroom,
+                known,
+                delta,
+                selected_local.CurrentReservation/MiB,
+                selected_local.AvailableForReservation/MiB,
+                selected_shared.CurrentUsage/MiB,
+                ram_spill/MiB);
     }
 }
 
 static std::atomic<uint64_t> server_cuda_host_compute = 0;
+static std::atomic<uint64_t> server_known_device = 0;
+
+static std::atomic<bool> server_wddm_logged_first_target_pp  = false;
+static std::atomic<bool> server_wddm_logged_first_spec_pp    = false;
+static std::atomic<bool> server_wddm_logged_first_target_tg  = false;
+static std::atomic<bool> server_wddm_logged_first_spec_tg    = false;
+static std::atomic<bool> server_wddm_logged_first_draft_gen  = false;
 
 static void server_log_wddm_memory_report() {
-    server_log_wddm_process_memory(server_cuda_host_compute.load(std::memory_order_acquire));
+    server_log_wddm_process_memory(
+            "runtime-callback",
+            server_known_device.load(std::memory_order_acquire),
+            server_cuda_host_compute.load(std::memory_order_acquire));
 }
 
 static void server_log_runtime_memory_usage(
+        const char * stage,
         const llama_context * ctx_tgt,
         const llama_context * ctx_dft) {
     llama_memory_breakdown_data device;
@@ -175,8 +208,10 @@ static void server_log_runtime_memory_usage(
         const bool shares_model = llama_get_model(ctx_dft) == llama_get_model(ctx_tgt);
         server_accumulate_runtime_memory_buffers(ctx_dft, !shares_model, device, host);
     }
+    const uint64_t known_device = device.model + device.context + device.compute;
+    server_known_device.store(known_device, std::memory_order_release);
     server_cuda_host_compute.store(host.compute, std::memory_order_release);
-    server_log_wddm_memory_report();
+    server_log_wddm_process_memory(stage, known_device, host.compute);
 }
 #endif
 
@@ -4288,6 +4323,19 @@ private:
 
         const bool is_resume = sleeping;
 
+#if defined(_WIN32)
+        server_wddm_logged_first_target_pp.store(false, std::memory_order_release);
+        server_wddm_logged_first_spec_pp.store(false, std::memory_order_release);
+        server_wddm_logged_first_target_tg.store(false, std::memory_order_release);
+        server_wddm_logged_first_spec_tg.store(false, std::memory_order_release);
+        server_wddm_logged_first_draft_gen.store(false, std::memory_order_release);
+        server_known_device.store(0, std::memory_order_release);
+        server_cuda_host_compute.store(0, std::memory_order_release);
+        if (!is_resume) {
+            server_log_wddm_process_memory("pre-target", 0, 0);
+        }
+#endif
+
         params_base = params;
         const auto output_limits = server_output_limits(params_base);
         params_base.n_outputs_max = output_limits.total;
@@ -4664,6 +4712,10 @@ private:
             return false;
         }
 
+#if defined(_WIN32)
+        server_log_runtime_memory_usage("after-target", ctx_tgt, nullptr);
+#endif
+
         vocab = llama_model_get_vocab(model_tgt);
 
         n_ctx = llama_n_ctx(ctx_tgt);
@@ -4845,7 +4897,7 @@ private:
         }
 
 #if defined(_WIN32)
-        server_log_runtime_memory_usage(ctx_tgt, ctx_dft);
+        server_log_runtime_memory_usage("after-draft-init", ctx_tgt, ctx_dft);
         if (ggml_moe_cache.set_memory_report_callback) {
             ggml_moe_cache.set_memory_report_callback(server_log_wddm_memory_report);
         }
@@ -4869,7 +4921,7 @@ private:
             slot.callback_on_release = [this](int id_slot) {
                 queue_tasks.pop_deferred_task(id_slot);
 #if defined(_WIN32)
-                server_log_runtime_memory_usage(ctx_tgt, ctx_dft);
+                server_log_runtime_memory_usage("after-request", ctx_tgt, ctx_dft);
 #endif
             };
 
@@ -6766,6 +6818,12 @@ private:
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+#if defined(_WIN32)
+            if (!server_wddm_logged_first_draft_gen.load(std::memory_order_relaxed) &&
+                   !server_wddm_logged_first_draft_gen.exchange(true, std::memory_order_acq_rel)) {
+                server_log_runtime_memory_usage("after-first-draft-generate", ctx_tgt, ctx_dft);
+            }
+#endif
         }
 
         // make checkpoints if needed
@@ -7794,8 +7852,12 @@ private:
         }
 
         bool has_output = false;
+        bool has_prompt_tokens = false;
+        bool has_generation_tokens = false;
         for (int i = off; i < off + batch_view.n_tokens; ++i) {
             has_output |= batch.tokens[i].output;
+            has_prompt_tokens |= batch.tokens[i].is_prompt;
+            has_generation_tokens |= !batch.tokens[i].is_prompt;
         }
 
         // yield to the queue, so we can still handle metrics tasks while decoding
@@ -7861,6 +7923,19 @@ private:
             metrics_post_decode(off, batch_view.n_tokens, has_output);
         }
 
+#if defined(_WIN32)
+        if (has_prompt_tokens &&
+               !server_wddm_logged_first_target_pp.load(std::memory_order_relaxed) &&
+               !server_wddm_logged_first_target_pp.exchange(true, std::memory_order_acq_rel)) {
+            server_log_runtime_memory_usage("after-first-target-pp", ctx_tgt, ctx_dft);
+        }
+        if (has_generation_tokens &&
+               !server_wddm_logged_first_target_tg.load(std::memory_order_relaxed) &&
+               !server_wddm_logged_first_target_tg.exchange(true, std::memory_order_acq_rel)) {
+            server_log_runtime_memory_usage("after-first-target-tg", ctx_tgt, ctx_dft);
+        }
+#endif
+
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
@@ -7876,6 +7951,19 @@ private:
                 // TODO: handle error
                 throw std::runtime_error("failed to process speculative batch");
             }
+
+#if defined(_WIN32)
+            if (has_prompt_tokens &&
+                   !server_wddm_logged_first_spec_pp.load(std::memory_order_relaxed) &&
+                   !server_wddm_logged_first_spec_pp.exchange(true, std::memory_order_acq_rel)) {
+                server_log_runtime_memory_usage("after-first-spec-pp", ctx_tgt, ctx_dft);
+            }
+            if (has_generation_tokens &&
+                   !server_wddm_logged_first_spec_tg.load(std::memory_order_relaxed) &&
+                   !server_wddm_logged_first_spec_tg.exchange(true, std::memory_order_acq_rel)) {
+                server_log_runtime_memory_usage("after-first-spec-tg", ctx_tgt, ctx_dft);
+            }
+#endif
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
