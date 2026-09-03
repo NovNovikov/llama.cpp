@@ -4405,6 +4405,22 @@ private:
                 if (spec_mtp) {
                     cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
                 }
+
+                // Keep the server-side draft memory probe consistent with the
+                // real speculative context and the initial --fit measurement.
+                // DFlash/DSpark prompt injection is already chunked by the draft
+                // n_ubatch, so inheriting a 2K/4K target batch only inflates the
+                // temporary draft compute buffers by gigabytes.
+                {
+                    const uint32_t n_batch_dft = 512;
+                    if (cparams_dft.n_batch > n_batch_dft) {
+                        cparams_dft.n_batch = n_batch_dft;
+                    }
+                    if (cparams_dft.n_ubatch > n_batch_dft) {
+                        cparams_dft.n_ubatch = n_batch_dft;
+                    }
+                }
+
                 cparams_dft.n_rs_seq = 0;
 
                 std::vector<ggml_backend_dev_t> devs;
