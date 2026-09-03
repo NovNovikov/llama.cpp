@@ -4300,6 +4300,9 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        const bool spec_eagle3 = std::find(params_base.speculative.types.begin(),
+                                           params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3) != params_base.speculative.types.end();
         const bool spec_dflash = std::find(params_base.speculative.types.begin(),
                                            params_base.speculative.types.end(),
                                            COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
@@ -4423,7 +4426,7 @@ private:
                     } catch (const std::exception &) {
                         const bool needs_ctx_other_retry =
                             has_draft &&
-                            (spec_mtp || spec_dflash || spec_dspark) &&
+                            (spec_mtp || spec_eagle3 || spec_dflash || spec_dspark) &&
                             cparams_dft.ctx_other == nullptr;
 
                         if (!needs_ctx_other_retry) {
