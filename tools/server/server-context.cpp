@@ -4300,6 +4300,12 @@ private:
         const bool spec_mtp = std::find(params_base.speculative.types.begin(),
                                         params_base.speculative.types.end(),
                                         COMMON_SPECULATIVE_TYPE_DRAFT_MTP) != params_base.speculative.types.end();
+        const bool spec_dflash = std::find(params_base.speculative.types.begin(),
+                                           params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params_base.speculative.types.end();
+        const bool spec_dspark = std::find(params_base.speculative.types.begin(),
+                                           params_base.speculative.types.end(),
+                                           COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK) != params_base.speculative.types.end();
         const bool has_spec = has_draft || spec_mtp;
 
         if (callback_state) {
@@ -4417,17 +4423,16 @@ private:
                     } catch (const std::exception &) {
                         const bool needs_ctx_other_retry =
                             has_draft &&
-                            spec_mtp &&
+                            (spec_mtp || spec_dflash || spec_dspark) &&
                             cparams_dft.ctx_other == nullptr;
 
                         if (!needs_ctx_other_retry) {
                             throw;
                         }
 
-                        // Gemma4 assistant draft models need a valid target context even
-                        // during the temporary VRAM probe used for sizing. Build a
-                        // transient target context so the MTP draft requirement is still
-                        // accounted for instead of being dropped from the estimate.
+                        // Some sidecar draft models need a valid target context to share
+                        // tensors even during the temporary VRAM probe. Build a transient
+                        // target context so their memory requirement remains accounted for.
                         SRV_INF("%s\n", "[spec] retrying draft model memory measurement with temporary ctx_other");
 
                         auto mparams_tgt_probe = common_model_params_to_llama(params_base);
