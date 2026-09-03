@@ -1314,6 +1314,23 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         if (spec_mtp) {
             cparams_dft.ctx_type = LLAMA_CONTEXT_TYPE_MTP;
         }
+
+        // Keep --fit consistent with the real speculative context. The runtime
+        // draft context is capped to 512 tokens because DFlash/DSpark already
+        // chunks target prompt features by the draft n_ubatch. Measuring the
+        // extra model with the target's 2K/4K batch would otherwise overestimate
+        // draft compute memory by gigabytes and force --fit to evict useful target
+        // weights/cache unnecessarily.
+        {
+            const uint32_t n_batch_dft = 512;
+            if (cparams_dft.n_batch > n_batch_dft) {
+                cparams_dft.n_batch = n_batch_dft;
+            }
+            if (cparams_dft.n_ubatch > n_batch_dft) {
+                cparams_dft.n_ubatch = n_batch_dft;
+            }
+        }
+
         cparams_dft.n_rs_seq = 0;
 
         const common_fit_extra_model extra = {

@@ -2641,6 +2641,21 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+
+    // The draft context inherits the target's n_batch/n_ubatch, but a drafter only
+    // submits a small block during generation and DFlash/DSpark prompt injection is
+    // already chunked by llama_n_ubatch(ctx_dft). Keeping a target-sized batch here
+    // makes the draft compute buffers unnecessarily huge.
+    {
+        const uint32_t n_batch_dft = 512;
+        if (cparams.n_batch > n_batch_dft) {
+            cparams.n_batch = n_batch_dft;
+        }
+        if (cparams.n_ubatch > n_batch_dft) {
+            cparams.n_ubatch = n_batch_dft;
+        }
+    }
+
     // Draft/MTP contexts only emit draft logits; they must not inherit target
     // embedding/pooling mode from the server context.
     cparams.embeddings   = false;
