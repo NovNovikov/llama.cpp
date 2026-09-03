@@ -212,11 +212,7 @@ extern "C" {
     };
 
     LLAMA_API const char * llama_load_mode_name(enum llama_load_mode load_mode);
-    LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str)
-#ifdef __cplusplus
-        noexcept(false)
-#endif
-        ;
+    LLAMA_API enum llama_load_mode llama_load_mode_from_str(const char * str);
 
     enum llama_lazy_mode {
         LLAMA_LAZY_MODE_OFF  = 0, // always read the whole tensor up front
