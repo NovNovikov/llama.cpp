@@ -151,6 +151,7 @@ static const std::map<llm_arch, const char *> LLM_ARCH_NAMES = {
     { LLM_ARCH_MAINCODER,        "maincoder"        },
     { LLM_ARCH_KIMI_LINEAR,      "kimi-linear"      },
     { LLM_ARCH_KIMI_K3,          "kimi-k3"          },
+    { LLM_ARCH_GLM5_NEXT,        "glm5-next"        },
     { LLM_ARCH_SOLAR_OPEN2,      "solar-open2"      },
     { LLM_ARCH_TALKIE,           "talkie"           },
     { LLM_ARCH_MELLUM,           "mellum"           },
@@ -287,6 +288,8 @@ static const std::map<llm_kv, const char *> LLM_KV_NAMES = {
     { LLM_KV_ATTENTION_INDEXER_TOP_K,                "%s.attention.indexer.top_k"                },
     { LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,           "%s.attention.indexer.block_size"           },
     { LLM_KV_ATTENTION_INDEXER_KPOOL,                "%s.attention.indexer.kpool"                },
+    { LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL,    "%s.attention.indexer.kpool_select_tail"    },
+    { LLM_KV_ATTENTION_INDEXER_INDEX_SHARE_MTP,      "%s.attention.indexer.index_share_mtp"      },
     { LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS,         "%s.attention.indexer.local_blocks"         },
     { LLM_KV_ATTENTION_INDEXER_TYPES,                "%s.attention.indexer.types"                },
     { LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,           "%s.attention.output_group_count"           },
@@ -705,6 +708,8 @@ static const std::map<llm_tensor, const char *> LLM_TENSOR_NAMES = {
     { LLM_TENSOR_INDEXER_COMPRESSOR_WGATE,               "blk.%d.indexer_compressor_gate" },
     { LLM_TENSOR_INDEXER_COMPRESSOR_APE,                 "blk.%d.indexer_compressor_ape" },
     { LLM_TENSOR_INDEXER_COMPRESSOR_NORM,                "blk.%d.indexer_compressor_norm" },
+    { LLM_TENSOR_INDEXER_KPOOL_GATE,                     "blk.%d.indexer_compressor_gate" },
+    { LLM_TENSOR_INDEXER_KPOOL_APE,                      "blk.%d.indexer_compressor_ape" },
     { LLM_TENSOR_FFN_GATE_TID2EID,                       "blk.%d.ffn_gate_tid2eid" },
     { LLM_TENSOR_MASKED_EMBD_CENTROIDS,                  "masked_embd_centroids" },
     { LLM_TENSOR_MASKED_EMBD_ORDERING,                   "masked_embd_ordering" },
@@ -987,6 +992,8 @@ static const std::map<llm_tensor, llm_tensor_info> LLM_TENSOR_INFOS = {
     {LLM_TENSOR_INDEXER_COMPRESSOR_WGATE,   {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_INDEXER_COMPRESSOR_APE,     {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
     {LLM_TENSOR_INDEXER_COMPRESSOR_NORM,    {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL}},
+    {LLM_TENSOR_INDEXER_KPOOL_GATE,         {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
+    {LLM_TENSOR_INDEXER_KPOOL_APE,          {LLM_TENSOR_LAYER_REPEATING, GGML_OP_ADD}},
     {LLM_TENSOR_FFN_GATE_TID2EID,           {LLM_TENSOR_LAYER_REPEATING, GGML_OP_GET_ROWS}},
     {LLM_TENSOR_NEXTN_PROJ_PRE,             {LLM_TENSOR_LAYER_REPEATING, GGML_OP_MUL_MAT}},
     {LLM_TENSOR_NEXTN_PROJ_POST,            {LLM_TENSOR_LAYER_OUTPUT,    GGML_OP_MUL_MAT}},
@@ -1069,6 +1076,10 @@ const char * llm_arch_name(llm_arch arch) {
 }
 
 llm_arch llm_arch_from_string(const std::string & name) {
+    // legacy GLM5Next GGUF compatibility: normalize old "glm5next" arch to new "glm5-next"
+    if (name == "glm5next") {
+        return LLM_ARCH_GLM5_NEXT;
+    }
     for (const auto & kv : LLM_ARCH_NAMES) { // NOLINT
         if (kv.second == name) {
             return kv.first;
@@ -1110,6 +1121,7 @@ bool llm_arch_is_hybrid(const llm_arch & arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_SOLAR_OPEN2:
         case LLM_ARCH_QWEN35:
         case LLM_ARCH_QWEN35MOE:
@@ -1183,6 +1195,7 @@ bool llm_arch_supports_sm_tensor(const llm_arch & arch) {
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_BAILINGMOE3:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_SOLAR_OPEN2:
         case LLM_ARCH_QWEN4EXP:
         case LLM_ARCH_GLM5NEXT:

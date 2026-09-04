@@ -204,7 +204,9 @@ static llama_model * llama_model_mapping(llm_arch arch, const llama_model_params
         case LLM_ARCH_GLM_DSA:
             return new llama_model_glm_dsa(params);
         case LLM_ARCH_GLM5NEXT:
-            return new llama_model_glm5next(params);
+            return new llama_model_glm5_next(params);
+        case LLM_ARCH_GLM5_NEXT:
+            return new llama_model_glm5_next(params);
         case LLM_ARCH_MISTRAL4:
             return new llama_model_mistral4(params);
         case LLM_ARCH_CHATGLM:
@@ -974,6 +976,7 @@ const char * llm_type_name(llm_type type) {
         case LLM_TYPE_685B_A37B:     return "685B.A37B";
         case LLM_TYPE_744B_A40B:     return "744B.A40B";
         case LLM_TYPE_2_8T_A50B:     return "2.8T.A50B";
+        case LLM_TYPE_320B_A18B:     return "320B.A18B";
         case LLM_TYPE_E2B:           return "E2B";
         case LLM_TYPE_E4B:           return "E4B";
         default:                     return "?B";
@@ -2018,7 +2021,8 @@ void llama_model::print_info() const {
                 arch == LLM_ARCH_QWEN35MOE ||
                 arch == LLM_ARCH_NEMOTRON_H ||
                 arch == LLM_ARCH_NEMOTRON_H_MOE ||
-                arch == LLM_ARCH_GLM5NEXT) {
+                arch == LLM_ARCH_GLM5NEXT ||
+                arch == LLM_ARCH_GLM5_NEXT) {
             LLAMA_LOG_INFO("%s: ssm_d_conv            = %u\n",     __func__, hparams.ssm_d_conv);
             LLAMA_LOG_INFO("%s: ssm_d_inner           = %u\n",     __func__, hparams.ssm_d_inner);
             LLAMA_LOG_INFO("%s: ssm_d_state           = %u\n",     __func__, hparams.ssm_d_state);
@@ -2051,7 +2055,8 @@ void llama_model::print_info() const {
         if (arch == LLM_ARCH_DEEPSEEK2 || arch == LLM_ARCH_DEEPSEEK2OCR ||
                 arch == LLM_ARCH_DEEPSEEK32 || arch == LLM_ARCH_GLM_DSA ||
                 arch == LLM_ARCH_DOTS3NOTE || arch == LLM_ARCH_MISTRAL4 ||
-                arch == LLM_ARCH_GLM5NEXT) {
+                arch == LLM_ARCH_GLM5NEXT ||
+                arch == LLM_ARCH_GLM5_NEXT) {
             LLAMA_LOG_INFO("%s: n_layer_dense_lead    = %d\n",     __func__, hparams.n_layer_dense_lead);
             LLAMA_LOG_INFO("%s: n_lora_q              = %d\n",     __func__, hparams.n_lora_q);
             LLAMA_LOG_INFO("%s: n_lora_kv             = %d\n",     __func__, hparams.n_lora_kv);
@@ -2480,6 +2485,50 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* filter_recr       */ std::move(filter_recr),
                     /* filter_idx        */ std::move(filter_idx));
             } break;
+        case LLM_ARCH_GLM5_NEXT:
+            {
+                // KDA layers are recurrent, the DSA layers use a K-only MLA cache plus an indexer cache.
+                // The Nextn block is never attended by the trunk graph
+                llama_memory_hybrid_idx::layer_filter_cb filter_attn = [&](uint32_t il) { return il < hparams.n_layer() && !hparams.is_recr(il); };
+                llama_memory_hybrid_idx::layer_filter_cb filter_idx = [&](uint32_t il) { return il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il); };
+                llama_memory_hybrid_idx::layer_filter_cb filter_recr = [&](uint32_t il) { return il < hparams.n_layer() && hparams.is_recr(il); };
+
+                // the draft head is a single DSA layer
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+                    if (hparams.n_layer_nextn == 0) {
+                        throw std::runtime_error("GLM5-Next MTP requires the NextN block, convert without --no-mtp");
+                    }
+                    filter_attn = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    filter_idx  = [&](uint32_t il) { return il >= hparams.n_layer(); };
+                    filter_recr = [&](uint32_t)    { return false; };
+                }
+
+                uint32_t idx_row_size = hparams.indexer_head_size * (hparams.indexer_kpool > 0 ? 3 : 1);
+                if (idx_row_size == 0 && hparams.indexer_head_size > 0 && hparams.indexer_block_size > 0) {
+                    idx_row_size = hparams.indexer_head_size * 3;
+                }
+
+                res = new llama_memory_hybrid_idx(
+                    *this,
+                    params.type_k,
+                    params.type_v,
+                    !cparams.flash_attn,
+                    cparams.n_ctx_seq,
+                    1,
+                    hparams.n_swa,
+                    hparams.swa_type,
+                    GGML_TYPE_F32,
+                    GGML_TYPE_F32,
+                    std::max((uint32_t) 1, cparams.n_seq_max),
+                    idx_row_size,
+                    cparams.n_seq_max,
+                    cparams.n_rs_seq,
+                    cparams.offload_kqv,
+                    cparams.kv_unified,
+                    std::move(filter_attn),
+                    std::move(filter_recr),
+                    std::move(filter_idx));
+            } break;
         case LLM_ARCH_DFLASH:
             {
                 // DSV4 DSpark stages store a single MLA-style K per position (window = the draft ring)
@@ -2899,6 +2948,7 @@ llama_rope_type llama_model_rope_type(const llama_model * model) {
         case LLM_ARCH_NEMOTRON_H_MOE:
         case LLM_ARCH_KIMI_LINEAR:
         case LLM_ARCH_KIMI_K3:
+        case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_SOLAR_OPEN2:
         case LLM_ARCH_INKLING:
         case LLM_ARCH_GLM5NEXT:
