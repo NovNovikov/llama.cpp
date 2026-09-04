@@ -122,7 +122,7 @@ static gguf_context_ptr get_gguf_ctx(
         n_embd = 160; // exercise per-head tensor split granularity with head size 80
     } else if (arch == LLM_ARCH_QWEN3 || arch == LLM_ARCH_MUSE_GLIMMER || arch == LLM_ARCH_AFMOE) {
         n_head = 4;
-    } else if (arch == LLM_ARCH_GLM5NEXT) {
+    } else if (arch == LLM_ARCH_GLM5NEXT || arch == LLM_ARCH_GLM5_NEXT) {
         n_embd = 128;
         n_head = 1;
         n_ff   = 192;
@@ -185,14 +185,19 @@ static gguf_context_ptr get_gguf_ctx(
 
     if (arch == LLM_ARCH_PLAMO2 || arch == LLM_ARCH_JAMBA || arch == LLM_ARCH_NEMOTRON_H || arch == LLM_ARCH_NEMOTRON_H_MOE ||
             arch == LLM_ARCH_GRANITE_HYBRID || arch == LLM_ARCH_LFM2 || arch == LLM_ARCH_LFM2MOE || arch == LLM_ARCH_KIMI_LINEAR ||
-            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3) {
+            arch == LLM_ARCH_BAILINGMOE3 || arch == LLM_ARCH_KIMI_K3 || arch == LLM_ARCH_GLM5_NEXT) {
         GGML_ASSERT(n_layer >= 2);
         std::vector<uint32_t> n_head_per_layer;
         n_head_per_layer.reserve(n_layer);
         for (uint32_t il = 0; il < n_layer; il++) {
             n_head_per_layer.push_back(il == 1 ? 0 : n_head);
         }
-        ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
+        // GLM5 next KDA heads come from the uniform head count, only head_count_kv is per layer.
+        if (arch == LLM_ARCH_GLM5_NEXT) {
+            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
+        } else {
+            ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head_per_layer);
+        }
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT_KV, n_head_per_layer);
     } else {
         ms.add_kv(LLM_KV_ATTENTION_HEAD_COUNT, n_head);
@@ -233,7 +238,7 @@ static gguf_context_ptr get_gguf_ctx(
             }
             ms.add_kv(LLM_KV_ATTENTION_INDEXER_TYPES, indexer_types);
         }
-    } else if (arch == LLM_ARCH_GLM5NEXT) {
+    } else if (arch == LLM_ARCH_GLM5NEXT || arch == LLM_ARCH_GLM5_NEXT) {
         // mla_use_nope: qk_rope_head_dim == 0, no RoPE anywhere
         ms.add_kv(LLM_KV_ATTENTION_KEY_LENGTH,       uint32_t(512)); // kv_lora_rank + 0
         ms.add_kv(LLM_KV_ATTENTION_VALUE_LENGTH,     uint32_t(512));
@@ -323,10 +328,15 @@ static gguf_context_ptr get_gguf_ctx(
 
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_TOP_K,        DSA_INDEXER_TOP_K);
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_BLOCK_SIZE,   DSA_INDEXER_KPOOL);
+    // native GLM5-Next k-pool schema; legacy GLM5NEXT keeps block_size as the kpool source
+    if (arch == LLM_ARCH_GLM5_NEXT) {
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL,             DSA_INDEXER_KPOOL);
+        ms.add_kv(LLM_KV_ATTENTION_INDEXER_KPOOL_SELECT_TAIL, true);
+    }
     ms.add_kv(LLM_KV_ATTENTION_INDEXER_LOCAL_BLOCKS, uint32_t(1));
     ms.add_kv(LLM_KV_ROPE_DIMENSION_SECTIONS, std::vector<uint32_t>({n_embd_head/4, n_embd_head/4, n_embd_head/4, n_embd_head/4}));
 
-    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5NEXT) {
+    if (arch == LLM_ARCH_DEEPSEEK4 || arch == LLM_ARCH_GLM5NEXT || arch == LLM_ARCH_GLM5_NEXT) {
         if (arch == LLM_ARCH_DEEPSEEK4) {
             ms.add_kv(LLM_KV_ATTENTION_OUTPUT_GROUP_COUNT,     uint32_t(8));
             ms.add_kv(LLM_KV_ATTENTION_OUTPUT_LORA_RANK,       uint32_t(32));
@@ -553,6 +563,7 @@ static bool moe_mandatory(const llm_arch arch) {
         case LLM_ARCH_GLM4_MOE:
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_GLM5NEXT:
+        case LLM_ARCH_GLM5_NEXT:
         case LLM_ARCH_EXAONE_MOE:
         case LLM_ARCH_BAILINGMOE:
         case LLM_ARCH_BAILINGMOE2:
