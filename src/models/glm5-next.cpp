@@ -12,14 +12,37 @@ void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
     ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
-    ml.get_key(LLM_KV_KDA_HEAD_DIM,                hparams.n_embd_head_kda);
-    ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND,        hparams.kda_gate_lower_bound, false);
+    if (!ml.get_key(LLM_KV_KDA_HEAD_DIM, hparams.n_embd_head_kda, false)) {
+        ml.get_key(LLM_KV_SSM_STATE_SIZE, hparams.n_embd_head_kda);
+    }
+    if (!ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND, hparams.kda_gate_lower_bound, false)) {
+        hparams.kda_gate_lower_bound = -5.0f;
+    }
 
     // the MLA cache holds the compressed latent
     hparams.n_embd_head_v_full = hparams.n_lora_kv;
 
-    for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
-        hparams.is_recr_impl[i] = hparams.n_head_kv(i) == 0;
+    std::fill(hparams.is_recr_impl.begin(), hparams.is_recr_impl.end(), 0);
+    if (!ml.get_key_or_arr(LLM_KV_ATTENTION_RECURRENT_LAYERS, hparams.is_recr_impl, hparams.n_layer(), false)) {
+        bool has_zero = false;
+        for (uint32_t i = 0; i < hparams.n_layer(); ++i) {
+            if (hparams.n_head_kv(i) == 0) {
+                has_zero = true;
+                break;
+            }
+        }
+        if (has_zero) {
+            for (uint32_t i = 0; i < hparams.n_layer_all; ++i) {
+                hparams.is_recr_impl[i] = hparams.n_head_kv(i) == 0;
+            }
+        } else {
+            uint32_t full_attn_interval = 4;
+            ml.get_key(LLM_KV_FULL_ATTENTION_INTERVAL, full_attn_interval, false);
+            GGML_ASSERT(full_attn_interval > 0);
+            for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+                hparams.is_recr_impl[il] = (il < hparams.n_layer()) && ((il + 1) % full_attn_interval != 0);
+            }
+        }
     }
 
     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, hparams.n_ff_exp);
