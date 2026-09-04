@@ -12,11 +12,14 @@ void llama_model_glm5_next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_Q_LORA_RANK,       hparams.n_lora_q);
     ml.get_key(LLM_KV_ATTENTION_KV_LORA_RANK,      hparams.n_lora_kv);
     ml.get_key(LLM_KV_SSM_CONV_KERNEL,             hparams.ssm_d_conv);
-    if (!ml.get_key(LLM_KV_KDA_HEAD_DIM, hparams.n_embd_head_kda, false)) {
+    const bool is_legacy_kda = !ml.get_key(LLM_KV_KDA_HEAD_DIM, hparams.n_embd_head_kda, false);
+    if (is_legacy_kda) {
         ml.get_key(LLM_KV_SSM_STATE_SIZE, hparams.n_embd_head_kda);
-    }
-    if (!ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND, hparams.kda_gate_lower_bound, false)) {
-        hparams.kda_gate_lower_bound = -5.0f;
+        if (!ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND, hparams.kda_gate_lower_bound, false)) {
+            hparams.kda_gate_lower_bound = -5.0f;
+        }
+    } else {
+        ml.get_key(LLM_KV_KDA_GATE_LOWER_BOUND, hparams.kda_gate_lower_bound, false);
     }
 
     // the MLA cache holds the compressed latent
