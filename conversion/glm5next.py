@@ -41,7 +41,7 @@ class Glm5NextModel(GlmMoeDsaModel):
     inherited from GLM-5.2 (GlmMoeDsaModel).
     """
 
-    model_arch = gguf.MODEL_ARCH.GLM5NEXT
+    model_arch = gguf.MODEL_ARCH.GLM5_NEXT
     supports_direct_quant = True
 
     # Tensors that carry no per-layer index and are named differently from the
@@ -54,9 +54,9 @@ class Glm5NextModel(GlmMoeDsaModel):
         "hc_ffn_base":  (gguf.MODEL_TENSOR.HC_FFN_BASE,   ""),
         "hc_ffn_scale": (gguf.MODEL_TENSOR.HC_FFN_SCALE,  ""),
         "self_attn.indexer.index_kpool_compress_ape":
-            (gguf.MODEL_TENSOR.INDEXER_COMPRESSOR_APE,   ""),
+            (gguf.MODEL_TENSOR.INDEXER_KPOOL_APE,   ""),
         "self_attn.indexer.index_kpool_compress_gate":
-            (gguf.MODEL_TENSOR.INDEXER_COMPRESSOR_WGATE, ""),
+            (gguf.MODEL_TENSOR.INDEXER_KPOOL_GATE, ""),
     }
 
     def index_tensors(self, remote_hf_model_id: str | None = None):
@@ -82,26 +82,57 @@ class Glm5NextModel(GlmMoeDsaModel):
 
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
-        hparams = self.hparams
-
-        # hyper-connections (mHC): identical formulation to DeepSeek-V4, so the
-        # existing sinkhorn graph applies unchanged.
-        self.gguf_writer.add_hyper_connection_count(hparams["hc_mult"])
-        self.gguf_writer.add_hyper_connection_sinkhorn_iterations(hparams["hc_sinkhorn_iters"])
-        self.gguf_writer.add_hyper_connection_epsilon(hparams["hc_eps"])
+        hp = self.hparams
+        # layer_types -> head_count_kv per-layer 0 for KDA, 1 for MLA/DSA
+        layer_types = hp.get("layer_types", [])
+        if layer_types:
+            n_kv_heads = [0 if t == "linear_attention" else 1 for t in layer_types]
+            assert len(n_kv_heads) == hp["num_hidden_layers"]
+            n_kv_heads += [1] * (self.block_count - len(n_kv_heads))
+            self.gguf_writer.add_head_count_kv(n_kv_heads)
+        # hyper-connections (mHC): identical formulation to DeepSeek-V4
+        self.gguf_writer.add_hyper_connection_count(hp["hc_mult"])
+        self.gguf_writer.add_hyper_connection_sinkhorn_iterations(hp["hc_sinkhorn_iters"])
+        self.gguf_writer.add_hyper_connection_epsilon(hp["hc_eps"])
 
         # KDA linear attention
-        linear = hparams["linear_attn_config"]
+        linear = hp["linear_attn_config"]
         self.gguf_writer.add_ssm_conv_kernel(linear["short_conv_kernel_size"])
-        self.gguf_writer.add_ssm_inner_size(linear["num_heads"] * linear["head_dim"])
+        self.gguf_writer.add_kda_head_dim(linear["head_dim"])
+        if (lb := linear.get("gate_lower_bound")) is not None:
+            self.gguf_writer.add_kda_gate_lower_bound(lb)
+        # legacy state size for compatibility (also KDA head dim)
         self.gguf_writer.add_ssm_state_size(linear["head_dim"])
+        self.gguf_writer.add_ssm_inner_size(linear["num_heads"] * linear["head_dim"])
         self.gguf_writer.add_ssm_group_count(linear["num_heads"])
 
-        # k-pool compression inside the DSA indexer
-        self.gguf_writer.add_indexer_block_size(hparams["index_kpool"])
+        # MLA (nope only)
+        assert hp.get("mla_use_nope") and hp["qk_rope_head_dim"] == 0, "expected nope-only MLA"
+        self.gguf_writer.add_q_lora_rank(hp["q_lora_rank"])
+        self.gguf_writer.add_kv_lora_rank(hp["kv_lora_rank"])
+        self.gguf_writer.add_rope_dimension_count(hp["qk_rope_head_dim"])
+        self.gguf_writer.add_key_length(hp["kv_lora_rank"] + hp["qk_rope_head_dim"])
+        self.gguf_writer.add_value_length(hp["kv_lora_rank"])
+        self.gguf_writer.add_key_length_mla(hp["qk_nope_head_dim"] + hp["qk_rope_head_dim"])
+        self.gguf_writer.add_value_length_mla(hp["v_head_dim"])
 
-        # clamped SwiGLU
-        if (limit := hparams.get("swiglu_limit")) is not None:
+        # k-pool compression inside the DSA indexer - native #27773 schema
+        self.gguf_writer.add_indexer_head_count(hp["index_n_heads"])
+        self.gguf_writer.add_indexer_key_length(hp["index_head_dim"])
+        self.gguf_writer.add_indexer_top_k(hp["index_topk"])
+        self.gguf_writer.add_indexer_kpool(hp["index_kpool"])
+        self.gguf_writer.add_indexer_kpool_select_tail(hp.get("index_kpool_always_select_tail", True))
+        self.gguf_writer.add_indexer_index_share_mtp(hp.get("index_share_for_mtp_iteration", False))
+        if (indexer_types := hp.get("indexer_types")) is not None:
+            self.gguf_writer.add_indexer_types([t == "full" for t in indexer_types])
+
+        # MoE
+        self.gguf_writer.add_leading_dense_block_count(hp.get("first_k_dense_replace", 0))
+        self.gguf_writer.add_expert_feed_forward_length(hp["moe_intermediate_size"])
+        self.gguf_writer.add_expert_shared_count(hp["n_shared_experts"])
+        self.gguf_writer.add_expert_weights_scale(hp["routed_scaling_factor"])
+        self.gguf_writer.add_expert_weights_norm(hp["norm_topk_prob"])
+        if (limit := hp.get("swiglu_limit")) is not None:
             self.gguf_writer.add_swiglu_clamp_exp([limit] * self.block_count)
             self.gguf_writer.add_swiglu_clamp_shexp([limit] * self.block_count)
 
