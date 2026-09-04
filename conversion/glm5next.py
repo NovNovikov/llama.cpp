@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from dataclasses import replace
 import re
 from typing import Any, Iterable
 
@@ -59,6 +60,10 @@ class Glm5NextModel(GlmMoeDsaModel):
             (gguf.MODEL_TENSOR.INDEXER_KPOOL_GATE, ""),
     }
 
+    # KDA short-conv weights: reshaped to the graph's 4D (1, d_inner, 1, d_conv)
+    # layout in both the ordinary and the direct-quant paths.
+    _kda_conv_suffixes = (".q_conv1d.weight", ".k_conv1d.weight", ".v_conv1d.weight")
+
     def index_tensors(self, remote_hf_model_id: str | None = None):
         # TextModel lifts text_config to the root, but only after this runs -
         # and the parent already needs num_hidden_layers from it here.
@@ -70,6 +75,9 @@ class Glm5NextModel(GlmMoeDsaModel):
                 **self.hparams,
                 **{k: v for k, v in self.hparams["text_config"].items() if v is not None},
             }
+        # the MLA head dims are derived from qk_nope/qk_rope/v_head_dim; drop the
+        # generic head_dim so nothing downstream can pick it up as a fallback
+        self.hparams.pop("head_dim", None)
         return super().index_tensors(remote_hf_model_id=remote_hf_model_id)
 
     @classmethod
@@ -83,6 +91,7 @@ class Glm5NextModel(GlmMoeDsaModel):
     def set_gguf_parameters(self):
         super().set_gguf_parameters()
         hp = self.hparams
+        self.gguf_writer.add_layer_norm_eps(1e-6)
         # layer_types -> head_count_kv per-layer 0 for KDA, 1 for MLA/DSA
         layer_types = hp.get("layer_types", [])
         if layer_types:
@@ -144,9 +153,20 @@ class Glm5NextModel(GlmMoeDsaModel):
         # expects ssm_a to already hold -exp(A_log), and the time-step bias to
         # be named like a bias so it is not loaded as a MUL_MAT weight.
         if name.endswith(".A_log"):
-            data_torch = -torch.exp(data_torch.float())
+            n_head = self.hparams["num_attention_heads"]
+            data_torch = -torch.exp(data_torch.float().flatten()[:n_head])
         if name.endswith(".dt_bias"):
             name = name.rpartition(".dt_bias")[0] + ".dt_proj.bias"
+
+        # KDA short-conv: [d_inner, 1, d_conv] or [d_inner, d_conv] -> (1, d_inner, 1, d_conv)
+        if name.endswith(self._kda_conv_suffixes):
+            if data_torch.ndim == 3:
+                d_inner, _, d_conv = data_torch.shape
+            elif data_torch.ndim == 2:
+                d_inner, d_conv = data_torch.shape
+            else:
+                raise ValueError(f"unexpected conv1d rank {data_torch.ndim} for {name}")
+            data_torch = data_torch.reshape(1, d_inner, 1, d_conv)
 
         for suffix, (tensor, ext) in self._direct_map.items():
             if name.endswith(suffix) and bid is not None:
@@ -226,6 +246,17 @@ class Glm5NextModel(GlmMoeDsaModel):
         if qtype in (gguf.GGMLQuantizationType.F16, gguf.GGMLQuantizationType.BF16):
             return np.dtype(np.uint16)
         return np.dtype(np.uint8)
+
+    @staticmethod
+    def _direct_conv1d_shape(source_shape: tuple[int, ...]) -> tuple[int, int, int, int]:
+        if len(source_shape) == 3:
+            d_inner, _mid, d_conv = source_shape
+        elif len(source_shape) == 2:
+            d_inner, d_conv = source_shape
+        else:
+            raise DirectQuantError(f"unexpected KDA conv1d rank {len(source_shape)} for shape {source_shape}")
+        return (1, int(d_inner), 1, int(d_conv))
+
 
     def _direct_model_descriptor(self) -> DirectModelDescriptor:
         hparams = self.hparams
@@ -339,7 +370,12 @@ class Glm5NextModel(GlmMoeDsaModel):
                     f"canonical GLM5Next manifest has unsupported tensor dtype {local_tensor.dtype} for {source_name}")
             if normalized.endswith(".A_log"):
                 source_type = gguf.GGMLQuantizationType.F32
-            add(self._direct_output_name(normalized), tuple(local_tensor.shape), source_type, (normalized,))
+                output_shape = (int(self.hparams["num_attention_heads"]),)
+            elif normalized.endswith(self._kda_conv_suffixes):
+                output_shape = self._direct_conv1d_shape(tuple(local_tensor.shape))
+            else:
+                output_shape = tuple(local_tensor.shape)
+            add(self._direct_output_name(normalized), output_shape, source_type, (normalized,))
 
         return manifest
 
@@ -531,6 +567,9 @@ class Glm5NextModel(GlmMoeDsaModel):
             output_name = self._direct_output_name(normalized)
             bid_match = re.search(r"\.layers\.(\d+)\.", normalized)
             bid = int(bid_match.group(1)) if bid_match is not None else None
+            if normalized.endswith(self._kda_conv_suffixes):
+                # pure reshape: same bytes, graph 4D layout, matching the ordinary converter
+                local_tensor = replace(local_tensor, shape=self._direct_conv1d_shape(tuple(local_tensor.shape)))
             requires_f32 = self._direct_requires_f32(output_name, local_tensor.shape, bid)
             if local_tensor.dtype in fp8_types:
                 source = fp8_source(normalized)
@@ -553,7 +592,7 @@ class Glm5NextModel(GlmMoeDsaModel):
                     "sources": (normalized,),
                     "source_dtype": local_tensor.dtype,
                     "source_type": gguf.GGMLQuantizationType.F32,
-                    "shape": local_tensor.shape,
+                    "shape": (int(self.hparams["num_attention_heads"]),),
                     "kind": "transformed",
                     "requires_f32": True,
                     "data": source_name,
@@ -652,7 +691,9 @@ class Glm5NextModel(GlmMoeDsaModel):
                 )
             elif record["kind"] == "transformed":
                 data = LazyTorchTensor.to_eager(self.model_tensors[record["data"]]())
-                self.gguf_writer.add_tensor(plan.name, -torch.exp(data.float()).numpy(), raw_dtype=plan.target_type)
+                n_head = int(self.hparams["num_attention_heads"])
+                self.gguf_writer.add_tensor(
+                    plan.name, -torch.exp(data.float().flatten()[:n_head]).numpy(), raw_dtype=plan.target_type)
             elif record["kind"] in ("fp8_f32", "experts_f32"):
                 self.gguf_writer.add_tensor(plan.name, record["data"].lazy_float32(), raw_dtype=plan.target_type)
             else:
