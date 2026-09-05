@@ -24,6 +24,13 @@ static void foreach_function(const json & tools, const std::function<void(const 
 
 namespace autoparser {
 
+static bool is_glm53_flash_template(const common_chat_template * tmpl) {
+    return tmpl != nullptr &&
+           tmpl->src.find("[gMASK]<sop>") != std::string::npos &&
+           tmpl->src.find("<tool_call>{function-name}<arg_key>") != std::string::npos &&
+           tmpl->src.find("<|observation|>") != std::string::npos;
+}
+
 parser_build_context::parser_build_context(common_chat_peg_builder & p, const generation_params & inputs) :
     p(p),
     inputs(inputs),
@@ -162,6 +169,26 @@ common_peg_parser analyze_reasoning::build_parser(parser_build_context & ctx) co
 
     if (mode == reasoning_mode::TAG_BASED || mode == reasoning_mode::TOOLS_ONLY) {
         if (!end.empty()) {
+            const bool glm53_tool_fallback =
+                is_glm53_flash_template(tmpl) &&
+                ctx.inputs.enable_thinking &&
+                ctx.inputs.tools.is_array() && !ctx.inputs.tools.empty() &&
+                ctx.inputs.tool_choice != COMMON_CHAT_TOOL_CHOICE_NONE;
+
+            if (glm53_tool_fallback) {
+                // GLM 5.3 occasionally starts a tool call directly from the reasoning stream
+                // without first emitting </think>. Treat <tool_call> as an implicit reasoning
+                // boundary, but keep the normal explicit </think> path first.
+                auto reasoning_body = p.choice({
+                    p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end),
+                    p.reasoning(p.until("<tool_call>")),
+                });
+                if (!start.empty()) {
+                    return p.optional(p.optspace(start) + reasoning_body);
+                }
+                return p.optional(reasoning_body);
+            }
+
             if (!start.empty()) {
                 // Standard tag-based: optional(<think>reasoning</think>)
                 return p.optional(p.optspace(start) + p.reasoning(p.until(trim_whitespace(end))) + p.optspace(end));
@@ -382,6 +409,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_json(parser_build_context
 common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_context & ctx) const {
     auto &       p           = ctx.p;
     const auto & inputs      = ctx.inputs;
+    const bool   glm53_tolerant_tools = is_glm53_flash_template(tmpl);
 
     auto until_suffix = p.rule("until-suffix", p.until(arguments.value_suffix));
 
@@ -521,6 +549,43 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
             std::optional(p.peek(p.literal(arguments.name_prefix))) : std::nullopt;
         auto func_parser = build_func_parser(p, name, call_id_section, have_call_id, args_seq, atomic_peek);
         tool_choice |= p.rule("tool-" + name, func_parser);
+
+        if (glm53_tolerant_tools &&
+            function.name_prefix.empty() && function.name_suffix.empty() && function.args_separator.empty() &&
+            call_id.pos == call_id_position::NONE && arguments.start.empty() && arguments.end.empty()) {
+            // GLM 5.3 sometimes uses <tool_call>name{"arg":...}</tool_call> even though its
+            // template requests <arg_key>/<arg_value>. Accept that dialect for this template only.
+            auto json_args = p.tool_args(p.schema(
+                p.json(), "glm53-tool-" + name + "-json-schema", params));
+            auto json_func = build_func_parser(
+                p, name, p.eps(), false, json_args, std::optional(p.peek(p.literal("{"))));
+            tool_choice |= p.rule("tool-" + name + "-json-args", json_func);
+
+            // A second observed dialect puts the function name inside the JSON object:
+            // <tool_call>{"function-name":"name","arg":...}</tool_call>.
+            // Parse only registered argument names and normalize the result through the same
+            // TOOL_ARG mapper used by the canonical tagged format.
+            auto flat_arg_choice = p.choice();
+            for (const auto & [param_name, param_schema] : properties.items()) {
+                auto flat_arg = p.tool_arg(
+                    p.tool_arg_open(
+                        p.literal("\"") + p.tool_arg_name_unique(p.literal(param_name)) + p.literal("\"") +
+                        p.space() + p.literal(":") + p.space()) +
+                    p.tool_arg_json_value(p.schema(
+                        p.json(), "glm53-flat-" + name + "-arg-" + param_name + "-schema", param_schema, false)) +
+                    p.tool_arg_close(p.eps()));
+                flat_arg_choice |= p.rule("glm53-flat-" + name + "-arg-" + param_name, flat_arg);
+            }
+
+            auto flat_json_func =
+                p.tool_open(
+                    p.literal("{") + p.space() +
+                    p.literal("\"function-name\"") + p.space() + p.literal(":") + p.space() +
+                    p.literal("\"") + p.tool_name(p.literal(name)) + p.literal("\"")) +
+                p.zero_or_more(p.space() + p.literal(",") + p.space() + flat_arg_choice) +
+                p.space() + p.tool_close(p.literal("}"));
+            tool_choice |= p.rule("tool-" + name + "-flat-json", flat_json_func);
+        }
     });
 
     auto require_tools = inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED;
@@ -586,17 +651,22 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
         !format.per_call_end.empty();
 
     if (can_qualify_per_call_marker) {
-        auto valid_tool_name = p.choice();
+        auto valid_tool_body = p.choice();
         foreach_function(inputs.tools, [&](const json & tool) {
             const auto & func = tool.at("function");
             const std::string name = func.at("name");
-            valid_tool_name |= p.literal(name);
+            valid_tool_body |= p.literal(name);
         });
+        if (glm53_tolerant_tools) {
+            // Flat-JSON GLM calls begin with '{' after <tool_call>; classify them as tools
+            // immediately so streaming never publishes the marker as ordinary content first.
+            valid_tool_body |= p.literal("{");
+        }
 
         auto valid_tool_start =
             p.literal(trigger_marker) +
             p.space() +
-            valid_tool_name;
+            valid_tool_body;
 
         // At a tool-call attempt, negate(valid_tool_start) fails without consuming the marker,
         // leaving it for tool_calls (and therefore for grammar validation). At a textual marker it
