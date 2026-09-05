@@ -2456,12 +2456,20 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                 llama_memory_hybrid_idx::layer_filter_cb filter_attn =
                     [&](int32_t il) { return (uint32_t) il < hparams.n_layer() && !hparams.is_recr(il); };
 
-                // no indexer weights -> no indexer cache, and the graph runs dense MLA
+                // no indexer weights -> no indexer cache, and the graph runs dense MLA.
+                // NOTE: the new runtime resolves kpool from BLOCK_SIZE fallback,
+                // leaving indexer_block_size == 0, so the gate must accept kpool.
                 llama_memory_hybrid_idx::layer_filter_cb filter_idx = nullptr;
-                if (hparams.indexer_head_size > 0 && hparams.indexer_block_size > 0) {
+                if (hparams.indexer_head_size > 0 && (hparams.indexer_block_size > 0 || hparams.indexer_kpool > 0)) {
                     filter_idx = [&](int32_t il) {
                         return (uint32_t) il < hparams.n_layer() && !hparams.is_recr(il) && hparams.is_indexer_full(il);
                     };
+                }
+
+                // The idx cache holds key | gate | pooled per token.
+                uint32_t glm5next_idx_row = hparams.indexer_head_size;
+                if (hparams.indexer_kpool > 0 || hparams.indexer_block_size > 0) {
+                    glm5next_idx_row = 3*hparams.indexer_head_size;
                 }
 
                 res = new llama_memory_hybrid_idx(
@@ -2476,7 +2484,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     /* recurrent_type_r  */ GGML_TYPE_F32,
                     /* recurrent_type_s  */ GGML_TYPE_F32,
                     /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-                    /* idx_row_size      */ 2*hparams.indexer_head_size, // key | k-pool gate
+                    /* idx_row_size      */ glm5next_idx_row,
                     /* n_seq_max         */ cparams.n_seq_max,
                     /* n_rs_seq          */ cparams.n_rs_seq,
                     /* offload           */ cparams.offload_kqv,
