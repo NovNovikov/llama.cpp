@@ -239,14 +239,20 @@
 
 		try {
 			const handle = await window.showDirectoryPicker();
-			const path = await resolveNativeName(handle.name);
+			const resolved = await resolveNativeName(handle.name);
+			const fallback = joinPath(homeBase ?? HOME_TILDE, handle.name);
+			const path = resolved ?? fallback;
 
+			// Always commit the picked folder - even if server-side
+			// glob could not resolve the leaf name (e.g. outside homeBase
+			// or tool disabled). The previous behaviour kept the old cwd
+			// and showed "Could not resolve" which looked like Browse did
+			// nothing.
 			if (path) {
+				searchError = null;
 				setDirectory(path);
 				closePicker();
 			} else {
-				// keep the previous cwd and fail visibly instead of committing a
-				// bare leaf name that would resolve against the server cwd
 				searchError = `Could not resolve "${handle.name}" to a server path`;
 			}
 		} catch (err) {
