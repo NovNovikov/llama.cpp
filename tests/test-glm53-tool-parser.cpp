@@ -6,6 +6,7 @@
 #include <fstream>
 #include <iostream>
 #include <sstream>
+#include <stdexcept>
 #include <string>
 
 using namespace autoparser;
@@ -119,10 +120,10 @@ static void test_tool_dialects(testing & t) {
         "</tool_call>";
 
     const std::string tag_with_json =
-        R"(<tool_call>exec_shell_command{"command":"cd \"L:/AI_pictures_generate/Manual LLAMA_CPP\" && ls -la | head -40"}</tool_call>)";
+        "<tool_call>exec_shell_command{\"command\":\"cd \\\"L:/AI_pictures_generate/Manual LLAMA_CPP\\\" && ls -la | head -40\"}</tool_call>";
 
     const std::string flat_json =
-        R"(<tool_call>{"function-name":"exec_shell_command","command":"cd \"L:/AI_pictures_generate/Manual LLAMA_CPP\" && ls -la | head -40"}</tool_call>)";
+        "<tool_call>{\"function-name\":\"exec_shell_command\",\"command\":\"cd \\\"L:/AI_pictures_generate/Manual LLAMA_CPP\\\" && ls -la | head -40\"}</tool_call>";
 
     assert_exec_call(t, "canonical tagged", parse_complete(t, parser, "canonical tagged", canonical), command);
     assert_exec_call(t, "name plus JSON", parse_complete(t, parser, "name plus JSON", tag_with_json), command);
@@ -142,8 +143,8 @@ static void test_streaming_prefixes_do_not_become_content(testing & t) {
     autoparser analysis;
     auto parser = build_glm53_tool_parser(tmpl, inputs, analysis);
 
-    const std::string full = R"(<tool_call>exec_shell_command{"command":"pwd"}</tool_call>)";
-    const std::string flat = R"(<tool_call>{"function-name":"exec_shell_command","command":"pwd"}</tool_call>)";
+    const std::string full = "<tool_call>exec_shell_command{\"command\":\"pwd\"}</tool_call>";
+    const std::string flat = "<tool_call>{\"function-name\":\"exec_shell_command\",\"command\":\"pwd\"}</tool_call>";
 
     for (const auto & sample : { full, flat }) {
         for (size_t i = 1; i <= sample.size(); ++i) {
