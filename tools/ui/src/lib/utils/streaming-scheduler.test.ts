@@ -76,21 +76,59 @@ describe('StreamingScheduler', () => {
 		s.destroy();
 	});
 
-	it('reasoning/content transitions are correct', () => {
-		const onContent = vi.fn();
-		const onReasoning = vi.fn();
-		const s = new StreamingScheduler({ onContent, onReasoning }, { flushIntervalMs: 400 });
-		s.pushContent('c1');
-		s.pushReasoning('r1');
-		expect(onContent).toHaveBeenCalledWith('c1');
-		expect(onReasoning).toHaveBeenCalledWith('r1');
-		s.pushContent('c2');
-		s.pushReasoning('r2');
-		expect(onContent).toHaveBeenCalledTimes(1);
-		expect(onReasoning).toHaveBeenCalledTimes(1);
+	it('preserves chronological order across content/reasoning/tool transitions', () => {
+		const log: Array<[string, string]> = [];
+		const s = new StreamingScheduler(
+			{
+				onContent: (c) => log.push(['content', c]),
+				onReasoning: (r) => log.push(['reasoning', r]),
+				onToolJson: (t) => log.push(['tool', t])
+			},
+			{ flushIntervalMs: 400 }
+		);
+		// thinking -> answer transition: pending reasoning must publish before staged content
+		s.pushReasoning('r1'); // immediate (first)
+		s.pushReasoning('r2'); // pending
+		s.pushContent('c1'); // type change -> flush r2 now, stage c1
+		expect(log).toEqual([
+			['reasoning', 'r1'],
+			['reasoning', 'r2']
+		]);
+		// tool after content: staged content flushes first
+		s.pushToolJson('{"a":1}');
+		expect(log).toEqual([
+			['reasoning', 'r1'],
+			['reasoning', 'r2'],
+			['content', 'c1']
+		]);
 		vi.advanceTimersByTime(400);
-		expect(onContent).toHaveBeenCalledTimes(2);
-		expect(onReasoning).toHaveBeenCalledTimes(2);
+		expect(log).toEqual([
+			['reasoning', 'r1'],
+			['reasoning', 'r2'],
+			['content', 'c1'],
+			['tool', '{"a":1}']
+		]);
+		s.destroy();
+	});
+
+	it('same-type neighbours coalesce, different types do not reorder', () => {
+		const log: Array<[string, string]> = [];
+		const s = new StreamingScheduler(
+			{
+				onContent: (c) => log.push(['content', c]),
+				onReasoning: (r) => log.push(['reasoning', r])
+			},
+			{ flushIntervalMs: 400 }
+		);
+		s.pushContent('a');
+		s.pushContent('b');
+		s.pushContent('c');
+		vi.advanceTimersByTime(400);
+		// 'a' immediate, 'bc' coalesced
+		expect(log).toEqual([
+			['content', 'a'],
+			['content', 'bc']
+		]);
 		s.destroy();
 	});
 
@@ -127,6 +165,54 @@ describe('StreamingScheduler', () => {
 		s.destroy();
 	});
 
+	it('hidden cancels armed timer: no commit fires while hidden', () => {
+		const onContent = vi.fn();
+		const s = new StreamingScheduler({ onContent }, { flushIntervalMs: 400 });
+		s.pushContent('a'); // immediate
+		s.pushContent('b'); // stages, arms timer
+		// tab goes hidden before the timer fires
+		// @ts-ignore
+		global.document.visibilityState = 'hidden';
+		s.onHidden();
+		vi.advanceTimersByTime(4000);
+		expect(onContent).toHaveBeenCalledTimes(1); // timer was cancelled
+		// catch-up on return
+		// @ts-ignore
+		global.document.visibilityState = 'visible';
+		s.onVisible();
+		expect(onContent).toHaveBeenCalledTimes(2);
+		expect(onContent.mock.calls[1][0]).toBe('b');
+		s.destroy();
+	});
+
+	it('first fragment while hidden is deferred, not committed', () => {
+		// @ts-ignore
+		global.document.visibilityState = 'hidden';
+		const onContent = vi.fn();
+		const s = new StreamingScheduler({ onContent }, { flushIntervalMs: 400 });
+		s.pushContent('a');
+		vi.advanceTimersByTime(4000);
+		expect(onContent).not.toHaveBeenCalled();
+		// @ts-ignore
+		global.document.visibilityState = 'visible';
+		s.onVisible();
+		expect(onContent).toHaveBeenCalledWith('a');
+		s.destroy();
+	});
+
+	it('abort delivers staged chunks even when hidden', () => {
+		const onContent = vi.fn();
+		const s = new StreamingScheduler({ onContent }, { flushIntervalMs: 400 });
+		s.pushContent('a'); // immediate
+		// @ts-ignore
+		global.document.visibilityState = 'hidden';
+		s.pushContent('b');
+		s.abortFlush(); // force-flush bypasses hidden deferral
+		expect(onContent).toHaveBeenCalledTimes(2);
+		expect(onContent.mock.calls[1][0]).toBe('b');
+		s.destroy();
+	});
+
 	it('timers are cleared on destroy/new generation', () => {
 		const onContent = vi.fn();
 		const s = new StreamingScheduler({ onContent }, { flushIntervalMs: 400 });
@@ -151,15 +237,31 @@ describe('StreamingScheduler', () => {
 		expect(onContent).not.toHaveBeenCalled();
 	});
 
-	it('200 fast chunks => tens of commits, not 200', () => {
+	it('200 synchronous chunks coalesce (burst case)', () => {
 		const onContent = vi.fn();
 		const s = new StreamingScheduler({ onContent }, { flushIntervalMs: 400 });
 		for (let i = 0; i < 200; i++) s.pushContent('x');
 		vi.advanceTimersByTime(400 * 10);
-		// first immediate + up to 1 per 400ms, but all 199 after first coalesced into 1 if within same interval
-		// With our implementation, all 199 after first are in one pending and flush once, so total 2
+		// burst case: everything arrives inside one interval -> 1 immediate + 1 timed
 		expect(onContent.mock.calls.length).toBeLessThan(10);
 		expect(onContent.mock.calls.length).toBeGreaterThan(0);
+		s.destroy();
+	});
+
+	it('paced 12 chunks/s: ~40 commits for 200 chunks, not 200', () => {
+		const out: string[] = [];
+		const s = new StreamingScheduler({ onContent: (c) => out.push(c) }, { flushIntervalMs: 400 });
+		// ~83ms between chunks ~= 12 t/s over ~16.6s of stream time
+		for (let i = 0; i < 200; i++) {
+			s.pushContent('x');
+			vi.advanceTimersByTime(83);
+		}
+		vi.advanceTimersByTime(400);
+		const commits = out.length;
+		// steady state ~= 1 commit per 400ms over 16.6s -> ~40-45, far below 200
+		expect(commits).toBeGreaterThan(5);
+		expect(commits).toBeLessThan(100);
+		expect(out.join('').length).toBe(200);
 		s.destroy();
 	});
 });

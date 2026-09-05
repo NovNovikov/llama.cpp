@@ -788,6 +788,13 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	}
 
 	async stopGenerationForChat(convId: string): Promise<void> {
+		// Abort first so the streaming scheduler flushes its staged buffer
+		// (up to 400ms of content) into onChunk -> setChatStreaming before we snapshot.
+		// Previously savePartialResponseIfNeeded ran before abort and lost the last coalesced chunk.
+		this.abortRequest(convId);
+		// Synchronously push the scheduler's staged buffer (up to 400ms of
+		// content) into onChunk -> setChatStreaming before snapshotting.
+		ChatService.flushPendingStream(convId);
 		await this.savePartialResponseIfNeeded(convId);
 		// tell the server to stop the generation, not just drop the HTTP socket. without this the
 		// detached drain keeps producing tokens until eos or max_tokens. use the frozen identity
@@ -799,7 +806,6 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		// an explicit stop leaves nothing to resume and kills a pending resume retry
 		ChatService.clearStreamState(convId);
 		this.streams.cancelResumeRetry(convId);
-		this.abortRequest(convId);
 		this.setChatLoading(convId, false);
 		this.clearChatStreaming(convId);
 		this.processing.setState(convId, null);

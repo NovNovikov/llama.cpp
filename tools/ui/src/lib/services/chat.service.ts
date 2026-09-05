@@ -76,6 +76,20 @@ export class ChatService {
 		{ lastSavedAt: number; model: string | null; pendingBytes: number | null }
 	>();
 
+	// Active per-conversation UI schedulers. Lets stopGenerationForChat force
+	// the staged buffer into the store synchronously before snapshotting the
+	// partial response, instead of racing the abort propagation.
+	private static activeSchedulers = new Map<string, StreamingScheduler>();
+
+	/** Synchronously flush staged stream content for a conversation (Stop path). */
+	static flushPendingStream(conversationId: string): void {
+		try {
+			ChatService.activeSchedulers.get(conversationId)?.forceFlush();
+		} catch {
+			/* ignore */
+		}
+	}
+
 	/**
 	 * Checks whether all server slots are currently idle (not processing any requests).
 	 * Queries the /slots endpoint (requires --slots flag on the server).
@@ -485,19 +499,13 @@ export class ChatService {
 
 		const scheduler = new StreamingScheduler(
 			{
-				onContent: (c) => {
-					if (!abortSignal?.aborted) onChunk?.(c);
-				},
-				onReasoning: (r) => {
-					if (!abortSignal?.aborted) onReasoningChunk?.(r);
-				},
-				onToolJson: (t) => {
-					if (!abortSignal?.aborted) onToolCallChunk?.(t);
-				}
+				onContent: (c) => onChunk?.(c),
+				onReasoning: (r) => onReasoningChunk?.(r),
+				onToolJson: (t) => onToolCallChunk?.(t)
 			},
 			{ flushIntervalMs: 400 }
 		);
-		if (typeof window !== 'undefined') {
+		if (typeof window !== 'undefined' && import.meta.env.DEV) {
 			(window as unknown as Record<string, unknown>).__LLAMA_STREAM_STATS = {
 				chunks: 0,
 				commits: 0,
@@ -510,7 +518,9 @@ export class ChatService {
 		const queueReasoning = (text: string) => scheduler.pushReasoning(text);
 		const queueToolJson = (json: string) => scheduler.pushToolJson(json);
 		const flushPending = () => scheduler.flushAll();
-		const scheduleFlush = () => {};
+		if (conversationId) {
+			ChatService.activeSchedulers.set(conversationId, scheduler);
+		}
 
 		const finalizeOpenToolCallBatch = () => {
 			if (!hasOpenToolCallBatch) {
@@ -555,18 +565,17 @@ export class ChatService {
 			if (typeof document === 'undefined') return;
 
 			if (document.visibilityState === 'hidden') {
+				scheduler.onHidden();
 				// the tab is going to the background and the OS may throttle or
 				// drop the socket shortly; persist the freshest resume offset now.
-				// Visual commits are deferred until visible (see scheduleFlush isHidden guard).
+				// Visual commits are deferred until visible (see scheduler isHidden guard).
 				if (conversationId) ChatService.flushStreamState(conversationId);
 
 				return;
 			}
 
 			// Tab became visible again - flush any pending staged content immediately (catch-up).
-			if (scheduler.hasPending()) {
-				scheduler.onVisible();
-			}
+			scheduler.onVisible();
 
 			if (streamFinished) return;
 
@@ -774,8 +783,10 @@ export class ChatService {
 			}
 
 			if (abortSignal?.aborted) {
-				// Abort should not lose staged content - flush what we have.
-				flushPending();
+				// Abort must not lose staged content: force-flush bypasses the
+				// hidden-tab deferral and the (now aborted) signal guard lives
+				// in the scheduler callbacks, which no longer check it.
+				scheduler.forceFlush();
 				return;
 			}
 
@@ -801,7 +812,7 @@ export class ChatService {
 		} catch (error) {
 			// Ensure staged content is not lost on error.
 			try {
-				flushPending();
+				scheduler.forceFlush();
 			} catch {}
 			const err = error instanceof Error ? error : new Error('Stream error');
 
@@ -813,6 +824,9 @@ export class ChatService {
 				scheduler.flushAll();
 			} catch {}
 			scheduler.destroy();
+			if (conversationId) {
+				ChatService.activeSchedulers.delete(conversationId);
+			}
 			if (typeof document !== 'undefined') {
 				document.removeEventListener('visibilitychange', onVisibilityChange);
 				window.removeEventListener('pagehide', onPageHide);
