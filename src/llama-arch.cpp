@@ -1076,10 +1076,12 @@ const char * llm_arch_name(llm_arch arch) {
 }
 
 llm_arch llm_arch_from_string(const std::string & name) {
-    // legacy GLM5Next GGUF compatibility: normalize old "glm5next" arch to new "glm5-next"
-    if (name == "glm5next") {
-        return LLM_ARCH_GLM5_NEXT;
-    }
+    // DO NOT normalize "glm5next" to LLM_ARCH_GLM5_NEXT here. Legacy GGUFs
+    // store all metadata under the "glm5next." prefix (e.g.
+    // glm5next.context_length); resolving them to GLM5_NEXT makes the loader
+    // look for "glm5-next.*" keys and fail with "key not found in model".
+    // Legacy files keep LLM_ARCH_GLM5NEXT and reach the same runtime class
+    // via llama_model_mapping; the new runtime reads both key variants.
     for (const auto & kv : LLM_ARCH_NAMES) { // NOLINT
         if (kv.second == name) {
             return kv.first;
