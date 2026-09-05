@@ -53,7 +53,7 @@ static json build_exec_shell_tools() {
 }
 
 static common_peg_arena build_glm53_tool_parser(const common_chat_template & tmpl, const generation_params & inputs,
-                                                 autoparser & analysis) {
+                                                 autoparser::autoparser & analysis) {
     analysis.analyze_template(tmpl);
     return build_chat_peg_parser([&](common_chat_peg_builder & p) {
         parser_build_context ctx(p, inputs);
@@ -105,7 +105,7 @@ static void test_tool_dialects(testing & t) {
     inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
     inputs.enable_thinking = true;
 
-    autoparser analysis;
+    autoparser::autoparser analysis;
     auto parser = build_glm53_tool_parser(tmpl, inputs, analysis);
 
     t.assert_equal("GLM 5.3 template is analyzed as TAG_WITH_TAGGED",
@@ -140,7 +140,7 @@ static void test_streaming_prefixes_do_not_become_content(testing & t) {
     inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
     inputs.enable_thinking = true;
 
-    autoparser analysis;
+    autoparser::autoparser analysis;
     auto parser = build_glm53_tool_parser(tmpl, inputs, analysis);
 
     const std::string full = "<tool_call>exec_shell_command{\"command\":\"pwd\"}</tool_call>";
@@ -158,9 +158,6 @@ static void test_streaming_prefixes_do_not_become_content(testing & t) {
             common_chat_peg_mapper mapper(msg);
             mapper.from_ast(ctx.ast, result);
 
-            // Once a real GLM tool-call marker has been recognized, it must never be published
-            // as ordinary assistant content and then retracted on the next chunk. That retraction
-            // is what used to trip common_chat_msg_diff::compute_diffs with "Invalid diff".
             if (sample.substr(0, i).find("<tool_call>") != std::string::npos) {
                 t.assert_true("recognized tool prefix must not leak <tool_call> into content",
                               msg.content.find("<tool_call>") == std::string::npos);
@@ -179,7 +176,7 @@ static void test_reasoning_can_end_at_tool_call(testing & t) {
     inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     inputs.enable_thinking = true;
 
-    autoparser analysis;
+    autoparser::autoparser analysis;
     analysis.analyze_template(tmpl);
     auto parser = analysis.build_parser(inputs, "");
 
