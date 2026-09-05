@@ -342,6 +342,12 @@
 	 * @param markdown - The raw markdown string to process
 	 */
 	async function processMarkdown(rawMarkdown: string) {
+		if (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__LLAMA_STREAM_STATS) {
+			try {
+				const s = (window as unknown as { __LLAMA_STREAM_STATS: { renders: number } }).__LLAMA_STREAM_STATS;
+				s.renders = (s.renders || 0) + 1;
+			} catch {}
+		}
 		// Text glued to a closing code fence is not a fence to the parser -
 		// the block would swallow it. Split it onto its own line first.
 		const markdown = splitGluedClosingCodeFences(rawMarkdown);

@@ -88,11 +88,21 @@ export class AutoScrollController {
 
 	/**
 	 * Scrolls the container to the bottom instantly.
+	 * Instrumentation: counts scrolls for streaming perf audit.
 	 */
 	scrollToBottom(): void {
-		if (this._disabled || !this._container) return;
+		if (this._disabled || !this._container || !this._autoScrollEnabled) return;
+
+		// Avoid forced reflow if user scrolled up - handleScroll already disabled autoScroll.
+		if (this._userScrolledUp) return;
 
 		this._container.scrollTop = this._container.scrollHeight;
+		if (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__LLAMA_STREAM_STATS) {
+			try {
+				const s = (window as unknown as { __LLAMA_STREAM_STATS: { scrolls: number } }).__LLAMA_STREAM_STATS;
+				s.scrolls = (s.scrolls || 0) + 1;
+			} catch {}
+		}
 	}
 
 	/**
@@ -126,13 +136,14 @@ export class AutoScrollController {
 
 	/**
 	 * Starts the auto-scroll interval for continuous scrolling during streaming.
+	 * No-op now: MutationObserver + throttled UI commits already drive scroll at ~3Hz.
+	 * Kept for API compatibility; interval would cause 10Hz wakeups with no content.
 	 */
 	startInterval(): void {
-		if (this._disabled || this._scrollInterval) return;
-
-		this._scrollInterval = setInterval(() => {
-			this.scrollToBottom();
-		}, AUTO_SCROLL_INTERVAL);
+		// Intentionally disabled to reduce main-thread wakeups during streaming.
+		// Scroll is driven by MutationObserver coalesced to rAF, which fires only on DOM mutations
+		// from throttled commits (~3Hz) instead of every 100ms.
+		return;
 	}
 
 	/**
@@ -197,6 +208,12 @@ export class AutoScrollController {
 
 				if (this._autoScrollEnabled && this._container) {
 					this._container.scrollTop = this._container.scrollHeight;
+					if (typeof window !== 'undefined' && (window as unknown as Record<string, unknown>).__LLAMA_STREAM_STATS) {
+						try {
+							const s = (window as unknown as { __LLAMA_STREAM_STATS: { scrolls: number } }).__LLAMA_STREAM_STATS;
+							s.scrolls = (s.scrolls || 0) + 1;
+						} catch {}
+					}
 				}
 			});
 		});

@@ -8,6 +8,7 @@
 
 import { getAudioInputFormat } from '../utils/audio-format';
 import { capImageDataURLSize } from '../utils/cap-img-size';
+import { StreamingScheduler } from '../utils/streaming-scheduler';
 import {
 	API_CHAT,
 	API_SLOTS,
@@ -482,6 +483,35 @@ export class ChatService {
 		let toolCallIndexOffset = 0;
 		let hasOpenToolCallBatch = false;
 
+		const scheduler = new StreamingScheduler(
+			{
+				onContent: (c) => {
+					if (!abortSignal?.aborted) onChunk?.(c);
+				},
+				onReasoning: (r) => {
+					if (!abortSignal?.aborted) onReasoningChunk?.(r);
+				},
+				onToolJson: (t) => {
+					if (!abortSignal?.aborted) onToolCallChunk?.(t);
+				}
+			},
+			{ flushIntervalMs: 400 }
+		);
+		if (typeof window !== 'undefined') {
+			(window as unknown as Record<string, unknown>).__LLAMA_STREAM_STATS = {
+				chunks: 0,
+				commits: 0,
+				renders: 0,
+				scrolls: 0,
+				startTime: Date.now()
+			};
+		}
+		const queueContent = (text: string) => scheduler.pushContent(text);
+		const queueReasoning = (text: string) => scheduler.pushReasoning(text);
+		const queueToolJson = (json: string) => scheduler.pushToolJson(json);
+		const flushPending = () => scheduler.flushAll();
+		const scheduleFlush = () => {};
+
 		const finalizeOpenToolCallBatch = () => {
 			if (!hasOpenToolCallBatch) {
 				return;
@@ -518,7 +548,7 @@ export class ChatService {
 			}
 
 			if (!abortSignal?.aborted) {
-				onToolCallChunk?.(serializedToolCalls);
+				queueToolJson(serializedToolCalls);
 			}
 		};
 		const onVisibilityChange = () => {
@@ -526,10 +556,16 @@ export class ChatService {
 
 			if (document.visibilityState === 'hidden') {
 				// the tab is going to the background and the OS may throttle or
-				// drop the socket shortly; persist the freshest resume offset now
+				// drop the socket shortly; persist the freshest resume offset now.
+				// Visual commits are deferred until visible (see scheduleFlush isHidden guard).
 				if (conversationId) ChatService.flushStreamState(conversationId);
 
 				return;
+			}
+
+			// Tab became visible again - flush any pending staged content immediately (catch-up).
+			if (scheduler.hasPending()) {
+				scheduler.onVisible();
 			}
 
 			if (streamFinished) return;
@@ -656,7 +692,7 @@ export class ChatService {
 									aggregatedContent += content;
 
 									if (!abortSignal?.aborted) {
-										onChunk?.(content);
+										queueContent(content);
 									}
 								}
 
@@ -665,7 +701,7 @@ export class ChatService {
 									fullReasoningContent += reasoningContent;
 
 									if (!abortSignal?.aborted) {
-										onReasoningChunk?.(reasoningContent);
+										queueReasoning(reasoningContent);
 									}
 								}
 
@@ -737,10 +773,16 @@ export class ChatService {
 				lastByteAt = Date.now();
 			}
 
-			if (abortSignal?.aborted) return;
+			if (abortSignal?.aborted) {
+				// Abort should not lose staged content - flush what we have.
+				flushPending();
+				return;
+			}
 
 			if (streamFinished) {
 				finalizeOpenToolCallBatch();
+				// Final flush ensures the last coalesced chunk is visible before onComplete persists.
+				flushPending();
 
 				if (conversationId) {
 					ChatService.clearStreamState(conversationId);
@@ -757,12 +799,20 @@ export class ChatService {
 				);
 			}
 		} catch (error) {
+			// Ensure staged content is not lost on error.
+			try {
+				flushPending();
+			} catch {}
 			const err = error instanceof Error ? error : new Error('Stream error');
 
 			onError?.(err);
 
 			throw err;
 		} finally {
+			try {
+				scheduler.flushAll();
+			} catch {}
+			scheduler.destroy();
 			if (typeof document !== 'undefined') {
 				document.removeEventListener('visibilitychange', onVisibilityChange);
 				window.removeEventListener('pagehide', onPageHide);
