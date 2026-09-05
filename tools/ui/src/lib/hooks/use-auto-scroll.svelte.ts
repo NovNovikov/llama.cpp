@@ -136,13 +136,13 @@ export class AutoScrollController {
 
 	/**
 	 * Starts the auto-scroll interval for continuous scrolling during streaming.
-	 * No-op now: MutationObserver + throttled UI commits already drive scroll at ~3Hz.
+	 * No-op now: MutationObserver + throttled UI commits already drive scroll at ~2.5Hz.
 	 * Kept for API compatibility; interval would cause 10Hz wakeups with no content.
 	 */
 	startInterval(): void {
 		// Intentionally disabled to reduce main-thread wakeups during streaming.
 		// Scroll is driven by MutationObserver coalesced to rAF, which fires only on DOM mutations
-		// from throttled commits (~3Hz) instead of every 100ms.
+		// from throttled commits (~2.5Hz) instead of every 100ms.
 		return;
 	}
 

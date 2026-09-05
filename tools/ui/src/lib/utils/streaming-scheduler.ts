@@ -2,9 +2,10 @@
  * StreamingScheduler - throttled UI commit scheduler for streaming generation.
  *
  * Batches incoming chunks in a cheap non-reactive staging buffer and flushes
- * to the reactive store at most 3 times per second (400ms). First fragment
- * flushes immediately for TTFT (unless hidden), final chunk and semantic
- * boundaries flush immediately, hidden tabs defer commits until visible.
+ * to the reactive store about every 400ms (~2.5Hz steady state). First
+ * fragment flushes immediately for TTFT (unless hidden), final chunk and
+ * semantic boundaries flush immediately, hidden tabs defer commits until
+ * visible.
  */
 
 export interface StreamingSchedulerCallbacks {

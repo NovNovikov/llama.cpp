@@ -149,6 +149,8 @@ export class ChatMessageFlows {
 						reasoningContent?: string,
 						timings?: ChatMessageTimings
 					) => {
+						// Publish the latest throttled timings before teardown drops them.
+						this.host.processing.flushStreamTimings(msg.convId);
 						const finalAppendedContent = hasReceivedContent ? appendedContent : finalContent || '';
 						const finalAppendedReasoning = hasReceivedContent
 							? appendedReasoning

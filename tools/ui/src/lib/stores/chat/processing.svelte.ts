@@ -43,15 +43,68 @@ export class ChatProcessingStore {
 		return this._activeConversationId;
 	}
 
+	// Latest-wins throttle for the live timings display. With
+	// timings_per_token the server emits per chunk; writing a fresh
+	// ApiProcessingState into the reactive SvelteMap on every token would
+	// keep a per-token reactive path alive after the content batching.
+	// Visual updates go out about every 300ms (~3.3Hz), the newest event always wins, and
+	// flushStreamTimings() publishes the latest event on completion so the
+	// final numbers are exact. (Final persisted accuracy lives in
+	// message.timings, written by the completion handlers.)
+	private static readonly TIMINGS_UI_FLUSH_MS = 300;
+	private timingsPending = new Map<
+		string,
+		{ timings?: ChatMessageTimings; promptProgress?: ChatMessagePromptProgress }
+	>();
+	private timingsTimers = new Map<string, ReturnType<typeof setTimeout>>();
+
 	/**
 	 * Applies a stream timings event (tokens/sec + token counts) to the given
 	 * conversation's processing state. Shared by the chat and continue flows.
+	 * Throttled latest-wins: per-token events coalesce into ~3.3Hz visual updates.
 	 */
 	applyStreamTimings(
 		timings?: ChatMessageTimings,
 		promptProgress?: ChatMessagePromptProgress,
 		conversationId?: string
 	): void {
+		const targetId = conversationId || this._activeConversationId;
+
+		if (!targetId) return;
+
+		this.timingsPending.set(targetId, { promptProgress, timings });
+
+		if (!this.timingsTimers.has(targetId)) {
+			this.timingsTimers.set(
+				targetId,
+				setTimeout(() => {
+					this.timingsTimers.delete(targetId);
+					this.flushStreamTimings(targetId);
+				}, ChatProcessingStore.TIMINGS_UI_FLUSH_MS)
+			);
+		}
+	}
+
+	/** Publish the latest pending timings event now (completion path). */
+	flushStreamTimings(conversationId?: string): void {
+		const targetId = conversationId || this._activeConversationId;
+
+		if (!targetId) return;
+
+		const timer = this.timingsTimers.get(targetId);
+
+		if (timer !== undefined) {
+			clearTimeout(timer);
+			this.timingsTimers.delete(targetId);
+		}
+
+		const pending = this.timingsPending.get(targetId);
+
+		if (!pending) return;
+
+		this.timingsPending.delete(targetId);
+
+		const { promptProgress, timings } = pending;
 		const tokensPerSecond =
 			timings?.predicted_ms && timings?.predicted_n
 				? (timings.predicted_n / timings.predicted_ms) * 1000
@@ -66,8 +119,24 @@ export class ChatProcessingStore {
 				prompt_n: timings?.prompt_n || 0,
 				prompt_progress: promptProgress
 			},
-			conversationId
+			targetId
 		);
+	}
+
+	/** Drop pending timings without publishing (teardown/stop path). */
+	dropStreamTimings(conversationId?: string): void {
+		const targetId = conversationId || this._activeConversationId;
+
+		if (!targetId) return;
+
+		const timer = this.timingsTimers.get(targetId);
+
+		if (timer !== undefined) {
+			clearTimeout(timer);
+			this.timingsTimers.delete(targetId);
+		}
+
+		this.timingsPending.delete(targetId);
 	}
 
 	getConversationIds(): string[] {

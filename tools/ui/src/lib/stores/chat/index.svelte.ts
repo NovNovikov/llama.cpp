@@ -105,13 +105,18 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	 * Stop button already does through stopGenerationForChat.
 	 */
 	async abortCurrentFlow(convId: string): Promise<void> {
-		await this.savePartialResponseIfNeeded(convId);
 		const c = this.abortControllers.get(convId);
 
 		if (c) {
 			c.abort();
 			this.abortControllers.delete(convId);
 		}
+		// Same ordering as stopGenerationForChat: abort first, then push the
+		// scheduler's staged buffer into the store, then snapshot. Saving
+		// before the abort would lose up to 400ms of already-received text.
+		ChatService.flushPendingStream(convId);
+		this.processing.dropStreamTimings(convId);
+		await this.savePartialResponseIfNeeded(convId);
 	}
 
 	async addMessage(
@@ -244,6 +249,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 	cleanupStreaming(convId: string): void {
 		this.setChatLoading(convId, false);
 		this.clearChatStreaming(convId);
+		this.processing.dropStreamTimings(convId);
 		this.processing.setState(convId, null);
 	}
 	clearChatStreaming(convId: string, messageId?: string): void {
@@ -806,6 +812,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		// an explicit stop leaves nothing to resume and kills a pending resume retry
 		ChatService.clearStreamState(convId);
 		this.streams.cancelResumeRetry(convId);
+		this.processing.dropStreamTimings(convId);
 		this.setChatLoading(convId, false);
 		this.clearChatStreaming(convId);
 		this.processing.setState(convId, null);
@@ -898,6 +905,7 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 		const cleanupStreamingState = () => {
 			this.setChatLoading(convId, false);
 			this.clearChatStreaming(convId, currentMessageId);
+			this.processing.dropStreamTimings(convId);
 			this.processing.setState(convId, null);
 		};
 
@@ -1056,6 +1064,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 				if (onError) onError(error);
 			},
 			onFlowComplete: (finalTimings?: ChatMessageTimings) => {
+				// Publish the latest throttled timings before teardown drops them.
+				this.processing.flushStreamTimings(convId);
 				if (finalTimings) {
 					const idx = conversationsStore.findMessageIndex(assistantMessage.id);
 
@@ -1186,6 +1196,8 @@ class ChatStore implements ChatStreamHost, ChatFlowsHost {
 					timings?: ChatMessageTimings,
 					toolCalls?: string
 				) => {
+					// Publish the latest throttled timings before teardown drops them.
+					this.processing.flushStreamTimings(convId);
 					const content = streamedContent || finalContent || '';
 					const reasoning = streamedReasoningContent || reasoningContent;
 					const updateData: Record<string, unknown> = {
