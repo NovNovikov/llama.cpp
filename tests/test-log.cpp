@@ -84,7 +84,7 @@ static void assert_call(testing & t, const std::string & label, const common_cha
 }
 
 static common_peg_arena build_tool_only_parser(const common_chat_template & tmpl, const generation_params & inputs,
-                                                autoparser & analysis) {
+                                                autoparser::autoparser & analysis) {
     analysis.analyze_template(tmpl);
     return build_chat_peg_parser([&](common_chat_peg_builder & p) {
         parser_build_context ctx(p, inputs);
@@ -105,7 +105,7 @@ static void test_dialects(testing & t) {
     inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
     inputs.enable_thinking = true;
 
-    autoparser analysis;
+    autoparser::autoparser analysis;
     auto parser = build_tool_only_parser(tmpl, inputs, analysis);
     t.assert_equal("format", tool_format::TAG_WITH_TAGGED, analysis.tools.format.mode);
 
@@ -134,7 +134,7 @@ static void test_streaming(testing & t) {
     inputs.reasoning_format = COMMON_REASONING_FORMAT_NONE;
     inputs.enable_thinking = true;
 
-    autoparser analysis;
+    autoparser::autoparser analysis;
     auto parser = build_tool_only_parser(tmpl, inputs, analysis);
 
     const std::string a = "<tool_call>exec_shell_command{\"command\":\"pwd\"}</tool_call>";
@@ -165,7 +165,7 @@ static void test_reasoning_boundary(testing & t) {
     inputs.reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     inputs.enable_thinking = true;
 
-    autoparser analysis;
+    autoparser::autoparser analysis;
     analysis.analyze_template(tmpl);
     auto parser = analysis.build_parser(inputs, "");
     auto msg = parse(t, parser, "reasoning boundary",
