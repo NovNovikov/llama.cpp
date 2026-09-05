@@ -636,10 +636,11 @@ static bool slot_save_parse_node_id(const std::string & state_path, uint64_t & n
 // temporaries) is an eviction candidate. Point --slot-save-max-count/-mb at a DEDICATED directory;
 // do not mix unrelated files into the auto-cache directory. (With no caps set — the default —
 // nothing is ever deleted and the directory is left exactly as before.)
-// `just_written` is the exact filepath string the server built as `slot_save_path + filename`;
-// directory_iterator(dir) over that same `slot_save_path` yields identically-spelled path strings
-// on POSIX (the production target), so raw string equality correctly identifies the just-saved
-// unit. (Not used on Windows in practice; if ever needed there, switch to filename comparison.)
+// `just_written` is the state path the server built as `slot_save_path + filename`, where
+// `slot_save_path` is the raw CLI string. directory_iterator(dir) yields its own spelling
+// (`dir / filename`, backslash on Windows), so raw string equality does NOT identify the
+// just-saved unit across separator styles. Compare basenames instead: both paths are
+// guaranteed to be in `dir`, and auto filenames are unique per directory.
 static void slot_save_enforce_limits(const std::string & dir,
                                      int32_t max_count, int64_t max_bytes,
                                      const std::string & just_written,
@@ -648,6 +649,10 @@ static void slot_save_enforce_limits(const std::string & dir,
     if (max_count <= 0 && max_bytes <= 0) {
         return; // both unlimited
     }
+    const std::string just_written_name = std::filesystem::path(just_written).filename().string();
+    const auto is_just_written = [&](const std::string & p) {
+        return std::filesystem::path(p).filename().string() == just_written_name;
+    };
 
     std::error_code ec;
     std::vector<slot_save_unit> units;
@@ -742,7 +747,7 @@ static void slot_save_enforce_limits(const std::string & dir,
             slot_node_meta_probe(p, u.parent_id, u.range_lo, u.range_hi);
             u.is_node = (u.parent_id != 0);
 
-            if (p == just_written) {
+            if (is_just_written(p)) {
                 this_unit_bytes = u.bytes;
             }
             units.push_back(std::move(u));
@@ -755,7 +760,7 @@ static void slot_save_enforce_limits(const std::string & dir,
     // individual snapshot's size is never bounded — only --slot-save-max-mb bounds per-snapshot size.
     if (max_bytes > 0 && this_unit_bytes > (uintmax_t) max_bytes) {
         for (const auto & u : units) {
-            if (u.state_path == just_written) {
+            if (is_just_written(u.state_path)) {
                 std::filesystem::remove(u.state_path, ec);
                 if (!u.sidecar_path.empty()) {
                     std::filesystem::remove(u.sidecar_path, ec);
@@ -822,7 +827,7 @@ static void slot_save_enforce_limits(const std::string & dir,
     for (bool changed = true; changed; ) {
         changed = false;
         for (size_t i = 0; i < units.size(); ++i) {
-            if (!alive[i] || units[i].parent_id == 0 || units[i].state_path == just_written) {
+            if (!alive[i] || units[i].parent_id == 0 || is_just_written(units[i].state_path)) {
                 continue;
             }
             const auto it = node_by_key.find(parent_key(units[i]));
@@ -898,7 +903,7 @@ static void slot_save_enforce_limits(const std::string & dir,
     auto pick_leaf = [&]() -> size_t {
         size_t best = units.size();
         for (size_t i = 0; i < units.size(); ++i) {
-            if (!alive[i] || units[i].state_path == just_written) {
+            if (!alive[i] || is_just_written(units[i].state_path)) {
                 continue;
             }
             if (units[i].node_id != 0) {
@@ -3173,12 +3178,15 @@ private:
             uint32_t range_lo = 0;
             uint32_t meta_version = 0;
             if (!slot_meta_read(p, fp, toks, &parent_id, &range_lo, nullptr, &media, &meta_version)) {
+                SRV_DBG("auto-cache scan: skip %s: invalid-meta\n", base.c_str());
                 continue; // no/short/corrupt meta -> not indexable (invariant 4)
             }
             if (!(fp == cur_fp)) {
+                SRV_DBG("auto-cache scan: skip %s: fingerprint-mismatch\n", base.c_str());
                 continue; // foreign model / requant / different ctx geometry (invariant 3)
             }
             if ((parent_id != 0 || range_lo != 0) && !slot_meta_is_safe_delta(meta_version)) {
+                SRV_DBG("auto-cache scan: skip %s: unsafe-delta\n", base.c_str());
                 continue; // legacy delta snapshots are unsafe to compose-load
             }
             uint64_t prefix_hash = 0;
