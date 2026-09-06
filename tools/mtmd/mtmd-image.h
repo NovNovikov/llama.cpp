@@ -132,7 +132,7 @@ struct mtmd_image_preprocessor_fixed_size : mtmd_image_preprocessor {
 // Inkling: split an image into 40x40 hMLP patches, each duplicated across a fixed temporal dimension of two.
 struct mtmd_image_preprocessor_inkling : mtmd_image_preprocessor {
     mtmd_image_preprocessor_inkling(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
-    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
 // resize image to multiple of patch_size*n_merge, while preserving aspect ratio
@@ -146,7 +146,7 @@ struct mtmd_image_preprocessor_dyn_size : mtmd_image_preprocessor {
 // GLM 5.3 flash, similar to dyn_size, but each edge is aligned up to patch_size*n_merge, and max budget is met by a search over the height with the width scaled proportionally
 struct mtmd_image_preprocessor_glm5v : mtmd_image_preprocessor {
     mtmd_image_preprocessor_glm5v(const clip_ctx * ctx) : mtmd_image_preprocessor(ctx) {}
-    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) override;
+    mtmd_image_preproc_out preprocess(const clip_image_u8 & img) const override;
 };
 
 // similar to mtmd_image_preprocessor_dyn_size, but resize the image to have longest edge equal to hparams.image_longest_edge, while preserving aspect ratio
