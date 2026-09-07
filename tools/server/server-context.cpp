@@ -4467,7 +4467,8 @@ private:
                 // DFlash/DSpark prompt injection is already chunked by the draft
                 // n_ubatch, so inheriting a 2K/4K target batch only inflates the
                 // temporary draft compute buffers by gigabytes.
-                {
+                // MTP is exempt (its prefill catch-up needs full batches).
+                if (!spec_mtp) {
                     const uint32_t n_batch_dft = 512;
                     if (cparams_dft.n_batch > n_batch_dft) {
                         cparams_dft.n_batch = n_batch_dft;

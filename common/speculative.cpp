@@ -2649,7 +2649,9 @@ common_speculative_init_result::common_speculative_init_result(
     // submits a small block during generation and DFlash/DSpark prompt injection is
     // already chunked by llama_n_ubatch(ctx_dft). Keeping a target-sized batch here
     // makes the draft compute buffers unnecessarily huge.
-    {
+    // MTP is exempt: its prefill catch-up submits whole batches, which would
+    // overflow a capped batch (matches unsloth, which has no cap at all).
+    if (!spec_mtp) {
         const uint32_t n_batch_dft = 512;
         if (cparams.n_batch > n_batch_dft) {
             cparams.n_batch = n_batch_dft;
