@@ -1432,10 +1432,12 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const std::string arch_tgt = common_speculative_get_model_arch(llama_get_model(ctx_tgt));
         const std::string arch_dft = common_speculative_get_model_arch(llama_get_model(ctx_dft));
         const bool is_gemma4_mtp = arch_tgt == "gemma4" && arch_dft == "gemma4-assistant";
-        const bool needs_nextn = is_gemma4_mtp || arch_tgt == "nemotron_h_moe" || arch_tgt == "glm5next";
+        const bool needs_nextn = is_gemma4_mtp || arch_tgt == "nemotron_h_moe" || arch_tgt == "glm5next" || arch_tgt == "qwen4exp";
 
-        // Qwen/Step-style native MTP consumes the target's pre-norm rows.
-        // Gemma4, Nemotron-H MoE, and GLM5Next MTP consume post-final-norm rows via t_h_nextn.
+        // Step-style native MTP consumes the target's pre-norm rows.
+        // Gemma4, Nemotron-H MoE, GLM5Next, and Qwen4Exp MTP consume post-final-norm rows via t_h_nextn.
+        // Note: qwen4exp must use nextn - its trunk graph never exports t_h_pre_norm, so the
+        // pre-norm path would copy uninitialized rows at the wrong (4x) width and segfault.
         llama_set_embeddings_pre_norm(ctx_tgt, !needs_nextn);
         llama_set_embeddings_pre_norm(ctx_dft, true);
         llama_set_embeddings_nextn(ctx_tgt, needs_nextn,   /*masked*/ false);
