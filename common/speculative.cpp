@@ -1432,12 +1432,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const std::string arch_tgt = common_speculative_get_model_arch(llama_get_model(ctx_tgt));
         const std::string arch_dft = common_speculative_get_model_arch(llama_get_model(ctx_dft));
         const bool is_gemma4_mtp = arch_tgt == "gemma4" && arch_dft == "gemma4-assistant";
-        const bool needs_nextn = is_gemma4_mtp || arch_tgt == "nemotron_h_moe" || arch_tgt == "glm5next" ||
+        const bool is_glm5next =
+            arch_tgt == "glm5next" || arch_tgt == "glm5-next";
+        const bool needs_nextn = is_gemma4_mtp || arch_tgt == "nemotron_h_moe" || is_glm5next ||
             arch_tgt == "qwen4exp" || arch_tgt == "deepseek4" || arch_tgt == "step35";
 
         // Step-style native MTP consumes the target's pre-norm rows.
         // Gemma4, Nemotron-H MoE, GLM5Next, Qwen4Exp, DeepSeek4, and Step35 MTP consume
         // post-final-norm rows via t_h_nextn.
+        // Note: glm5-next is the canonical arch string, glm5next the legacy GGUF
+        // string. Both reach the same runtime class, which exports only t_h_nextn.
         // Note: qwen4exp and deepseek4 must use nextn - their trunk graphs never export
         // t_h_pre_norm, so the pre-norm path would copy uninitialized rows at the wrong
         // (4x, HC) width and segfault. step35 never exports t_h_pre_norm either, so the
