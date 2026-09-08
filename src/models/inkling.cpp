@@ -57,7 +57,6 @@ void llama_model_inkling::load_arch_tensors(llama_model_loader &) {
     const int64_t head_dim = hparams.n_embd_head_k();
     const int64_t d_rel    = hparams.inkling_d_rel;
     const int64_t K        = hparams.n_shortconv_l_cache;
-    const int64_t n_ff_exp = hparams.n_ff_exp();
     const int64_t n_shexp  = hparams.n_expert_shared;
 
     tok_embd    = create_tensor(tn(LLM_TENSOR_TOKEN_EMBD,      "weight"), {n_embd, n_vocab}, 0);
@@ -102,6 +101,8 @@ void llama_model_inkling::load_arch_tensors(llama_model_loader &) {
             layer.ffn_down = create_tensor(tn(LLM_TENSOR_FFN_DOWN, "weight", i), {n_ff_i, n_embd}, 0);
         } else {
             GGML_ASSERT(n_expert > 0 && n_expert_used > 0 && n_shexp > 0);
+
+            const int64_t n_ff_exp = hparams.n_ff_exp(i);
 
             // gate holds n_expert + n_shexp rows (incl. shared-expert sink logits)
             layer.ffn_gate_inp    = create_tensor(tn(LLM_TENSOR_FFN_GATE_INP,    "weight", i), {n_embd, n_expert + n_shexp}, 0);
