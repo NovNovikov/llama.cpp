@@ -1017,7 +1017,10 @@ static constexpr uint32_t SLOT_META_VERSION_STATE_ABI_SAFE_NODE = 9u;
 static constexpr uint32_t SLOT_META_VERSION_STATE_ABI_SAFE_MEDIA_NODE = 10u;
 // Bump whenever the serialized llama state consumed by automatic snapshots changes.
 // v2: Qwen4-Exp QSA state switched from the fork's serialized history to upstream's indexer KV layout.
-static constexpr uint32_t AUTO_SNAPSHOT_STATE_ABI = 2u;
+// v3: gate snapshots on executable version (build number + commit). Recurrent/hybrid state folds
+// the full prefix through the then-current algorithms, so state computed by older code is unsound
+// even when the serialization layout is unchanged. Bumping purges all pre-fix on-disk snapshots.
+static constexpr uint32_t AUTO_SNAPSHOT_STATE_ABI = 3u;
 static constexpr uint32_t SLOT_META_MEDIA_MAX = 4096u;
 static constexpr uint32_t SLOT_META_ID_MAX    = 256u;
 
@@ -1066,6 +1069,10 @@ struct model_fp {
     // Serialized llama-state layout used by automatic snapshots. Zero is legacy metadata that
     // predates an explicit ABI and must never match a current snapshot.
     uint32_t fp_state_abi       = 0;
+    // Executable identity that produced the state. Files predating these fields are
+    // shorter on disk and fail the read; same-source rebuilds keep the values.
+    uint32_t fp_build           = 0; // llama_build_number()
+    uint64_t fp_commit          = 0; // FNV-1a of llama_commit()
 
     // exact field-by-field equality (C++17: no defaulted operator==). Any difference REFUSES the
     // restore (invariant 3). Note: fp_block is intentionally part of identity — a snapshot hashed
@@ -1082,6 +1089,7 @@ struct model_fp {
                fp_yarn_beta_slow == o.fp_yarn_beta_slow && fp_yarn_orig_ctx == o.fp_yarn_orig_ctx &&
                fp_lora == o.fp_lora && fp_mmproj_loaded == o.fp_mmproj_loaded &&
                fp_state_abi == o.fp_state_abi &&
+               fp_build == o.fp_build && fp_commit == o.fp_commit &&
                // v1 text and v3 text-delta sidecars deliberately do not carry a
                // projector hash. Zero is therefore an "identity not applicable"
                // sentinel for those formats, not a hash mismatch. v2 media
@@ -1518,6 +1526,8 @@ static bool slot_meta_write(const std::string & state_filepath,
     // mmproj deployment-shape bit — refuses cross-shape restores.
     put_u32(fp.fp_mmproj_loaded);
     put_u32(fp.fp_state_abi);
+    put_u32(fp.fp_build);
+    put_u64(fp.fp_commit);
     put_u32((uint32_t) toks.size());
     put_u64(chain_hash);
     // token IDs as raw LE int32 (llama_token == int32_t; llama.cpp's on-disk
@@ -1627,6 +1637,7 @@ static bool slot_meta_read(const std::string & state_filepath,
         // mmproj deployment-shape bit — read in the same order slot_meta_write emits.
         !get_u64(fp.fp_lora)          || !get_u32(fp.fp_mmproj_loaded) ||
         ((version >= SLOT_META_VERSION_STATE_ABI) && !get_u32(fp.fp_state_abi)) ||
+        !get_u32(fp.fp_build)         || !get_u64(fp.fp_commit)        ||
         !get_u32(tok_count)           || !get_u64(chain_hash)) {
         return false;
     }
@@ -3005,6 +3016,16 @@ private:
         h = auto_hash_mix64(h, auto_kv_overrides_hash(params_base.kv_overrides));
         fp.fp_state_abi = AUTO_SNAPSHOT_STATE_ABI;
         h = auto_hash_mix64(h, fp.fp_state_abi);
+        // Executable identity: state computed by other code is unsound even when
+        // the layout matches, so it joins both the fingerprint and the store name.
+        fp.fp_build = (uint32_t) llama_build_number();
+        h = auto_hash_mix64(h, fp.fp_build);
+        uint64_t hc = 0xcbf29ce484222325ULL;
+        for (const char * p = llama_commit(); p && *p; ++p) {
+            hc ^= (uint64_t) (unsigned char) *p; hc *= 0x100000001b3ULL;
+        }
+        fp.fp_commit = hc;
+        h = auto_hash_mix64(h, fp.fp_commit);
 
         fp.fp_model       = h;
         fp.fp_n_vocab     = (uint32_t) llama_vocab_n_tokens(llama_model_get_vocab(model_tgt));
@@ -5814,6 +5835,15 @@ private:
     void send_final_response(server_slot & slot) {
         auto res = std::make_unique<server_task_result_cmpl_final>();
         const std::string generated_output = slot.generated_text;
+
+        // raw model output log, pairs with the --log-prompts-dir intake files
+        if (!params_base.path_prompts_log_dir.empty()) {
+            const auto file_path = std::filesystem::path(params_base.path_prompts_log_dir) / string_format("%012" PRId64 "-gen.txt", ggml_time_ms());
+            std::ofstream f(file_path);
+            if (f) {
+                f << generated_output;
+            }
+        }
 
         res->id      = slot.task->id;
         res->id_slot = slot.id;
