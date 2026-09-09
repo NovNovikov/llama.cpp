@@ -347,8 +347,9 @@ static bool tensor_allows_quantization(const llama_model_quantize_params * param
     quantize &= name.find("indexer.k_proj.weight") == std::string::npos;
     quantize &= name.find("indexer.q_proj.weight") == std::string::npos;
 
-    // glm5-next
-    if (arch == LLM_ARCH_GLM5_NEXT) {
+    // glm5-next (canonical "glm5-next" and legacy "glm5next" GGUF strings reach
+    // the same runtime class, so both need the same precision protection)
+    if (arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_GLM5NEXT) {
         quantize &= name.find("hc_")                     == std::string::npos;
         quantize &= name.find("indexer.attn_q_b")        == std::string::npos;
         quantize &= name.find("indexer.attn_k")          == std::string::npos;
@@ -499,7 +500,8 @@ static ggml_type llama_tensor_get_type_impl(quantize_state_impl & qs, ggml_type 
     };
 
     // by default, for glm5-next, don't let these tensors be quantized below Q8_0
-    if (arch == LLM_ARCH_GLM5_NEXT && (
+    // (both the canonical and the legacy arch strings)
+    if ((arch == LLM_ARCH_GLM5_NEXT || arch == LLM_ARCH_GLM5NEXT) && (
         name.find("attn_q_a")      != std::string::npos ||
         name.find("attn_q_b")      != std::string::npos ||
         name.find("nextn.eh_proj") != std::string::npos))
