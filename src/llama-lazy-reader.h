@@ -32,6 +32,22 @@
 #include <windows.h>
 #endif
 
+#ifdef _WIN32
+// one event per read chunk: concurrent overlapped reads on one handle
+// need a private event each, a shared null event misattributes completions
+struct llama_lazy_reader_event_guard {
+    HANDLE h;
+    llama_lazy_reader_event_guard() : h(CreateEventW(nullptr, FALSE, FALSE, nullptr)) {
+        GGML_ASSERT(h != nullptr);
+    }
+    ~llama_lazy_reader_event_guard() {
+        CloseHandle(h);
+    }
+    llama_lazy_reader_event_guard(const llama_lazy_reader_event_guard &) = delete;
+    llama_lazy_reader_event_guard & operator=(const llama_lazy_reader_event_guard &) = delete;
+};
+#endif
+
 struct llama_lazy_reader {
 #ifdef _WIN32
     llama_lazy_reader(void * file, size_t base, size_t row_size, int64_t n_rows, int n_threads,
@@ -137,23 +153,26 @@ struct llama_lazy_reader {
 private:
 #ifdef _WIN32
     // one positional read; ReadFile takes a DWORD length, so chunk big rows
-    void read_exact(size_t off, uint8_t * dst, size_t n) const {
+    void read_exact(size_t off, uint8_t * dst, size_t n, HANDLE ev) const {
         while (n > 0) {
             const DWORD want = n > 0x7FFFFFFFu ? 0x7FFFFFFFu : (DWORD) n;
             OVERLAPPED ov = {};
             ov.Offset     = (DWORD) (off & 0xFFFFFFFFu);
             ov.OffsetHigh = (DWORD) (off >> 32);
+            ov.hEvent     = ev;
             DWORD done = 0;
-            if (!ReadFile((HANDLE) file, dst, want, &done, &ov)) {
-                if (GetLastError() != ERROR_IO_PENDING ||
+            const BOOL ok = ReadFile((HANDLE) file, dst, want, &done, &ov);
+            const DWORD err = GetLastError();
+            if (!ok) {
+                if (err != ERROR_IO_PENDING ||
                         !GetOverlappedResult((HANDLE) file, &ov, &done, TRUE)) {
-                    throw std::runtime_error(format("lazy direct read of %lu bytes at file offset %zu failed, error %lu",
-                            (unsigned long) want, off, (unsigned long) GetLastError()));
+                    throw std::runtime_error(format("lazy direct read sync=%d err=%lu done=%lu want=%lu off=%zu",
+                            (int) ok, (unsigned long) err, (unsigned long) done, (unsigned long) want, off));
                 }
             }
             if (done == 0) {
-                throw std::runtime_error(format("lazy direct read of %lu bytes at file offset %zu failed: unexpected EOF",
-                        (unsigned long) want, off));
+                throw std::runtime_error(format("lazy direct read sync=%d err=%lu done=0 want=%lu off=%zu (unexpected EOF)",
+                        (int) ok, (unsigned long) err, (unsigned long) want, off));
             }
             dst += (size_t) done;
             off += (size_t) done;
@@ -179,6 +198,9 @@ private:
 
     void run_range(const std::vector<std::pair<int32_t, int32_t>> & pairs,
                    int64_t begin, int64_t end, float * dst) const {
+#ifdef _WIN32
+        llama_lazy_reader_event_guard ev;
+#endif
         std::vector<uint8_t> bounce(row_size);
         for (int64_t i = begin; i < end; ) {
             int64_t j = i;
@@ -186,7 +208,11 @@ private:
                 ++j; // dedup: one read serves the whole run
             }
             const size_t off = base + (size_t) pairs[(size_t) i].first * row_size;
-            read_exact(off, bounce.data(), row_size);
+            read_exact(off, bounce.data(), row_size
+#ifdef _WIN32
+                , ev.h
+#endif
+                );
             float * first = dst + (size_t) pairs[(size_t) i].second * (size_t) head_dim;
             if (to_float) {
                 to_float(bounce.data(), first, head_dim);
