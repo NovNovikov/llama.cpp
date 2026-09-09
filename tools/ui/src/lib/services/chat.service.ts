@@ -517,7 +517,6 @@ export class ChatService {
 		const queueContent = (text: string) => scheduler.pushContent(text);
 		const queueReasoning = (text: string) => scheduler.pushReasoning(text);
 		const queueToolJson = (json: string) => scheduler.pushToolJson(json);
-		const flushPending = () => scheduler.flushAll();
 		if (conversationId) {
 			ChatService.activeSchedulers.set(conversationId, scheduler);
 		}
@@ -793,7 +792,10 @@ export class ChatService {
 			if (streamFinished) {
 				finalizeOpenToolCallBatch();
 				// Final flush ensures the last coalesced chunk is visible before onComplete persists.
-				flushPending();
+				// Must bypass the hidden-tab deferral: the scheduler is destroyed in finally below
+				// and the visibilitychange listener is removed, so anything still staged here would
+				// be discarded and the message body would stay empty when the tab was hidden.
+				scheduler.forceFlush();
 
 				if (conversationId) {
 					ChatService.clearStreamState(conversationId);
