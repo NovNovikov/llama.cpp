@@ -642,9 +642,14 @@ class Glm5NextModel(GlmMoeDsaModel):
                     f"direct structural parity failed for {record['sources']}: canonical "
                     f"{plan.name} requires F32, direct recipe selected {plan.target_type.name}")
             if record["kind"] not in ("fp8", "experts") and plan.target_type != record["source_type"]:
-                raise DirectQuantError(
-                    f"direct structural parity failed for {record['sources']}: canonical "
-                    f"{plan.name} uses {record['source_type'].name}, direct recipe selected {plan.target_type.name}")
+                # Explicit Q8_0 overrides on unquantized storage are allowed: the writer
+                # quantizes them via ggml_quantize_chunk (same machinery as the FP8 path).
+                # Anything else must match the source type exactly.
+                if not (record["kind"] == "storage" and
+                        plan.target_type == gguf.GGMLQuantizationType.Q8_0):
+                    raise DirectQuantError(
+                        f"direct structural parity failed for {record['sources']}: canonical "
+                        f"{plan.name} uses {record['source_type'].name}, direct recipe selected {plan.target_type.name}")
 
         self._direct_set_file_type(plans)
 
@@ -685,8 +690,18 @@ class Glm5NextModel(GlmMoeDsaModel):
 
         for record, plan in zip(records, plans, strict=True):
             if record["kind"] in ("storage", "storage_f32"):
-                data = record["data"].lazy_float32() if record["kind"] == "storage_f32" else record["data"].lazy_storage()
-                self.gguf_writer.add_tensor(plan.name, data, raw_dtype=plan.target_type)
+                if plan.target_type == record["source_type"]:
+                    data = record["data"].lazy_float32() if record["kind"] == "storage_f32" else record["data"].lazy_storage()
+                    self.gguf_writer.add_tensor(plan.name, data, raw_dtype=plan.target_type)
+                else:
+                    # Explicit Q8_0 override on unquantized storage (parity-checked above).
+                    encoded = record["data"].lazy_quantized(quantizer, plan.target_type)
+                    self.gguf_writer.add_tensor(
+                        plan.name,
+                        encoded,
+                        raw_shape=record["shape"],
+                        raw_dtype=plan.target_type,
+                    )
             elif record["kind"] in ("storage_experts", "storage_experts_f32"):
                 data = record["data"].lazy_float32() if record["kind"] == "storage_experts_f32" else record["data"].lazy_storage()
                 self.gguf_writer.add_tensor(plan.name, data, raw_dtype=plan.target_type)
