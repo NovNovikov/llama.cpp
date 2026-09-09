@@ -1,5 +1,5 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
-import { StreamingScheduler } from './streaming-scheduler';
+import { StreamingScheduler } from '$lib/utils/streaming-scheduler';
 
 describe('StreamingScheduler', () => {
 	beforeEach(() => {
