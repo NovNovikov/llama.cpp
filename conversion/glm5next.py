@@ -666,6 +666,14 @@ class Glm5NextModel(GlmMoeDsaModel):
             n_head_kv = int(self.hparams["num_key_value_heads"])
             qk_nope_head_dim = int(self.hparams["qk_nope_head_dim"])
             v_head_dim = int(self.hparams["v_head_dim"])
+            # Fail loud like _direct_kv_b_outputs: a stale num_key_value_heads
+            # (DeepseekV2 forcing sets it to 1 for MLA) would silently reshape
+            # into the wrong geometry via view() below.
+            expected_rows = n_head_kv * (qk_nope_head_dim + v_head_dim)
+            if data.shape[0] != expected_rows:
+                raise DirectQuantError(
+                    f"direct MLA kv_b tensor {source_name} has {data.shape[0]} rows, expected "
+                    f"{n_head_kv} * ({qk_nope_head_dim} + {v_head_dim}) = {expected_rows}")
             kv_b = data.view(n_head_kv, qk_nope_head_dim + v_head_dim, data.shape[-1])
             k_b, v_b = torch.split(kv_b, [qk_nope_head_dim, v_head_dim], dim=1)
             output = k_b.transpose(1, 2).contiguous() if projection == "k" else v_b.contiguous()
