@@ -2018,7 +2018,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
 
     if (probs_in == nullptr) {
         logits = build_lora_mm(gate_inp, cur); // [n_expert, n_tokens]
-        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS) {
+        // HF reference computes router logits in FP32 (hidden and weight cast).
+        // SQRT_SOFTPLUS needs it for numerics; GLM5 sigmoid-router needs it to
+        // match the reference: without the override CUDA picks BF16 compute.
+        if (gating_op == LLAMA_EXPERT_GATING_FUNC_TYPE_SQRT_SOFTPLUS ||
+            arch == LLM_ARCH_GLM5_NEXT ||
+            arch == LLM_ARCH_GLM5NEXT) {
             ggml_mul_mat_set_prec(logits, GGML_PREC_F32);
         }
         cb(logits, "ffn_moe_logits", il);
