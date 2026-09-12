@@ -3270,7 +3270,12 @@ static void func_args_not_string(json & messages) {
                         try {
                             args = json::parse(args.get<std::string>());
                         } catch (const std::exception & e) {
-                            throw std::runtime_error("Failed to parse tool call arguments as JSON: " + std::string(e.what()));
+                            // A single malformed tool call must not fail the whole request.
+                            // Fall back to empty arguments so template rendering stays valid;
+                            // the tool executor will report a per-tool error and the agentic
+                            // loop can retry instead of surfacing a 500.
+                            LOG_WRN("Tool call arguments are not valid JSON (%s), using empty object", e.what());
+                            args = json::object();
                         }
                     }
                 }
