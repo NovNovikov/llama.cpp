@@ -610,10 +610,19 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
     gf_res_prev_active = nullptr;
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
-    ggml_backend_sched_set_moe_cache(
-            sched.get(), (ggml_moe_cache_mode)cparams.moe_cache_mode,
-            cparams.moe_cache_budget_mib);
+    // A re-reserve (e.g. llama_set_sampler(), which llama-server calls for every request) used to recreate the
+    // scheduler, freeing and reallocating every compute buffer and the pinned host input buffer, then page-faulting
+    // on the fresh buffers during the first decode steps. Keep the existing scheduler instead: the graph reserve
+    // below re-plans and only grows the buffers that need to grow.
+    // NOTE (fork): ggml_backend_sched_set_moe_cache() destroys the live MoE cache session, so it must run only when
+    // the scheduler itself is (re)created. Calling it on a kept scheduler would drop all hot experts every request.
+    // cparams.moe_cache_mode/budget_mib are fixed at init, so configure-once is exact.
+    if (!sched) {
+        sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+        ggml_backend_sched_set_moe_cache(
+                sched.get(), (ggml_moe_cache_mode)cparams.moe_cache_mode,
+                cparams.moe_cache_budget_mib);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
