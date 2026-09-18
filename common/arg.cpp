@@ -3074,11 +3074,18 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "note: use comma-separated values (format: FNAME:SCALE,...)",
         [](common_params & params, const std::string & value) {
             for (const auto & item : parse_csv_row(value)) {
-                auto parts = string_split<std::string>(item, ':');
-                if (parts.size() != 2) {
+                // split on the LAST colon: Windows absolute paths contain a drive-letter
+                // colon (e.g. "L:\vectors\file.gguf":1), so a naive split would break them
+                const auto pos = item.find_last_of(':');
+                if (pos == std::string::npos) {
                     throw std::invalid_argument("control-vector-scaled format: FNAME:SCALE");
                 }
-                params.control_vectors.push_back({ std::stof(parts[1]), parts[0] });
+                auto fname = item.substr(0, pos);
+                // quoted paths with spaces arrive with the quotes intact
+                if (fname.size() >= 2 && fname.front() == '"' && fname.back() == '"') {
+                    fname = fname.substr(1, fname.size() - 2);
+                }
+                params.control_vectors.push_back({ std::stof(item.substr(pos + 1)), fname });
             }
         }
     ));
