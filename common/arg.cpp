@@ -23,6 +23,7 @@
 #endif
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
 #include <cinttypes>
 #include <climits>
@@ -3886,6 +3887,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             }
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_EFFORT"));
+    add_opt(common_arg(
+        {"--reasoning-effort-default"}, "LEVEL",
+        "default reasoning effort level published via /v1/models metadata\n"
+        "(must be a level the chat template actually supports; when absent, \"high\"\n"
+        "is used if supported, otherwise a random supported level; metadata only,\n"
+        "generation behavior is unchanged)",
+        [](common_params & params, const std::string & value) {
+            std::string level = value;
+            for (auto & ch : level) {
+                ch = (char) tolower((unsigned char) ch);
+            }
+            params.reasoning_effort_default = level;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REASONING_EFFORT_DEFAULT"));
     add_opt(common_arg(
         {"--reasoning-budget"}, "N",
         "token budget for thinking: -1 for unrestricted, 0 for immediate end, N>0 for token budget (default: -1)",

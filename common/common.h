@@ -674,6 +674,9 @@ struct common_params {
     std::map<std::string, std::string> default_template_kwargs;
     bool preserve_reasoning_specified = false;
 
+    // reasoning effort default published via /v1/models (empty = resolve from template)
+    std::string reasoning_effort_default;
+
     // CLI params
     std::string server_base; // if set, connect to this server instead of starting a new one
 
@@ -808,6 +811,12 @@ void common_init();
 
 void common_params_print_info(const common_params & params, bool print_devices = true);
 std::string common_params_get_system_info(const common_params & params);
+
+// extract reasoning effort levels a jinja template actually branches on
+// (equality tests and in-lists over reasoning_effort / reasoning_strength).
+// returns them in canonical order; empty when the template never branches.
+// this is the source of truth for what may be published, never the model name
+std::vector<std::string> common_reasoning_effort_from_template(const std::string & src);
 
 bool parse_cpu_range(const std::string & range, bool(&boolmask)[GGML_MAX_N_THREADS]);
 bool parse_cpu_mask(const std::string & mask, bool(&boolmask)[GGML_MAX_N_THREADS]);

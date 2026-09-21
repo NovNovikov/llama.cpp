@@ -52,6 +52,10 @@ struct server_context_meta {
     uint64_t model_n_params;
     uint64_t model_size;
     std::string model_ftype;
+
+    // reasoning effort metadata published via /v1/models (empty = not published)
+    std::vector<std::string> reasoning_effort_levels;
+    std::string reasoning_effort_default;
 };
 
 enum server_state {

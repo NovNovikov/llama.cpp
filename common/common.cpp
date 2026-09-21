@@ -11,7 +11,9 @@
 #include "unicode.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cinttypes>
+#include <stdexcept>
 #include <climits>
 #include <cmath>
 #include <chrono>
@@ -2395,4 +2397,167 @@ void common_prompt_checkpoint::clear_tgt() {
 void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
+}
+
+static const std::vector<std::string> & common_reasoning_effort_allowed() {
+    static const std::vector<std::string> allowed = {
+        "none", "minimal", "low", "medium", "high", "xhigh", "max",
+    };
+    return allowed;
+}
+
+static bool common_reasoning_effort_is_var_char(char c) {
+    return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_';
+}
+
+std::vector<std::string> common_reasoning_effort_from_template(const std::string & src) {
+    // collect quoted literals the template compares against reasoning_effort /
+    // reasoning_strength: `var == 'level'`, `'level' == var` and `in [...]` lists.
+    // only allowlist values count; result is in canonical order.
+    std::vector<std::string> found;
+    const std::vector<std::string> vars = { "reasoning_effort", "reasoning_strength" };
+    size_t pos = 0;
+    while (pos < src.size()) {
+        size_t best = std::string::npos;
+        size_t best_len = 0;
+        for (const auto & v : vars) {
+            const size_t p = src.find(v, pos);
+            if (p != std::string::npos && (best == std::string::npos || p < best)) {
+                best = p;
+                best_len = v.size();
+            }
+        }
+        if (best == std::string::npos) {
+            break;
+        }
+        // skip identifiers that merely contain the name (e.g. reasoning_effort_high)
+        if (best + best_len < src.size() && common_reasoning_effort_is_var_char(src[best + best_len])) {
+            pos = best + 1;
+            continue;
+        }
+        // look ahead for == 'level', skipping jinja filters (| lower, | string, ...)
+        // templates often compare a filtered value: reasoning_effort | lower == "none"
+        size_t p = best + best_len;
+        for (;;) {
+            while (p < src.size() && (src[p] == ' ' || src[p] == '\t' || src[p] == '\n' || src[p] == '\r')) {
+                p++;
+            }
+            if (p >= src.size() || src[p] != '|') {
+                break;
+            }
+            p++; // '|'
+            while (p < src.size() && (src[p] == ' ' || src[p] == '\t')) {
+                p++;
+            }
+            while (p < src.size() && (common_reasoning_effort_is_var_char(src[p]) || (src[p] >= '0' && src[p] <= '9'))) {
+                p++;
+            }
+            while (p < src.size() && (src[p] == ' ' || src[p] == '\t')) {
+                p++;
+            }
+            if (p < src.size() && src[p] == '(') {
+                int depth = 0;
+                while (p < src.size()) {
+                    if (src[p] == '(') {
+                        depth++;
+                    } else if (src[p] == ')') {
+                        depth--;
+                        if (depth == 0) {
+                            p++;
+                            break;
+                        }
+                    }
+                    p++;
+                }
+            }
+        }
+        // case 1: var == 'level'
+        if (src.compare(p, 2, "==") == 0) {
+            size_t q = p + 2;
+            while (q < src.size() && (src[q] == ' ' || src[q] == '\t')) {
+                q++;
+            }
+            if (q < src.size() && (src[q] == '\'' || src[q] == '"')) {
+                const char quote = src[q];
+                size_t e = src.find(quote, q + 1);
+                if (e != std::string::npos && e - (q + 1) <= 16) {
+                    found.push_back(src.substr(q + 1, e - (q + 1)));
+                }
+            }
+        }
+        // case 2: 'level' == var (literal immediately before, same line)
+        {
+            size_t ls = src.rfind('\n', best);
+            ls = (ls == std::string::npos) ? 0 : ls + 1;
+            // walk back over spaces from var start, expect ==
+            size_t r = best;
+            while (r > ls && (src[r - 1] == ' ' || src[r - 1] == '\t')) {
+                r--;
+            }
+            if (r >= ls + 2 && src.compare(r - 2, 2, "==") == 0) {
+                // walk back over spaces, expect quoted literal end
+                size_t qe = r - 2;
+                while (qe > ls && (src[qe - 1] == ' ' || src[qe - 1] == '\t')) {
+                    qe--;
+                }
+                if (qe > ls && (src[qe - 1] == '\'' || src[qe - 1] == '"')) {
+                    const char quote = src[qe - 1];
+                    size_t qs = src.rfind(quote, qe - 2);
+                    if (qs != std::string::npos && qs >= ls && qe - 1 - (qs + 1) <= 16) {
+                        found.push_back(src.substr(qs + 1, qe - 1 - (qs + 1)));
+                    }
+                }
+            }
+        }
+        // case 3: var in [...] or var|lower in [...] : collect quoted items from brackets
+        {
+            size_t b = src.find('[', best);
+            const size_t in_kw = src.find(" in ", best);
+            if (b != std::string::npos && in_kw != std::string::npos && in_kw < b && b - best <= 80) {
+                const size_t be = src.find(']', b + 1);
+                if (be != std::string::npos && be - b <= 200) {
+                    size_t q = b;
+                    while (q < be) {
+                        q = src.find_first_of("'\"", q + (q == b ? 1 : 0), be - q);
+                        if (q == std::string::npos || q >= be) {
+                            break;
+                        }
+                        const char quote = src[q];
+                        const size_t e = src.find(quote, q + 1);
+                        if (e == std::string::npos || e > be) {
+                            break;
+                        }
+                        if (e - (q + 1) <= 16) {
+                            found.push_back(src.substr(q + 1, e - (q + 1)));
+                        }
+                        q = e + 1;
+                    }
+                }
+            }
+        }
+        pos = best + 1;
+    }
+    // normalize + keep allowlist values in canonical order
+    const auto & allowed = common_reasoning_effort_allowed();
+    std::vector<std::string> out;
+    for (auto & cand : found) {
+        for (auto & ch : cand) {
+            ch = (char) tolower((unsigned char) ch);
+        }
+        if (std::find(allowed.begin(), allowed.end(), cand) == allowed.end()) {
+            continue;
+        }
+        if (std::find(out.begin(), out.end(), cand) != out.end()) {
+            continue;
+        }
+        // insert keeping canonical allowlist order
+        auto it = out.begin();
+        while (it != out.end() &&
+               std::find(allowed.begin(), allowed.end(), *it) <
+               std::find(allowed.begin(), allowed.end(), cand)) {
+            ++it;
+        }
+        out.insert(it, cand);
+    }
+    return out;
 }

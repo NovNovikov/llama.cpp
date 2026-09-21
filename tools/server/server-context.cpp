@@ -5135,6 +5135,37 @@ private:
                 return false;
             }
 
+            // reasoning effort metadata must reflect the template (never the model
+            // name): resolve the published default here, once per load, so it stays
+            // stable across sleeping/resuming. An explicit default must be a level the
+            // template actually branches on; without one, "high" wins when supported,
+            // otherwise a random supported level. Empty template set: publish nothing.
+            if (chat_templates) {
+                const auto tpl_levels = common_reasoning_effort_from_template(
+                    common_chat_templates_source(chat_templates.get(), ""));
+                std::string def = params_base.reasoning_effort_default;
+                if (!def.empty()) {
+                    if (std::find(tpl_levels.begin(), tpl_levels.end(), def) == tpl_levels.end()) {
+                        std::string have;
+                        for (const auto & t : tpl_levels) {
+                            have += have.empty() ? t : ", " + t;
+                        }
+                        SRV_ERR("reasoning effort default '%s' is not supported by the chat template (template supports: %s)\n",
+                            def.c_str(), have.empty() ? "<none>" : have.c_str());
+                        return false;
+                    }
+                } else if (!tpl_levels.empty()) {
+                    if (std::find(tpl_levels.begin(), tpl_levels.end(), "high") != tpl_levels.end()) {
+                        def = "high";
+                    } else {
+                        static std::mt19937 rng{ std::random_device{}() };
+                        def = tpl_levels[rng() % tpl_levels.size()];
+                    }
+                    SRV_INF("reasoning effort default not set, using '%s'\n", def.c_str());
+                }
+                params_base.reasoning_effort_default = def;
+            }
+
             // IMPORTANT: chat_params is reused across sleeping / resuming states,
             //            never store llama_context/llama_model pointers in chat_params,
             //            as they may be invalidated after sleeping
@@ -8492,6 +8523,20 @@ server_context_meta server_context::get_meta() const {
 
     const char * ftype_name = llama_ftype_name(llama_model_ftype(impl->model_tgt));
 
+    // reasoning effort levels come straight from the loaded template; the default
+    // was resolved and validated at load and stored in params_base (stable across
+    // sleeping/resuming). Defensive membership check: never publish a stale default.
+    std::vector<std::string> effort_levels;
+    if (impl->chat_params.tmpls) {
+        effort_levels = common_reasoning_effort_from_template(
+            common_chat_templates_source(impl->chat_params.tmpls.get(), ""));
+    }
+    std::string effort_def = impl->params_base.reasoning_effort_default;
+    if (!effort_def.empty() &&
+        std::find(effort_levels.begin(), effort_levels.end(), effort_def) == effort_levels.end()) {
+        effort_def.clear();
+    }
+
     return server_context_meta {
         /* build_info             */ std::string(llama_build_info()),
         /* model_name             */ impl->model_name,
@@ -8527,6 +8572,8 @@ server_context_meta server_context::get_meta() const {
         /* model_n_params         */ llama_model_n_params(impl->model_tgt),
         /* model_size             */ llama_model_size(impl->model_tgt),
         /* model_ftype            */ ftype_name,
+        /* reasoning_effort_levels */ effort_levels,
+        /* reasoning_effort_default */ effort_def,
     };
 }
 
@@ -8874,7 +8921,7 @@ server_routes::server_routes(const common_params & params, server_context & ctx_
 static json get_res_model_info(const server_context_meta & meta) {
     // note: do NOT use ctx_server here, otherwise it's not possible to use this during sleep
 
-    return {
+    json info = {
         {"id",       meta.model_name},
         {"aliases",  meta.model_aliases},
         {"tags",     meta.model_tags},
@@ -8892,6 +8939,15 @@ static json get_res_model_info(const server_context_meta & meta) {
             {"ftype",       meta.model_ftype},
         }},
     };
+    // reasoning effort levels declared by server configuration (metadata only,
+    // generation behavior is unchanged)
+    if (!meta.reasoning_effort_levels.empty()) {
+        info["reasoning_effort_levels"] = meta.reasoning_effort_levels;
+        if (!meta.reasoning_effort_default.empty()) {
+            info["reasoning_effort_default"] = meta.reasoning_effort_default;
+        }
+    }
+    return info;
 }
 
 static json get_res_models(const server_context_meta & meta) {

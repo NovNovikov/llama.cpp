@@ -2066,6 +2066,10 @@ void server_models_routes::init_routes() {
                 // {"need_download", meta.need_download},
                 // TODO: add other fields, may require reading GGUF metadata
             };
+            // NOTE: reasoning effort metadata is intentionally not published here:
+            // the supported levels come from the loaded chat template, which the
+            // router does not have without loading the model. Child processes
+            // validate their own --reasoning-effort-default at load.
 
             // merge with loaded_info from the child process if available
             if (meta.is_running()) {
