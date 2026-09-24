@@ -1077,12 +1077,14 @@ struct model_fp {
     // exact field-by-field equality (C++17: no defaulted operator==). Any difference REFUSES the
     // restore (invariant 3). Note: fp_block is intentionally part of identity — a snapshot hashed
     // with a different block size cannot be longest-prefix-matched against the current index.
+    // fp_n_ctx is intentionally excluded: positions are absolute, capacity is enforced at
+    // restore, and position-affecting ctx differences already surface via the rope fields.
     bool operator==(const model_fp & o) const {
         return fp_model == o.fp_model && fp_n_vocab == o.fp_n_vocab &&
                fp_n_ctx_train == o.fp_n_ctx_train && fp_n_embd == o.fp_n_embd &&
                fp_n_layer == o.fp_n_layer && fp_rope_type == o.fp_rope_type &&
                fp_cache_k == o.fp_cache_k && fp_cache_v == o.fp_cache_v &&
-               fp_n_ctx == o.fp_n_ctx && fp_kv_full == o.fp_kv_full &&
+               fp_kv_full == o.fp_kv_full &&
                fp_block == o.fp_block && fp_rope_scale == o.fp_rope_scale &&
                fp_rope_base == o.fp_rope_base && fp_yarn_ext == o.fp_yarn_ext &&
                fp_yarn_attn == o.fp_yarn_attn && fp_yarn_beta_fast == o.fp_yarn_beta_fast &&
@@ -3278,6 +3280,7 @@ private:
             const auto prefix_hashes = auto_prefix_hashes(req, media, cur_fp.fp_model, cur_fp.fp_mmproj);
             std::lock_guard<std::mutex> lk(auto_idx.mtx);
             auto_index_refresh_locked(/*force=*/false);
+            size_t n_fp_skip = 0;
             for (int attempt = 0; attempt < 2; ++attempt) {
                 out.clear();
                 for (auto it_hash = prefix_hashes.rbegin(); it_hash != prefix_hashes.rend(); ++it_hash) {
@@ -3286,7 +3289,11 @@ private:
                         continue;
                     }
                     for (const auto & c : it->second) {
-                        if (c.n_tokens != it_hash->n_tokens || !(c.fp == cur_fp)) {
+                        if (c.n_tokens != it_hash->n_tokens) {
+                            continue;
+                        }
+                        if (!(c.fp == cur_fp)) {
+                            ++n_fp_skip;
                             continue;
                         }
                         out.push_back(c);
@@ -3302,6 +3309,9 @@ private:
                     auto_index_refresh_locked(/*force=*/true);
                 }
             }
+            if (out.empty() && n_fp_skip > 0) {
+                SRV_INF("auto-cache: index lookup skipped %zu snapshots on fingerprint mismatch\n", n_fp_skip);
+            }
             return out;
         }
 
@@ -3314,6 +3324,7 @@ private:
         // cost is negligible against it, and a peer's snapshot written <1s ago (within the throttle
         // window) is still found on this first request rather than only the next one.
         auto_index_refresh_locked(/*force=*/false);
+        size_t n_fp_skip = 0;
         for (int attempt = 0; attempt < 2; ++attempt) {
             out.clear();
             std::unordered_set<std::string> seen;
@@ -3324,6 +3335,7 @@ private:
                 }
                 for (const auto_cache_entry & c : it->second) { // longest first within the boundary
                     if (!(c.fp == cur_fp)) {
+                        ++n_fp_skip;
                         continue; // invariant 3
                     }
                     if (full && c.n_tokens > req.size()) {
@@ -3344,6 +3356,9 @@ private:
             if (attempt == 0) {
                 auto_index_refresh_locked(/*force=*/true); // miss -> rescan once before giving up
             }
+        }
+        if (out.empty() && n_fp_skip > 0) {
+            SRV_INF("auto-cache: index lookup skipped %zu snapshots on fingerprint mismatch\n", n_fp_skip);
         }
         return out;
     }
@@ -3475,7 +3490,8 @@ private:
         // Reconstruct a context checkpoint at the restored position so hybrid/recurrent (and SWA)
         // models — which cannot partially rewind — can reuse this state for the suffix; other
         // models do not need it.
-        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL) {
+        if (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL ||
+            ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART) {
             const auto ckpt_pos_min = llama_memory_seq_pos_min(llama_get_memory(ctx_tgt), slot.id);
             const auto ckpt_pos_max = llama_memory_seq_pos_max(llama_get_memory(ctx_tgt), slot.id);
             if (ckpt_pos_min >= 0) {
@@ -3727,14 +3743,15 @@ private:
             }
             n_keep_disk = (int) disk_toks.size();
         } else {
-            // Attention (PART) models support per-token partial seq_rm, so a mid-snapshot divergence
-            // is fine: claim the verified prefix clamped down to the last whole block boundary <= v.
-            // An exact full-snapshot match keeps the whole snapshot length.
-            if (v == disk_toks.size()) {
-                n_keep_disk = (int) disk_toks.size();
-            } else {
-                n_keep_disk = (int) (v - (v % (size_t) B));
+            // PART memory cannot continue from inside a snapshot: trimming the divergent tail
+            // also drops the snapshot end window, and the window behind the divergence is gone.
+            // Only whole-prefix snapshots are usable here (same rule as FULL above).
+            if (v != disk_toks.size()) {
+                SLT_INF(slot, "auto-restore: disk candidate rejected (request diverges inside snapshot, PART needs whole prefix), file=%s\n",
+                        cand.state_path.c_str());
+                return 0;
             }
+            n_keep_disk = (int) disk_toks.size();
         }
         if (n_keep_disk <= 0) {
             SLT_INF(slot, "auto-restore: disk candidate rejected (no whole-block token prefix), file=%s\n",
@@ -3851,11 +3868,9 @@ private:
             // restore failed -> slot seq already cleared by do_slot_restore; caller reprefills (invariant 4).
             return 0;
         }
-        // do_slot_restore loaded the snapshot. For FULL models n_keep_disk == snapshot length (gated
-        // above), so the existing regenerate / suffix-reuse path takes over with no partial
-        // rewind. For attention models the request may diverge inside the snapshot; keep_first(n_past)
-        // + a PARTIAL seq_rm then reprefills the divergent tail (supported for PART). The verified
-        // prefix is what we claim as reused.
+        // do_slot_restore loaded the snapshot. The gates above allow only whole-prefix
+        // snapshots (any model), so the existing regenerate / suffix-reuse path takes over
+        // with no partial rewind. The verified prefix is what we claim as reused.
         // Bump every node on the chain's mtime so the LRU treats a reused-but-not-rewritten base (and
         // each shared delta) as recently-used (true LRU, not least-recently-written) — critical for
         // the fan-out case where many requests restore one hot base prefix, and so eviction keeps the
@@ -7150,7 +7165,8 @@ private:
 
                                     bool disk_restored = false;
                                     for (const auto & cand : disk_candidates) {
-                                        if (n_keep_ram > 0 && !preserve_ram_checkpoint) {
+                                        // Skip the disk probe only when the resident prefix fully matches and will survive: a failed load would destroy live state. A partial prefix dies in do_reset anyway, so probing disk for it is free.
+                                        if (!preserve_ram_checkpoint && n_keep_ram > 0 && n_keep_ram >= (int) slot.prompt.tokens.size()) {
                                             SLT_INF(slot,
                                                     "auto-restore: disk candidate skipped (resident RAM prefix %d has no rollback checkpoint)\n",
                                                     n_keep_ram);
@@ -7497,7 +7513,10 @@ private:
                                 const bool slot_was_restored = slot.just_restored; slot.just_restored = false;
                                 (void) slot_was_restored;
 
-                                if (pos_min >= pos_min_thold) {
+                                // No rewind is needed when the whole resident state is a prefix of the
+                                // request (pure extension): the anchor search below can only confirm or
+                                // destroy, and a fresh restore anchor may miss its own window edge.
+                                if (n_past < (int) slot.prompt.n_tokens() && pos_min >= pos_min_thold) {
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -7516,7 +7535,11 @@ private:
                                             // threshold, pos_min_thold == pos_next for tail memories, so such a
                                             // checkpoint restores to p0 == cell.pos and the following partial seq_rm
                                             // on a recurrent cache with n_rs_seq == 0 returns false -> GGML_ABORT.
-                                            return cur.pos_min == 0 || cur.pos_min < pos_min_thold;
+                                            // PART memories support partial seq_rm, so a window edge landing exactly
+                                            // on the threshold still covers the needed range.
+                                            return cur.pos_min == 0 || cur.pos_min < pos_min_thold ||
+                                                (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART &&
+                                                 cur.pos_min == pos_min_thold);
                                         }
                                     );
 
