@@ -8,8 +8,7 @@
 		ChatFormInputFileInputInvisible,
 		ChatFormMcpResourcesList,
 		ChatFormPickers,
-		DialogMcpResourcesBrowser,
-		DialogMcpServers
+		DialogMcpResourcesBrowser
 	} from '$lib/components/app';
 	import {
 		CLIPBOARD_CONTENT_QUOTE_PREFIX,
@@ -30,11 +29,13 @@
 	import {
 		chatStore,
 		conversationsStore,
+		deviceStore,
 		mcpStore,
 		modelsStore,
 		serverStore,
 		settingsStore,
-		toolsStore
+		toolsStore,
+		uiStore
 	} from '$lib/stores';
 	import type {
 		FileMentionEntry,
@@ -59,9 +60,12 @@
 		AudioRecorder,
 		convertToWav,
 		createAudioFile,
-		isAudioRecordingSupported
+		describeMicrophoneError,
+		isAudioRecordingSupported,
+		microphoneUnavailableReason
 	} from '$lib/utils/browser-only';
 	import { onMount } from 'svelte';
+	import { toast } from 'svelte-sonner';
 
 	interface Props {
 		// Data
@@ -134,6 +138,10 @@
 	// Audio Recording State
 	let isRecording = $state(false);
 	let recordingSupported = $state(false);
+	/** Why this page can't record at all (no HTTPS, no recorder), which no tap fixes. */
+	let micUnavailableReason = $state<string | null>(null);
+	/** Why the last start failed (denied, no microphone, busy); the next tap tries again. */
+	let micError = $state<string | null>(null);
 
 	// Invisible anchor at the form's top edge so the mention/WD popovers
 	// float above the box.
@@ -143,7 +151,16 @@
 		conversationsStore.activeConversation?.cwd ?? conversationsStore.preferences.pendingCwd
 	);
 
+	let showWorkingDirectory = $derived(conversationsStore.preferences.hasEnabledCwdTools());
+	// A phone has no chip for the working directory under the form: a chat shows it in its
+	// header (see ChatScreenMobileHeader), and a new chat, which has no header yet, offers it in
+	// the + menu
+	let isWorkingDirectoryInAddMenu = $derived(
+		showWorkingDirectory && deviceStore.isMobile && !conversationsStore.activeConversation
+	);
+
 	const pickers = useChatFormPickers({
+		canCompact: () => chatStore.canCompact(conversationsStore.activeMessages),
 		focusInput: refocusInput,
 		getCaretOffset: () => inputRef?.getCaretOffset(),
 		getCwd: () => cwd,
@@ -163,6 +180,7 @@
 				.getServers()
 				.some((s) => s.enabled && prefs.isServerToolsEnabled(s.id) && s.url.trim());
 		},
+		onCompact: () => chatStore.compactConversation(),
 		openModelSelector: () => chatFormActionsRef?.openModelSelector(),
 		setCaretOffset: (offset) => inputRef?.setCaretOffset(offset),
 		setValue: (v) => {
@@ -193,7 +211,6 @@
 	let preSelectedResourceUri = $state<string | undefined>(undefined);
 
 	// MCP Servers Dialog State
-	let isMcpServersDialogOpen = $state(false);
 
 	let currentConfig = $derived(settingsStore.config);
 
@@ -248,6 +265,7 @@
 
 	onMount(() => {
 		recordingSupported = isAudioRecordingSupported();
+		micUnavailableReason = microphoneUnavailableReason();
 		audioRecorder = new AudioRecorder();
 	});
 
@@ -257,6 +275,10 @@
 
 	export function resetTextareaHeight() {
 		inputRef?.resetHeight();
+	}
+
+	export function openWorkingDirectoryPicker() {
+		pickers.handleWorkingDirectoryOpen();
 	}
 
 	export function openModelSelector() {
@@ -478,6 +500,16 @@
 		queueMicrotask(() => inputRef?.focus());
 	}
 
+	// A flow outside the chat, e.g. the models page returning to it, asks for the
+	// composer back. Focus on a frame of its own, once the route has settled.
+	$effect(() => {
+		if (!uiStore.composerFocusRequested) return;
+
+		uiStore.composerFocusRequested = false;
+
+		setTimeout(() => inputRef?.focus(), 0);
+	});
+
 	// Splice the mention link in place of the `@<query>` token. Uses the
 	// live cursor, not a stale snapshot - the token may have been edited.
 	function handleMentionSelect(entry: FileMentionEntry) {
@@ -507,6 +539,13 @@
 	}
 
 	async function handleMicClick() {
+		// a phone shows no tooltip on a tap, so the reason comes as a toast
+		if (micUnavailableReason) {
+			toast.error(micUnavailableReason);
+
+			return;
+		}
+
 		if (!audioRecorder || !recordingSupported) {
 			console.warn('Audio recording not supported');
 
@@ -528,8 +567,10 @@
 			try {
 				await audioRecorder.startRecording();
 				isRecording = true;
+				micError = null;
 			} catch (error) {
-				console.error('Failed to start recording:', error);
+				micError = describeMicrophoneError(error);
+				toast.error(micError);
 			}
 		}
 	}
@@ -627,11 +668,14 @@
 				{isLoading}
 				isReasoning={chatStore.isReasoning}
 				{isRecording}
+				micWarning={micUnavailableReason ?? micError}
 				onFileUpload={handleFileUpload}
-				onMcpSettingsClick={() => (isMcpServersDialogOpen = true)}
 				onMicClick={handleMicClick}
 				{onStop}
 				onSystemPromptClick={() => onSystemPromptClick?.({ files: uploadedFiles, message: value })}
+				onWorkingDirectoryClick={isWorkingDirectoryInAddMenu
+					? pickers.handleWorkingDirectoryOpen
+					: undefined}
 				{showAddButton}
 				{showModelSelector}
 				{uploadedFiles}
@@ -641,7 +685,8 @@
 
 	<ContextGaugePopup />
 
-	{#if conversationsStore.preferences.hasEnabledCwdTools()}
+	{#if showWorkingDirectory}
+		<!-- a phone opens the picker from elsewhere (see isWorkingDirectoryInAddMenu): no chip here -->
 		<ChatFormCurrentWorkingDirectory
 			bind:query={pickers.workingDirectoryQuery}
 			customAnchor={mentionAnchor}
@@ -651,6 +696,7 @@
 			onChange={handleWorkingDirectoryChange}
 			onClose={pickers.handleWorkingDirectoryClose}
 			onOpen={pickers.handleWorkingDirectoryOpen}
+			showChip={!deviceStore.isMobile}
 		/>
 	{/if}
 </form>
@@ -667,5 +713,3 @@
 	}}
 	preSelectedUri={preSelectedResourceUri}
 />
-
-<DialogMcpServers bind:open={isMcpServersDialogOpen} />
