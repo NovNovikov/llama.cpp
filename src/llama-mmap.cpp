@@ -985,11 +985,17 @@ struct llama_mlock::impl {
             if (VirtualLock(ptr, len)) {
                 return true;
             }
+            const DWORD err_lock = GetLastError();
             if (tries == 2) {
                 LLAMA_LOG_WARN("warning: failed to VirtualLock %zu-byte buffer (after previously locking %zu bytes): %s\n",
-                    len, size, llama_format_win_err(GetLastError()).c_str());
+                    len, size, llama_format_win_err(err_lock).c_str());
                 return false;
             }
+
+            // log why the lock failed before fighting the quota: when the raise below
+            // fails, raw_lock returns without ever reporting the VirtualLock error
+            LLAMA_LOG_WARN("warning: VirtualLock failed for %zu-byte buffer (after previously locking %zu bytes): %s - raising the working set\n",
+                    len, size, llama_format_win_err(err_lock).c_str());
 
             SIZE_T min_ws_size, max_ws_size;
             if (!GetProcessWorkingSetSize(GetCurrentProcess(), &min_ws_size, &max_ws_size)) {
