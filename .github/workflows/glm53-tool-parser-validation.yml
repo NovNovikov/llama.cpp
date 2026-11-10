@@ -1,0 +1,25 @@
+name: GLM 5.3 parser validation
+
+on:
+  pull_request:
+    paths:
+      - 'common/chat-auto-parser-generator.cpp'
+      - 'models/templates/GLM-5.3-Flash.jinja'
+      - 'tests/test-log.cpp'
+      - '.github/workflows/glm53-tool-parser-validation.yml'
+  workflow_dispatch:
+
+jobs:
+  windows-x64:
+    runs-on: windows-2025
+    steps:
+      - uses: actions/checkout@v6
+      - name: Configure
+        shell: cmd
+        run: cmake -S . -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DGGML_NATIVE=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_BUILD_TESTS=ON -DBUILD_SHARED_LIBS=OFF
+      - name: Build focused test
+        shell: cmd
+        run: cmake --build build --target test-log -j %NUMBER_OF_PROCESSORS%
+      - name: Run focused test
+        shell: cmd
+        run: build\bin\test-log.exe
