@@ -4735,6 +4735,7 @@ private:
 
                 std::vector<ggml_backend_dev_t> devs;
                 uint32_t hp_ngl = 0;
+                uint32_t hp_nsk = 0;
                 uint32_t hp_nct = 0;
                 uint32_t hp_nex = 0;
                 try {
@@ -4742,8 +4743,8 @@ private:
 
                     auto measure_draft_memory = [&](const llama_context_params & cparams_probe) {
                         return common_get_device_memory_data(
-                            params_dft.model.path.c_str(), &mparams_dft, &cparams_probe,
-                            devs, hp_ngl, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
+                            { params_dft.model.path }, &mparams_dft, &cparams_probe,
+                            devs, hp_ngl, hp_nsk, hp_nct, hp_nex, GGML_LOG_LEVEL_ERROR);
                     };
 
                     common_device_memory_data_vec dmd;
@@ -4897,15 +4898,17 @@ private:
 
                 std::vector<ggml_backend_dev_t> devs_probe;
                 uint32_t hp_ngl_probe = 0;
+                uint32_t hp_nsk_probe = 0;
                 uint32_t hp_nct_probe = 0;
                 uint32_t hp_nex_probe = 0;
 
                 const auto dmd_probe = common_get_device_memory_data(
-                    params_base.model.path.c_str(),
+                    { params_base.model.path },
                     &mparams_probe,
                     &cparams_probe,
                     devs_probe,
                     hp_ngl_probe,
+                    hp_nsk_probe,
                     hp_nct_probe,
                     hp_nex_probe,
                     GGML_LOG_LEVEL_ERROR);

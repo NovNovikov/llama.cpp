@@ -305,6 +305,9 @@ struct common_chat_msg_delimiters {
     common_chat_msg_spans split(const llama_tokens & tokens, const std::map<size_t, size_t> & skips = {}) const;
 };
 
+// parse the message delimiters a client sent with the request
+common_chat_msg_delimiters common_chat_msg_delimiters_parse(const common_json & delimiters);
+
 struct common_chat_tool {
     std::string name;
     std::string description;

@@ -536,7 +536,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
             // Parse only registered argument names and normalize the result through the same
             // TOOL_ARG mapper used by the canonical tagged format.
             auto flat_arg_choice = p.choice();
-            foreach_parameter(func, [&](const common_chat_schema_property & prop, const common_chat_schema_document_ptr & doc) {
+            foreach_parameter(func, [&](size_t, const common_chat_schema_property & prop, const common_chat_schema_document_ptr & doc) {
                 auto flat_arg = p.tool_arg(
                     p.tool_arg_open(
                         p.literal("\"") + p.tool_arg_name_unique(p.literal(prop.name)) + p.literal("\"") +
@@ -622,7 +622,7 @@ common_peg_parser analyze_tools::build_tool_parser_tag_tagged(parser_build_conte
 
     if (can_qualify_per_call_marker) {
         auto valid_tool_body = p.choice();
-        foreach_function(inputs.tools, [&](const json & tool) {
+        foreach_function(inputs.tools, [&](size_t, const json & tool) {
             const auto & func = tool.at("function");
             const std::string name = func.at("name");
             valid_tool_body |= p.literal(name);

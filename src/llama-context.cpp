@@ -2382,9 +2382,6 @@ int llama_context::decode(const llama_batch_ext & batch_inp) {
         llama_sampler_backend_begin(entry.second);
     }
 
-    int64_t n_outputs_prev = 0;
-    int64_t n_tokens_prev  = 0;
-
     // ordering for the layer input device buffer
     llama_context * inject_src     = has_embd_row ? cparams.ctx_other : nullptr;
     ggml_backend_t  inject_backend = nullptr;

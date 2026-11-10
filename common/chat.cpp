@@ -119,6 +119,27 @@ void common_chat_msg_delimiters::tokenize(const llama_vocab * vocab) {
     }
 }
 
+common_chat_msg_delimiters common_chat_msg_delimiters_parse(const json & delimiters) {
+    common_chat_msg_delimiters result;
+
+    if (!delimiters.is_array()) {
+        return result;
+    }
+
+    result.delimiters.reserve(delimiters.size());
+    for (const auto & d : delimiters) {
+        if (!d.is_object()) {
+            continue;
+        }
+        result.delimiters.push_back({
+            common_chat_role_from_string(d.value("role", std::string())),
+            d.value("delimiter", std::string()),
+        });
+    }
+
+    return result;
+}
+
 common_chat_msg_spans common_chat_msg_delimiters::split(const llama_tokens & tokens, const std::map<size_t, size_t> & skips) const {
     std::vector<std::pair<common_chat_role, size_t>> matches;
 
@@ -1286,7 +1307,7 @@ static common_chat_params common_chat_params_init_inkling(const common_chat_temp
             data.generation_prompt += END_MESSAGE + TEXT + msg.render_content();
         }
 
-        data.prompt += data.generation_prompt;
+        data.prompt.append(data.generation_prompt);
     }
 
     const auto parser = build_chat_peg_parser([&](common_chat_peg_builder & p) {
@@ -1337,7 +1358,7 @@ static common_chat_params common_chat_params_init_inkling(const common_chat_temp
                p.optional(p.literal(END_SAMPLING)) + end;
     });
 
-    data.parser = parser.save();
+    data.parser = parser;
 
     return data;
 }
@@ -1349,8 +1370,9 @@ static common_chat_params common_chat_params_init_solar_open2(const common_chat_
     data.prompt = common_chat_template_direct_apply_impl(tmpl, inputs);
     {
         static const std::string marker = "<|im:start|>assistant<|im:content|>";
-        const auto pos = data.prompt.rfind(marker);
-        data.generation_prompt = pos == std::string::npos ? std::string() : data.prompt.substr(pos);
+        const std::string prompt_str = data.prompt.str();
+        const auto pos = prompt_str.rfind(marker);
+        data.generation_prompt = pos == std::string::npos ? std::string() : prompt_str.substr(pos);
     }
     data.format            = COMMON_CHAT_FORMAT_PEG_NATIVE;
     data.supports_thinking = true;
@@ -1392,7 +1414,7 @@ static common_chat_params common_chat_params_init_solar_open2(const common_chat_
                 p.tool_arg_close(p.literal("<|tool_arg:end|>")), "<|tool_arg:end|>");
 
             auto tool_choice = p.choice();
-            foreach_function(inputs.tools, [&](const json & tool) {
+            foreach_function(inputs.tools, [&](size_t, const json & tool) {
                 const auto & function = tool.at("function");
                 const std::string name = function.at("name");
                 auto params = function.contains("parameters") ? function.at("parameters") : json::object();
@@ -1400,7 +1422,7 @@ static common_chat_params common_chat_params_init_solar_open2(const common_chat_
 
                 if (params.contains("properties") && params.at("properties").is_object() && !params.at("properties").empty()) {
                     auto arg_choice = p.choice();
-                    foreach_parameter(function, [&](const common_chat_schema_property & prop, const common_chat_schema_document_ptr & doc) {
+                    foreach_parameter(function, [&](size_t, const common_chat_schema_property & prop, const common_chat_schema_document_ptr & doc) {
                         auto value_parser = p.eps();
                         if (prop.schema->may_be_string()) {
                             value_parser = string_value;
@@ -1431,7 +1453,7 @@ static common_chat_params common_chat_params_init_solar_open2(const common_chat_
         return generation_prompt + reasoning + p.content(p.rest()) + p.end();
     });
 
-    data.parser = parser.save();
+    data.parser = parser;
     if (include_grammar) {
         data.grammar_lazy = !(has_response_format || (has_tools && inputs.tool_choice == COMMON_CHAT_TOOL_CHOICE_REQUIRED));
         data.grammar = build_grammar([&](const common_grammar_builder & builder) {
@@ -1626,7 +1648,7 @@ static common_chat_params_init_fn common_chat_template_detect_params_init(const 
     if (src.find("<|tool_call:start|>") != std::string::npos &&
         src.find("<|tool_arg:value|>") != std::string::npos) {
         LOG_DBG("Using specialized template: Solar Open 2\n");
-        return common_chat_params_init_solar_open2(tmpl, params);
+        return common_chat_params_init_solar_open2;
     }
 
     // Qwen3-Coder XML tool calls, also used by Nemotron Nano 3, Qwen3.5 and StepFun-3.5-Flash

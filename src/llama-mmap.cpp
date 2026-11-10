@@ -629,9 +629,8 @@ struct llama_file::impl {
         }
     }
     int fd = -1;
-#endif
-
     std::string fname;
+#endif
 
     size_t read_alignment() const {
         return alignment;

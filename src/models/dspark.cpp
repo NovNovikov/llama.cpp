@@ -38,7 +38,7 @@ std::unique_ptr<llm_graph_context> llama_model_dspark::build_arch_graph(const ll
 
 template <>
 llama_model_dspark::graph<true>::graph(const llama_model & model, const llm_graph_params & params)
-    : llama_model_dflash::graph<true>(model, params) {}
+    : llama_model_dflash::graph<true>(params) {}
 
 class llm_graph_input_dspark_anchor : public llm_graph_input_i {
 public:
@@ -66,7 +66,7 @@ public:
 
 template <>
 llama_model_dspark::graph<false>::graph(const llama_model & model, const llm_graph_params & params)
-    : llama_model_dflash::graph<false>(model, params) {
+    : llama_model_dflash::graph<false>(params) {
     if (ubatch.embd) {
         return;
     }

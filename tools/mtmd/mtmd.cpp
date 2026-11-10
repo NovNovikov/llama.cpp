@@ -774,7 +774,7 @@ struct mtmd_context {
                 {
                     // renderer opens each image part with <|content_image|>; block framing comes from the template
                     img_beg = "<|content_image|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_inkling>(ctx_v);
+                    image_preproc = std::make_unique<mtmd_image_preprocessor_inkling>(models.v.get());
                 } break;
             case PROJECTOR_TYPE_MLP:
             case PROJECTOR_TYPE_MLP_NORM:
@@ -1079,13 +1079,6 @@ struct mtmd_context {
                     img_end = "<|end_of_image|>";
                     image_preproc = std::make_unique<mtmd_image_preprocessor_glm5v>(models.v.get());
                 } break;
-            case PROJECTOR_TYPE_GLM5V:
-                {
-                    // <|begin_of_image|> ... (image embeddings) ... <|end_of_image|>
-                    img_beg = "<|begin_of_image|>";
-                    img_end = "<|end_of_image|>";
-                    image_preproc = std::make_unique<mtmd_image_preprocessor_glm5v>(ctx_v);
-                } break;
             case PROJECTOR_TYPE_PADDLEOCR:
                 {
                     // <|IMAGE_START|> ... (image embeddings) ... <|IMAGE_END|>
@@ -1152,7 +1145,7 @@ struct mtmd_context {
                     // <|content_audio_input|> ... <|audio_end|>, matching the renderer's audio framing
                     aud_beg = "<|content_audio_input|>";
                     aud_end = "<|audio_end|>";
-                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_inkling>(ctx_a);
+                    audio_preproc = std::make_unique<mtmd_audio_preprocessor_inkling>(models.a.get());
                 } break;
             case PROJECTOR_TYPE_QWEN2A:
             case PROJECTOR_TYPE_QWEN25O:

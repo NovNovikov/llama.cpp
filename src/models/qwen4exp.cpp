@@ -241,8 +241,6 @@ void llama_model_qwen4exp::load_arch_tensors(llama_model_loader & ml) {
     auto load_block = [&](int il, int flags) {
         auto & layer = layers[il];
 
-        const int flags = il < n_layer ? trunk_flags : mtp_flags;
-
         const int64_t n_ff_exp   = hparams.n_ff_exp() ? hparams.n_ff_exp() : n_ff / n_expert_used;
         const int64_t n_ff_shexp = hparams.n_ff_shexp ? hparams.n_ff_shexp : n_ff;
 
@@ -698,7 +696,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llm_graph_params & params) :
 
 // TODO: QSA for the draft head; dense is a numerical superset below the 2048-token budget.
 llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params) :
-    graph(model, params, no_build_t{}) {
+    graph(params, no_build{}) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN4EXP MTP requires n_layer_nextn > 0");
     GGML_ASSERT(hparams.n_layer_nextn == 1 && "QWEN4EXP MTP currently only supports a single MTP block");
     GGML_ASSERT(ubatch.token && "QWEN4EXP MTP requires token input");
@@ -718,7 +716,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     int sections[4];
     std::copy(std::begin(hparams.rope_sections), std::begin(hparams.rope_sections) + 4, sections);
 
-    auto inp = std::make_unique<llm_graph_input_embd_h>(hc_dim);
+    auto inp = std::make_unique<llm_graph_input_embd_h>(hc_dim, hc_dim);
 
     inp->tokens = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
     ggml_set_input(inp->tokens);
@@ -766,10 +764,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * res_hc = build_lora_mm(layer.nextn.eh_proj, concat, layer.nextn.eh_proj_s);
     cb(res_hc, "mtp_eh_proj", il);
 
-    ggml_tensor * inject = nullptr;
-    ggml_tensor * cur = build_hc_mix(res_hc,
+    hc_mix attn_mix = build_hc_mix(res_hc,
             layer.hc_attn_norm, layer.hc_attn_down, layer.hc_attn_up, layer.hc_attn_inject,
-            &inject, il);
+            layer.hc_attn_down_inject, il);
+    ggml_tensor * cur    = attn_mix.cur;
+    ggml_tensor * inject = attn_mix.inject;
     cb(cur, "mtp_hc_attn_pre", il);
 
     const int64_t n_embd_head = hparams.n_embd_head_v();
@@ -835,9 +834,11 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
     res_hc = build_hc_combine(res_hc, cur, inject, il);
     cb(res_hc, "mtp_hc_attn_post", il);
 
-    cur = build_hc_mix(res_hc,
+    hc_mix ffn_mix = build_hc_mix(res_hc,
             layer.hc_ffn_norm, layer.hc_ffn_down, layer.hc_ffn_up, layer.hc_ffn_inject,
-            &inject, il);
+            layer.hc_ffn_down_inject, il);
+    cur    = ffn_mix.cur;
+    inject = ffn_mix.inject;
     cb(cur, "mtp_hc_ffn_pre", il);
 
     cur = build_layer_ffn(cur, il);
@@ -852,7 +853,7 @@ llama_model_qwen4exp::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     cur = build_hc_mix(res_hc,
             layer.nextn.hc_head_norm, layer.nextn.hc_head_down, layer.nextn.hc_head_up,
-            nullptr, nullptr, -1);
+            nullptr, nullptr, -1).cur;
     cb(cur, "mtp_hc_head", -1);
 
     // no res->t_embd: it is n_embd wide, but the context sizes that buffer by n_embd_out.
